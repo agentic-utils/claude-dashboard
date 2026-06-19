@@ -395,16 +395,19 @@ def collect(now: datetime):
                         aid = rec.get("agentId") or "untagged"
                         sub = s["subs"].get(aid)
                         if sub is None:
+                            # The transcript `slug` is per-session, not
+                            # per-subagent — every subagent in one session
+                            # shares it (e.g. "shimmering-dancing-rainbow"),
+                            # so in this single-session popup it just repeats.
+                            # Show the agentId instead; it is genuinely unique.
                             sub = s["subs"][aid] = {
-                                "slug": _clean(rec.get("slug") or aid[:12]),
+                                "slug": aid,
                                 "start": ts, "stop": ts, "peak": 0, "eff": 0.0,
                                 "model": model}
                         sub["start"] = min(sub["start"], ts)
                         sub["stop"] = max(sub["stop"], ts)
                         sub["peak"] = max(sub["peak"], total_in)
                         sub["eff"] += eff
-                        if rec.get("slug"):
-                            sub["slug"] = _clean(rec["slug"])
                         if model:
                             sub["model"] = model
 
