@@ -23,8 +23,10 @@ labelled Y-axis token scale and hourly X-axis):
   3. Output tokens generated (yellow).
 
 Below: a SUMMARY panel and, to its right, an ACTIVE SESSIONS panel listing
-sessions with a prompt in the last hour and their main-vs-subagent fresh-token
-balance over the last hour and the full window.
+sessions active within the lookback window (--active-window, default 1h; also
+governs the subagent list in the detail popup) and their main-vs-subagent
+fresh-token balance over the last hour and the full window. A renamed session
+(/rename) shows its custom title in place of the session id.
 
 Key facts baked in:
   - 5-minute ephemeral cache == subagent/sidechain work; 1-hour cache == main
@@ -63,6 +65,10 @@ BUCKET = timedelta(minutes=5)
 NUM_BUCKETS = int(WINDOW / BUCKET)          # 144
 WINDOW_HOURS = int(WINDOW.total_seconds() // 3600)
 INTERVAL_SECONDS = int(BUCKET.total_seconds())
+# How far back a session (and, in the detail popup, a subagent) counts as
+# "active". Default 1h; overridden by --active-window. Set in main(). Distinct
+# from the fixed "1h main/sub" token column, which stays a 1-hour metric.
+ACTIVE_WINDOW = timedelta(hours=1)
 CHART_HEIGHT = 8
 MARGIN = 8                                  # left gutter for the Y-axis scale
 TOTAL_WIDTH = MARGIN + NUM_BUCKETS
@@ -258,7 +264,7 @@ def new_session(sid, ts, rec):
     turn ts (None until a usage record is seen); `last_act` is the last ANY
     activity ts (usage or surfaced error)."""
     return {
-        "sid": sid, "last": None, "cwd": rec.get("cwd") or "",
+        "sid": sid, "name": None, "last": None, "cwd": rec.get("cwd") or "",
         "main_12": 0, "sub_12": 0, "main_1h": 0, "sub_1h": 0,
         "ctx": 0, "ctx_ts": None, "model": None,
         "peak_main": 0, "peak_sub": 0, "peak_sub_model": None,
@@ -279,6 +285,7 @@ def collect(now: datetime):
     buckets = [empty_bucket() for _ in range(NUM_BUCKETS)]
     sessions: dict[str, dict] = {}
     seen: set[str] = set()
+    titles: dict[str, str] = {}   # sid -> custom session title (latest /rename)
 
     for path in glob.glob(TRANSCRIPT_GLOB, recursive=True):
         try:
@@ -296,6 +303,18 @@ def collect(now: datetime):
                         rec = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+
+                    # A /rename writes a standalone metadata record with no
+                    # timestamp/usage; it'd be dropped by the cutoff check below.
+                    # Capture the latest title per session (file order is append
+                    # order, so last wins) and attach it after the scan.
+                    if rec.get("type") == "custom-title":
+                        t = _clean(rec.get("customTitle") or "").strip()
+                        if t:
+                            tsid = rec.get("sessionId") or os.path.basename(path)[:-6]
+                            titles[tsid] = t
+                        continue
+
                     msg = rec.get("message") or {}
                     ts = parse_ts(rec.get("timestamp"))
                     if ts is None or ts < cutoff:
@@ -410,6 +429,13 @@ def collect(now: datetime):
         except OSError:
             continue
 
+    # Attach custom /rename titles to their sessions (titles may be seen before
+    # the session has any usage record, so this is done after the full scan).
+    for tsid, t in titles.items():
+        s = sessions.get(tsid)
+        if s is not None:
+            s["name"] = t
+
     return buckets, sessions
 
 
@@ -425,6 +451,16 @@ def fmt_compact(n):
     if n >= 1_000:
         return f"{n / 1_000:.0f}k"
     return str(int(n))
+
+
+def fmt_window(td):
+    """A timedelta as a compact label for the UI: '1h', '30m', '1h30m'."""
+    m = int(td.total_seconds() // 60)
+    if m % 60 == 0:
+        return f"{m // 60}h"
+    if m < 60:
+        return f"{m}m"
+    return f"{m // 60}h{m % 60:02d}m"
 
 
 def pct(part, whole):
@@ -608,13 +644,13 @@ def session_rows(sessions, now, inner):
     """Return (rows, active_sids). active_sids is the ordered list of session
     ids for the DATA rows (header excluded), in the same order as the rows, so
     callers can map a clicked row index back to its session."""
-    last_hour = now - timedelta(hours=1)
-    active = sorted((s for s in sessions.values() if s["last_act"] >= last_hour),
+    cutoff = now - ACTIVE_WINDOW
+    active = sorted((s for s in sessions.values() if s["last_act"] >= cutoff),
                     key=lambda s: s["last_act"], reverse=True)
-    rows = [rgb(DIM, f"  {'last':<6}{'project':<16}{'session':<8}"
+    rows = [rgb(DIM, f"  {'last':<6}{'session':<32}"
                      f"{'1h main/sub':<20}{'12h main/sub':<20}{'context':<12}")]
     if not active:
-        rows.append(rgb(DIM, "  no sessions active in the last hour"))
+        rows.append(rgb(DIM, f"  no sessions active in the last {fmt_window(ACTIVE_WINDOW)}"))
         return rows, []
 
     def bal(main, sub):
@@ -638,17 +674,18 @@ def session_rows(sessions, now, inner):
             s["last"] is None or s["err"]["ts"] >= s["last"])
         when_ts = s["last"] or s["last_act"]
         when = when_ts.astimezone().strftime("%H:%M")
-        proj = _clean(os.path.basename(s["cwd"]) or "?")[:15]
         # Errored rows: red ! marker (2 cols, same as the plain indent), red
-        # project + time. Everything else keeps its normal colour.
+        # time. Everything else keeps its normal colour.
         indent = rgb(HOT_C, "! ") if errored_last else "  "
         when_col = (rgb(HOT_C, f"{when:<6}") if errored_last
                     else rgb(ACCENT, f"{when:<6}"))
-        proj_col = (rgb(HOT_C, f"{proj:<16}") if errored_last
-                    else rgb(TEXT, f"{proj:<16}"))
+        # Session column (always white): the /rename title if one exists; else
+        # the project (cwd basename); else the session-id prefix. Truncated.
+        proj = _clean(os.path.basename(s["cwd"])) if s["cwd"] else ""
+        ident = s["name"] or proj or s["sid"][:8]
+        ident_col = rgb(TEXT, f"{ident[:32]:<32}")
         rows.append(
-            indent + when_col + proj_col
-            + rgb(DIM, f"{s['sid'][:8]:<8}")
+            indent + when_col + ident_col
             + _padcol(bal(s["main_1h"], s["sub_1h"]), 20)
             + _padcol(bal(s["main_12"], s["sub_12"]), 20)
             + _padcol(ctx_cell(s), 12)
@@ -679,7 +716,9 @@ def render_popup(sid, sessions, now, cols, rows, anim=0):
                    + " " + rgb(TEXT, fmt_compact(s["peak_sub"])))
     else:
         sub_str = rgb(DIM, "  ·  no subagents")
-    head = (rgb(TEXT, proj, bold=True) + rgb(DIM, "  " + s["sid"][:8] + "  ")
+    name_str = rgb(ACCENT2, s["name"], bold=True) + rgb(DIM, "  ") if s["name"] else ""
+    head = (rgb(TEXT, proj, bold=True) + rgb(DIM, "  ") + name_str
+            + rgb(DIM, s["sid"][:8] + "  ")
             + rgb(ACCENT, short_model(s["model"])) + rgb(DIM, "  ")
             + ctx_str + sub_str)
 
@@ -716,13 +755,14 @@ def render_popup(sid, sessions, now, cols, rows, anim=0):
     body += ["", "  " + legend([("output", "output tokens")])]
     body += render_chart("Output tokens generated", ["output"], sb, 5, now, anim)
 
-    # Named subagent detail table — subagents active in the LAST HOUR only.
-    last_hour = now - timedelta(hours=1)
-    cands = sorted((sub for sub in s["subs"].values() if sub["stop"] >= last_hour),
+    # Named subagent detail table — subagents active in the lookback window only.
+    cutoff = now - ACTIVE_WINDOW
+    win = fmt_window(ACTIVE_WINDOW)
+    cands = sorted((sub for sub in s["subs"].values() if sub["stop"] >= cutoff),
                    key=lambda sub: sub["start"])
-    body += ["", "  " + rgb(DIM, "subagents · last 1h")]
+    body += ["", "  " + rgb(DIM, f"subagents · last {win}")]
     if not cands:
-        body += ["  " + rgb(DIM, "no subagents in the last hour")]
+        body += ["  " + rgb(DIM, f"no subagents in the last {win}")]
     else:
         def sub_row(sub):
             slug = sub["slug"][:26]
@@ -815,9 +855,11 @@ def render_help(now, cols, rows, scroll):
               "plus the cache-mix chips."),
         ("G", None),
         ("H", "ACTIVE SESSIONS"),
-        ("T", "Sessions active in the last hour. \"1h / 12h\" = fresh-token split, "
-              "main vs subagent. A session turns RED with a ! when its most recent "
-              "action hit a surfaced API error."),
+        ("T", f"Sessions active in the last {fmt_window(ACTIVE_WINDOW)} "
+              "(--active-window). A renamed session (/rename) shows its title in "
+              "place of the id. \"1h / 12h\" = fresh-token split, main vs subagent. "
+              "A session turns RED with a ! when its most recent action hit a "
+              "surfaced API error."),
         ("G", None),
         ("H", "CONTEXT LIGHT"),
         ("L", rgb(OK_C, "●") + rgb(DIM, " green   ") + rgb(WARN_C, "●")
@@ -837,9 +879,10 @@ def render_help(now, cols, rows, scroll):
               "response body."),
         ("G", None),
         ("H", "CLICK A SESSION"),
-        ("T", "Opens its detail: that session's 3 charts, effective tokens "
-              "(main/sub, 1h & 12h), named subagents from the last hour (peak ctx "
-              "+ eff tkn), and any recent error."),
+        ("T", f"Opens its detail: that session's 3 charts, effective tokens "
+              f"(main/sub, 1h & 12h), named subagents from the last "
+              f"{fmt_window(ACTIVE_WINDOW)} (peak ctx + eff tkn), and any recent "
+              "error."),
         ("G", None),
         ("H", "KEYS"),
         ("T", "? help · up/down PgUp/PgDn j/k scroll · q / esc close · ^C quit."),
@@ -1170,10 +1213,10 @@ def render_frame(now, buckets, sessions, anim=0, height=CHART_HEIGHT):
                         ["output"], buckets, height, now, anim)
 
     out += [""]
-    summ_inner, sess_inner, allow_inner = 40, 84, 26
+    summ_inner, sess_inner, allow_inner = 40, 92, 26
     sess_rows, active_sids = session_rows(sessions, now, sess_inner)
     summ = panel("SUMMARY · 12h", summary_rows(buckets, summ_inner), summ_inner)
-    sess = panel("ACTIVE SESSIONS · last 1h", sess_rows, sess_inner)
+    sess = panel(f"ACTIVE SESSIONS · last {fmt_window(ACTIVE_WINDOW)}", sess_rows, sess_inner)
     # Loading dots tick ~1 Hz (not the 10 Hz chart shimmer) so they don't blur.
     slow = int(now.timestamp())
     allow = panel("ALLOWANCE", allowance_rows(now, slow, allow_inner), allow_inner)
@@ -1216,7 +1259,12 @@ def main():
     ap.add_argument("--once", action="store_true", help="render one frame and exit")
     ap.add_argument("--interval", type=int, default=INTERVAL_SECONDS,
                     metavar="SECONDS", help="seconds between refreshes (default 300)")
+    ap.add_argument("--active-window", type=int, default=60, metavar="MINUTES",
+                    help="how far back a session (and, in the detail popup, its "
+                         "subagents) counts as active (default 60)")
     args = ap.parse_args()
+    global ACTIVE_WINDOW
+    ACTIVE_WINDOW = timedelta(minutes=max(args.active_window, 1))
 
     if args.once:
         now = datetime.now(timezone.utc)
@@ -1245,8 +1293,8 @@ def fit_height(rows, sessions, now):
       + per-chart title+baseline+axis (3 each -> 9) + blank before panels (1)
       + panels block (2 borders + body) + blank + footer (2).
     """
-    last_hour = now - timedelta(hours=1)
-    n_active = sum(1 for s in sessions.values() if s["last_act"] >= last_hour)
+    cutoff = now - ACTIVE_WINDOW
+    n_active = sum(1 for s in sessions.values() if s["last_act"] >= cutoff)
     panels_body = max(8, 1 + n_active, len(allowance_rows(now, 0, 26)))
     # 4 (header block) + 3*2 (blank+legend before charts 2&3 plus first legend
     # already counted) ... count explicitly to avoid drift:
