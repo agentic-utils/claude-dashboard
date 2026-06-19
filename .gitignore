@@ -1,0 +1,10 @@
+# Runtime diagnostics — written next to the script, local-only, never commit.
+claude-cache-monitor.log
+*.log
+
+# Adversarial-review scratch
+.review/
+
+# Python
+__pycache__/
+*.pyc
