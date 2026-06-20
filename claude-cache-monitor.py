@@ -60,14 +60,16 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 TRANSCRIPT_GLOB = os.path.expanduser("~/.claude/projects/**/*.jsonl")
+# These window/bucket dimensions are RESOLVED at startup in configure_dimensions()
+# from the CLI args and the terminal width; the values here are fallback defaults
+# for non-interactive use (import, piped --once when the size is unknown).
 WINDOW = timedelta(hours=12)
 BUCKET = timedelta(minutes=5)
-NUM_BUCKETS = int(WINDOW / BUCKET)          # 144
-WINDOW_HOURS = int(WINDOW.total_seconds() // 3600)
+NUM_BUCKETS = int(WINDOW / BUCKET)          # 144 (width = MARGIN + NUM_BUCKETS)
 INTERVAL_SECONDS = int(BUCKET.total_seconds())
 # How far back a session (and, in the detail popup, a subagent) counts as
-# "active". Default 1h; overridden by --active-window. Set in main(). Distinct
-# from the fixed "1h main/sub" token column, which stays a 1-hour metric.
+# "active". Default 1h; overridden by --active-window-hours. Set in main().
+# Distinct from the fixed "1h main/sub" token column, a fixed 1-hour metric.
 ACTIVE_WINDOW = timedelta(hours=1)
 CHART_HEIGHT = 8
 MARGIN = 8                                  # left gutter for the Y-axis scale
@@ -173,6 +175,11 @@ def eff_tokens(uncached, c5m, c1h, read, output):
     One definition shared by the bucket summary and the per-session accounting
     so the two never drift."""
     return uncached + 1.25 * c5m + 2 * c1h + 0.1 * read + 5 * output
+
+
+def buckets_per_hour():
+    """How many buckets span one hour, given the current BUCKET size (>=1)."""
+    return max(1, round(3600 / BUCKET.total_seconds()))
 
 
 def model_max_window(model):
@@ -636,12 +643,12 @@ def summary_rows(buckets, inner):
                    for b in bs)
 
     eff_12 = beff(buckets)
-    eff_1h = beff(buckets[-12:])     # 12 × 5-min buckets ≈ last hour
+    eff_1h = beff(buckets[-buckets_per_hour():])     # last hour of buckets
 
     return [
         kv(rgb(DIM, "input tokens"), rgb(TEXT, fmt(total_input), bold=True)),
         kv(rgb(DIM, "output tokens"), rgb(TEXT, fmt(agg["output"]), bold=True)),
-        kv(rgb(DIM, f"responses · {WINDOW_HOURS}h"), rgb(TEXT, fmt(agg["responses"]))),
+        kv(rgb(DIM, f"responses · {fmt_window(WINDOW)}"), rgb(TEXT, fmt(agg["responses"]))),
         kv(rgb(DIM, "effective tokens · 1h/12h"),
            rgb(TEXT, fmt_compact(round(eff_1h)) + " / " + fmt_compact(round(eff_12)),
                bold=True)),
@@ -840,9 +847,9 @@ def render_help(now, cols, rows, scroll):
         return rgb(CO[k], CHIP)
 
     items = [
-        ("T", f"Live Claude Code cache-token usage, last {WINDOW_HOURS}h in "
-              f"5-minute buckets. Charts refresh every {INTERVAL_SECONDS // 60}m; "
-              "the screen animates."),
+        ("T", f"Live Claude Code cache-token usage, last {fmt_window(WINDOW)} in "
+              f"{fmt_window(BUCKET)} buckets. Charts refresh every "
+              f"{max(1, INTERVAL_SECONDS // 60)}m; the screen animates."),
         ("G", None),
         ("H", "CHARTS"),
         ("T", "y-axis = tokens, x-axis = clock hour."),
@@ -1266,18 +1273,85 @@ def render_frame(now, buckets, sessions, anim=0, height=CHART_HEIGHT):
     return "\n".join(out), hits
 
 
+def term_cols():
+    """Terminal width, or a 12h-at-5m fallback (152) when it can't be probed
+    (piped --once) so non-interactive output keeps the historical default."""
+    try:
+        return os.get_terminal_size().columns
+    except OSError:
+        return MARGIN + 144
+
+
+def configure_dimensions(args, cols, fail):
+    """Resolve BUCKET / WINDOW / NUM_BUCKETS / ACTIVE_WINDOW / TOTAL_WIDTH /
+    INTERVAL_SECONDS from the CLI args and terminal width; `fail(msg)` reports a
+    validation error and exits. NUM_BUCKETS is fixed HERE at startup — the chart
+    is MARGIN + NUM_BUCKETS columns wide, so history is bounded by terminal
+    width. --window-hours unset => fill the available width (wider terminal =
+    more history); given => fixed and validated to fit."""
+    global BUCKET, WINDOW, NUM_BUCKETS, ACTIVE_WINDOW, TOTAL_WIDTH, INTERVAL_SECONDS
+
+    bucket_min, aw_hours = args.bucket_minutes, args.active_window_hours
+    if bucket_min < 1:
+        fail("--bucket-minutes must be >= 1")
+    if aw_hours <= 0:
+        fail("--active-window-hours must be > 0")
+
+    avail = max(cols - MARGIN, 1)            # bucket columns the width allows
+    if args.window_hours is None:
+        nb = avail                          # fill the terminal
+    else:
+        if args.window_hours <= 0:
+            fail("--window-hours must be > 0")
+        win_min = round(args.window_hours * 60)
+        if win_min % bucket_min:
+            fail(f"--window-hours*60 ({win_min}) must be divisible by "
+                 f"--bucket-minutes ({bucket_min})")
+        nb = win_min // bucket_min
+        if nb > avail:
+            fail(f"--window-hours {args.window_hours:g} needs {nb} bars "
+                 f"({MARGIN + nb} cols) but the terminal is {cols} wide. Widen "
+                 f"it, lower --window-hours, or raise --bucket-minutes.")
+    win_min = nb * bucket_min
+
+    if bucket_min > aw_hours * 60:
+        fail(f"--bucket-minutes ({bucket_min}) must be <= "
+             f"--active-window-hours*60 ({aw_hours * 60:g})")
+    if aw_hours >= win_min / 60:
+        fail(f"--active-window-hours ({aw_hours:g}) must be < the window "
+             f"({win_min / 60:g}h)")
+
+    BUCKET = timedelta(minutes=bucket_min)
+    WINDOW = timedelta(minutes=win_min)
+    NUM_BUCKETS = nb
+    TOTAL_WIDTH = MARGIN + NUM_BUCKETS
+    ACTIVE_WINDOW = max(timedelta(hours=aw_hours), BUCKET)
+    INTERVAL_SECONDS = args.interval if args.interval else bucket_min * 60
+    args.interval = INTERVAL_SECONDS        # the run loop reads args.interval
+
+
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--once", action="store_true", help="render one frame and exit")
-    ap.add_argument("--interval", type=int, default=INTERVAL_SECONDS,
-                    metavar="SECONDS", help="seconds between refreshes (default 300)")
-    ap.add_argument("--active-window", type=int, default=60, metavar="MINUTES",
+    ap.add_argument("--interval", type=int, default=None, metavar="SECONDS",
+                    help="seconds between transcript refreshes "
+                         "(default: one bucket)")
+    ap.add_argument("--window-hours", type=float, default=None, metavar="HOURS",
+                    help="chart history span. Unset: fill the terminal width "
+                         "(wider terminal -> more history). Given: fixed, and "
+                         "validated to fit the width.")
+    ap.add_argument("--bucket-minutes", type=int, default=5, metavar="MINUTES",
+                    help="width of one chart bar / bucket (default 5)")
+    ap.add_argument("--active-window-hours", type=float, default=1.0,
+                    metavar="HOURS",
                     help="how far back a session (and, in the detail popup, its "
-                         "subagents) counts as active (default 60)")
+                         "subagents, and the SUMMARY active-window tab) counts "
+                         "as active (default 1)")
     args = ap.parse_args()
-    global ACTIVE_WINDOW
-    ACTIVE_WINDOW = timedelta(minutes=max(args.active_window, 1))
+
+    cols = term_cols()
+    configure_dimensions(args, cols, ap.error)
 
     if args.once:
         now = datetime.now(timezone.utc)
