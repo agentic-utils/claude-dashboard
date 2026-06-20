@@ -165,6 +165,16 @@ def add_usage(bk, inp, f5, f1, read, fresh, out):
     bk["responses"] += 1
 
 
+def eff_tokens(uncached, c5m, c1h, read, output):
+    """Effective tokens: everything normalised to base-input-token-equivalents
+    using Anthropic's per-token price multipliers. 5m cache write = 1.25x base
+    input, 1h write = 2x, cache read = 0.1x, uncached input = 1x, and OUTPUT =
+    5x base input (the output:input price ratio, uniform across Claude models).
+    One definition shared by the bucket summary and the per-session accounting
+    so the two never drift."""
+    return uncached + 1.25 * c5m + 2 * c1h + 0.1 * read + 5 * output
+
+
 def model_max_window(model):
     # Max context a model CAN do. FINDING (2026-06): the 1M context is a per-
     # request beta header, NOT a model property — it's stripped from the logged
@@ -358,7 +368,7 @@ def collect(now: datetime):
                     fresh = inp + creation
                     out = usage.get("output_tokens", 0) or 0
                     total_in = inp + creation + read
-                    eff = inp + 1.25 * f5 + 2 * f1 + 0.1 * read
+                    eff = eff_tokens(inp, f5, f1, read, out)
                     model = msg.get("model")
 
                     # Charts 1 & 2 + output/responses for the global bucket.
@@ -622,7 +632,7 @@ def summary_rows(buckets, inner):
         return kv(rgb(CO[key], CHIP) + " " + rgb(TEXT, name), rgb(TEXT, value))
 
     def beff(bs):
-        return sum(b["uncached"] + 1.25 * b["c5m"] + 2 * b["c1h"] + 0.1 * b["read"]
+        return sum(eff_tokens(b["uncached"], b["c5m"], b["c1h"], b["read"], b["output"])
                    for b in bs)
 
     eff_12 = beff(buckets)
