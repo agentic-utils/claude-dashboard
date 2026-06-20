@@ -761,7 +761,7 @@ def summary_rows(buckets, inner, win_label, lean=False, compact_nums=False):
     return rows
 
 
-SESS_COL_W = {"c1h": 20, "c12h": 20, "ctx": 12}   # widths of the optional columns
+SESS_COL_W = {"c1h": 20, "c12h": 20, "ctx": 9}    # widths of the optional columns
 SESS_FIXED_W = 8                                   # indent(2) + last(6)
 IDENT_MAX, IDENT_MIN = 32, 12                       # session-name column range
 
@@ -776,8 +776,9 @@ def session_rows(sessions, now, inner, cols=("c1h", "c12h", "ctx"),
     cutoff = now - ACTIVE_WINDOW
     active = sorted((s for s in sessions.values() if s["last_act"] >= cutoff),
                     key=lambda s: s["last_act"], reverse=True)
-    heads = {"c1h": f"{'1h main/sub':<20}", "c12h": f"{'12h main/sub':<20}",
-             "ctx": f"{'context':<12}"}
+    heads = {"c1h": f"{'1h main/sub':<{SESS_COL_W['c1h']}}",
+             "c12h": f"{'12h main/sub':<{SESS_COL_W['c12h']}}",
+             "ctx": f"{'context':<{SESS_COL_W['ctx']}}"}
     rows = [rgb(DIM, f"  {'last':<6}{'session':<{ident_w}}"
                      + "".join(heads[c] for c in cols))]
     if not active:
@@ -815,9 +816,9 @@ def session_rows(sessions, now, inner, cols=("c1h", "c12h", "ctx"),
         proj = _clean(os.path.basename(s["cwd"])) if s["cwd"] else ""
         ident = s["name"] or proj or s["sid"][:8]
         ident_col = rgb(TEXT, f"{ident[:ident_w]:<{ident_w}}")
-        cells = {"c1h": lambda: _padcol(bal(s["main_1h"], s["sub_1h"]), 20),
-                 "c12h": lambda: _padcol(bal(s["main_12"], s["sub_12"]), 20),
-                 "ctx": lambda: _padcol(ctx_cell(s), 12)}
+        cells = {"c1h": lambda: _padcol(bal(s["main_1h"], s["sub_1h"]), SESS_COL_W["c1h"]),
+                 "c12h": lambda: _padcol(bal(s["main_12"], s["sub_12"]), SESS_COL_W["c12h"]),
+                 "ctx": lambda: _padcol(ctx_cell(s), SESS_COL_W["ctx"])}
         rows.append(indent + when_col + ident_col
                     + "".join(cells[c]() for c in cols))
     return rows, active_sids
@@ -1635,7 +1636,7 @@ GAP = 3
 # ("▆ 5m cache · subagent" + pct = 28). SUMM_MIN is the lean floor (no meters,
 # compact numbers). The summary may only shrink below SUMM_FULL when lean.
 SUMM_FULL, SUMM_MIN = 28, 16
-ALLOW_MAX, ALLOW_MIN = 26, 13                   # allowance inner range
+ALLOW_MAX, ALLOW_MIN = 26, 14                   # allowance inner range
 
 
 def _panel_row_w(summ_inner, sess_cols, ident_w, allow_inner):
@@ -1742,7 +1743,13 @@ def run_live(args):
     fd = sys.stdin.fileno() if alt else None
     old_term = None
     if alt:
-        sys.stdout.write("\033[?1049h\033[?25l")   # alt screen, hide cursor
+        # Alt screen, hide cursor, and DISABLE autowrap (?7l): a glyph written
+        # to the last terminal column otherwise leaves a pending wrap that some
+        # terminals/tmux smear or drop — which dropped the rightmost panel's
+        # border at widths where the panel row exactly filled the screen. With
+        # autowrap off, full-width lines render in place (and any stray
+        # over-width line clips instead of wrapping + desyncing the layout).
+        sys.stdout.write("\033[?1049h\033[?25l\033[?7l")
         # Enable SGR mouse reporting + cbreak input so clicks/keys arrive
         # immediately. cbreak (not raw) keeps ISIG, so ⌃C still raises.
         try:
@@ -1927,7 +1934,7 @@ def run_live(args):
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
                 except (termios.error, ValueError, OSError):
                     pass
-            sys.stdout.write("\033[?25h\033[?1049l")   # show cursor, leave alt
+            sys.stdout.write("\033[?7h\033[?25h\033[?1049l")   # re-enable wrap, show cursor, leave alt
             sys.stdout.flush()
 
 
