@@ -74,6 +74,7 @@ ACTIVE_WINDOW = timedelta(hours=1)
 CHART_HEIGHT = 8
 MIN_BAR_H = 2                               # floor so 3 charts fit ~9 rows (95x9)
 MARGIN = 8                                  # left gutter for the Y-axis scale
+RIGHT_RESERVE = 1                           # leave the last terminal column unused
 TOTAL_WIDTH = MARGIN + NUM_BUCKETS
 # When --window-hours is unset the window fills the terminal width and tracks it
 # live on resize (re-bucketing on the next collect); a fixed --window-hours does
@@ -1516,13 +1517,14 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
         foot = foot[:TOTAL_WIDTH - 2]          # clip so it never wraps/overflows
         out += ["", "  " + rgb(DIM, foot)]
 
-    # DEBUG: terminal size, right-aligned so its LAST char sits in the LAST
-    # displayable column — a live probe for last-column truncation. If the final
-    # digit/char is missing, the terminal is dropping the last column.
-    cw = cols if cols is not None else TOTAL_WIDTH
-    dbg = f"term {cw}x{rows if rows is not None else '?'} · chart {TOTAL_WIDTH}"
-    dbg = dbg[:cw]
-    out.append(" " * max(cw - len(dbg), 0) + rgb(WARN_C, dbg))
+    # DEBUG: terminal size, right-aligned to the last USED column (we reserve the
+    # rightmost terminal column, so the used width is cols-RIGHT_RESERVE). If the
+    # final char is still missing, the terminal is dropping more than one column.
+    actual = cols if cols is not None else TOTAL_WIDTH
+    usable = (actual - RIGHT_RESERVE) if cols is not None else TOTAL_WIDTH
+    dbg = f"term {actual}x{rows if rows is not None else '?'} · chart {TOTAL_WIDTH}"
+    dbg = dbg[:usable]
+    out.append(" " * max(usable - len(dbg), 0) + rgb(WARN_C, dbg))
     return "\n".join(out), hits
 
 
@@ -1552,7 +1554,11 @@ def configure_dimensions(args, cols, fail):
         fail("--active-window-hours must be > 0")
 
     AUTOFIT = args.window_hours is None
-    avail = max(cols - MARGIN, 1)            # bucket columns the width allows
+    # Reserve the rightmost terminal column (RIGHT_RESERVE): writing a glyph to
+    # the last column is unreliable — the per-line clear in the paint loop erases
+    # it on some terminals, dropping a panel's right border at exact-fit widths.
+    # Keeping everything within cols-1 sidesteps it entirely.
+    avail = max(cols - MARGIN - RIGHT_RESERVE, 1)   # bucket columns width allows
     if AUTOFIT:
         nb = max(avail, MIN_BUCKETS)        # fill the terminal (tracks resize)
     else:
@@ -1565,7 +1571,7 @@ def configure_dimensions(args, cols, fail):
         nb = win_min // bucket_min
         if nb > avail:
             fail(f"--window-hours {args.window_hours:g} needs {nb} bars "
-                 f"({MARGIN + nb} cols) but the terminal is {cols} wide. Widen "
+                 f"({MARGIN + nb + RIGHT_RESERVE} cols) but the terminal is {cols} wide. Widen "
                  f"it, lower --window-hours, or raise --bucket-minutes.")
     win_min = nb * bucket_min
 
@@ -1592,7 +1598,7 @@ def refit_width(cols):
     global WINDOW, NUM_BUCKETS, TOTAL_WIDTH
     if not AUTOFIT:
         return False
-    nb = max(cols - MARGIN, MIN_BUCKETS)
+    nb = max(cols - MARGIN - RIGHT_RESERVE, MIN_BUCKETS)
     if nb == NUM_BUCKETS:
         return False
     NUM_BUCKETS, WINDOW, TOTAL_WIDTH = nb, BUCKET * nb, MARGIN + nb
@@ -1728,7 +1734,7 @@ def plan_layout(rows, cols, sessions, now):
     # the minimum bar height; otherwise they move to the s/e/w popups and the
     # charts take the freed rows. panel_body is the EXACT rendered height (the
     # tallest of the three panels) so the charts fill the rest with no waste.
-    cfg = fit_panels(cols, lean)
+    cfg = fit_panels(cols - RIGHT_RESERVE, lean)
     panel_body = 0
     if cfg is not None:
         summ = 4 if lean else 9             # summary_rows length
