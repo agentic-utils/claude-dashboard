@@ -864,6 +864,75 @@ def render_popup(sid, sessions, now, cols, rows, anim=0):
     return panel("SESSION DETAIL", body, inner)
 
 
+def render_bucket_popup(idx, sessions, now, cols, rows):
+    """A bordered modal breaking one chart bar (a single bucket / time slice)
+    down by session, covering all three chart dimensions: input (uncached / 5m
+    write / 1h write), context (read / new / miss), output, and effective
+    tokens. Returns the list of lines, or None if the index is out of range."""
+    if not (0 <= idx < NUM_BUCKETS):
+        return None
+    inner = 92
+    cutoff = now - WINDOW
+    start = (cutoff + idx * BUCKET).astimezone()
+    end = (cutoff + (idx + 1) * BUCKET).astimezone()
+    span = f"{start:%H:%M}–{end:%H:%M}"
+
+    agg = empty_bucket()
+    entries = []                         # (label, bucket, eff, model)
+    for s in sessions.values():
+        b = s["buckets"][idx]
+        if b["uncached"] + b["c5m"] + b["c1h"] + b["read"] + b["output"] <= 0:
+            continue
+        for k in agg:
+            agg[k] += b[k]
+        label = (s["name"] or _clean(os.path.basename(s["cwd"]) or "")
+                 or s["sid"][:8])
+        e = eff_tokens(b["uncached"], b["c5m"], b["c1h"], b["read"], b["output"])
+        entries.append((label, b, e, s.get("model")))
+    entries.sort(key=lambda e: e[2], reverse=True)
+
+    head = (rgb(TEXT, f"bucket {span}", bold=True)
+            + rgb(DIM, f"   ·   {fmt_window(BUCKET)} slice   ·   "
+                       f"{len(entries)} session{'' if len(entries) == 1 else 's'}"))
+
+    # session(26) new(11) writes(11) reads(11) output(10) eff -> ~92 inner.
+    def row(label, b, eff, lab_style):
+        def c(v):
+            return rgb(TEXT, fmt_compact(round(v)))
+        return ("  " + _padcol(lab_style(label[:24]), 26)
+                + _padcol(c(b["uncached"]), 11)
+                + _padcol(c(b["c5m"] + b["c1h"]), 11)
+                + _padcol(c(b["read"]), 11)
+                + _padcol(c(b["output"]), 10)
+                + rgb(TEXT, fmt_compact(round(eff)), bold=True))
+
+    header = ("  " + _padcol(rgb(DIM, "session"), 26)
+              + _padcol(rgb(DIM, "new in"), 11) + _padcol(rgb(DIM, "writes"), 11)
+              + _padcol(rgb(DIM, "reads"), 11) + _padcol(rgb(DIM, "output"), 10)
+              + rgb(DIM, "eff"))
+
+    body = [head, ""]
+    if not entries:
+        body += [rgb(DIM, "  no activity in this slice")]
+    else:
+        body += [header]
+        agg_eff = eff_tokens(agg["uncached"], agg["c5m"], agg["c1h"],
+                             agg["read"], agg["output"])
+        # Cap to vertical room: header + total row + footer(2) + borders(2).
+        used = len(body) + 1 + 2 + 2 + 1
+        room = max(rows - used, 1)
+        shown = entries[:room] if len(entries) > room else entries
+        body += [row(lab, b, e, lambda t: rgb(TEXT, t)) for lab, b, e, _ in shown]
+        if len(entries) > len(shown):
+            body += ["  " + rgb(DIM, f"+{len(entries) - len(shown)} more (by eff)")]
+        body += [rgb(DIM2, "─" * inner),
+                 row("all sessions", agg, agg_eff,
+                     lambda t: rgb(TEXT, t, bold=True))]
+
+    body += ["", "  " + rgb(DIM, "click outside · q · esc to close")]
+    return panel("BUCKET BREAKDOWN", body, inner)
+
+
 def render_help(now, cols, rows, scroll):
     """A modal explaining every element of the dashboard and how to read it.
 
@@ -1262,16 +1331,27 @@ def render_frame(now, buckets, sessions, anim=0, height=CHART_HEIGHT,
         "  " + legend([("uncached", "uncached"),
                        ("c5m", "5m · subagent"), ("c1h", "1h · main")]),
     ]
-    out += render_chart("Input tokens · cache write disposition",
-                        ["uncached", "c5m", "c1h"], buckets, height, now, anim)
+    # Each chart's bar rows are clickable: a click drills into that bucket. Bar
+    # rows are out lines [chart_start+1 .. chart_start+height] (render_chart =
+    # title + height bars + baseline + axis); token "__chart__" carries no idx —
+    # process_input derives the bucket from the click x (col MARGIN+i+1).
+    chart_rows = []   # 1-based terminal rows that sit over the bars
+
+    def add_chart(*chart_args):
+        start = len(out)
+        out.extend(render_chart(*chart_args))
+        chart_rows.extend(range(start + 2, start + 1 + height + 1))
+
+    add_chart("Input tokens · cache write disposition",
+              ["uncached", "c5m", "c1h"], buckets, height, now, anim)
     out += ["",
             "  " + legend([("read", "from cache"),
                            ("new", "new input"), ("miss", "cache miss")])]
-    out += render_chart("Context assembly",
-                        ["read", "new", "miss"], buckets, height, now, anim)
+    add_chart("Context assembly",
+              ["read", "new", "miss"], buckets, height, now, anim)
     out += ["", "  " + legend([("output", "output tokens")])]
-    out += render_chart("Output tokens generated",
-                        ["output"], buckets, height, now, anim)
+    add_chart("Output tokens generated",
+              ["output"], buckets, height, now, anim)
 
     out += [""]
     summ_inner, sess_inner, allow_inner = 40, 92, 26
@@ -1312,6 +1392,8 @@ def render_frame(now, buckets, sessions, anim=0, height=CHART_HEIGHT,
     # the "╭─ " prefix; seg offsets are 0-based within that text.
     tab_row = panel_start + 1
     hits += [(tab_row, 4 + lo, 4 + hi, tok) for tok, lo, hi in s_segs]
+    # Chart bars: any bar row, across the bucket columns, drills into a bucket.
+    hits += [(r, MARGIN + 1, MARGIN + NUM_BUCKETS, "__chart__") for r in chart_rows]
     # Make the ALLOWANCE panel clickable when there's a live usage error to show
     # (opens the USAGE CALL ERROR overlay). Its column span sits to the right of
     # the summary + sessions panels.
@@ -1480,6 +1562,7 @@ def run_live(args):
     anim = 0
     hits = []
     focus_sid = None
+    focus_bucket = None
     summary_tab = "win"
     show_help = False
     show_uerr = False
@@ -1526,10 +1609,10 @@ def run_live(args):
             if alt and (cols < TOTAL_WIDTH or frame.count("\n") + 1 > rows):
                 hits = []
                 show_help = show_uerr = False
-                focus_sid = None
+                focus_sid = focus_bucket = None
                 frame = render_too_small(cols, rows, height * 3 + 30)
             if alt:
-                # One overlay at a time: help > usage-error > popup.
+                # One overlay at a time: help > usage-error > session > bucket.
                 overlay, okey = None, None
                 if show_help:
                     if not prev_show_help:        # freshly opened: reset scroll
@@ -1549,6 +1632,12 @@ def run_live(args):
                         focus_sid = None
                     else:
                         okey = ("popup", focus_sid)
+                elif focus_bucket is not None:
+                    overlay = render_bucket_popup(focus_bucket, sessions, now, cols, rows)
+                    if overlay is None:
+                        focus_bucket = None
+                    else:
+                        okey = ("bucket", focus_bucket)
                 if overlay is None:
                     # No overlay: full base repaint each tick (shimmer live).
                     body = "\033[H" + frame.replace("\n", "\033[K\n") + "\033[K\033[J"
@@ -1586,10 +1675,10 @@ def run_live(args):
                         data = os.read(fd, 4096).decode("utf-8", "ignore")
                     except OSError:
                         data = ""
-                    (focus_sid, summary_tab, show_help, show_uerr,
+                    (focus_sid, focus_bucket, summary_tab, show_help, show_uerr,
                      scroll_delta) = process_input(
-                        data, mouse_re, hits, focus_sid, summary_tab,
-                        show_help, show_uerr)
+                        data, mouse_re, hits, focus_sid, focus_bucket,
+                        summary_tab, show_help, show_uerr)
                     # Only the help overlay scrolls; the delta is clamped each
                     # render and ignored when help is closed (reset on open).
                     help_scroll += scroll_delta
@@ -1612,19 +1701,21 @@ def run_live(args):
             sys.stdout.flush()
 
 
-def process_input(data, mouse_re, hits, focus_sid, summary_tab,
+def process_input(data, mouse_re, hits, focus_sid, focus_bucket, summary_tab,
                   show_help, show_uerr):
-    """Update (focus_sid, summary_tab, show_help, show_uerr) from a chunk of
-    terminal input and return a scroll delta for the (only scrollable) help
-    overlay.
+    """Update (focus_sid, focus_bucket, summary_tab, show_help, show_uerr) from a
+    chunk of terminal input and return a scroll delta for the (only scrollable)
+    help overlay.
 
-    A left-click on a session row opens/switches its popup; a click on a SUMMARY
-    tab (TAB_WIN/TAB_AW) switches the summary window; a click on the ALLOWANCE
-    panel (token "__usage__") opens the usage-error overlay; a click outside
-    closes whatever overlay is open. '?' toggles help; q/bare-esc closes every
-    overlay. Mouse wheel and arrow/PgUp/PgDn/j/k scroll the help overlay.
+    A left-click on a session row opens/switches its popup; a click on a chart
+    bar (token "__chart__") drills into that bucket; a click on a SUMMARY tab
+    (TAB_WIN/TAB_AW) switches the summary window; a click on the ALLOWANCE panel
+    (token "__usage__") opens the usage-error overlay; a click outside closes
+    whatever overlay is open. '?' toggles help; q/bare-esc closes every overlay.
+    Mouse wheel and arrow/PgUp/PgDn/j/k scroll the help overlay.
 
-    Returns (focus_sid, summary_tab, show_help, show_uerr, scroll_delta)."""
+    Returns (focus_sid, focus_bucket, summary_tab, show_help, show_uerr,
+    scroll_delta)."""
     delta = 0
     for m in mouse_re.finditer(data):
         button, x, y, final = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
@@ -1643,15 +1734,19 @@ def process_input(data, mouse_re, hits, focus_sid, summary_tab,
                         if tr == y and lo <= x <= hi), None)
             if hit in (TAB_WIN, TAB_AW):   # switch summary window, leave overlays
                 summary_tab = "aw" if hit == TAB_AW else "win"
+            elif hit == "__chart__":       # drill into the clicked bucket
+                focus_bucket = x - MARGIN - 1
+                focus_sid, show_uerr = None, False
             elif hit == "__usage__":
                 show_uerr = True
-                focus_sid = None           # one overlay at a time
+                focus_sid = focus_bucket = None   # one overlay at a time
             elif hit is not None:
                 focus_sid = hit
+                focus_bucket = None
                 show_uerr = False
-            elif show_uerr or focus_sid is not None:
+            elif show_uerr or focus_sid is not None or focus_bucket is not None:
                 show_uerr = False
-                focus_sid = None
+                focus_sid = focus_bucket = None
     # Strip mouse sequences, then handle keys. Arrow/PgUp/PgDn are multi-byte
     # escape SEQUENCES starting with "\x1b[" — detect and consume them FIRST so
     # a bare ESC (a "\x1b" not part of such a sequence) is the only thing that
@@ -1672,9 +1767,9 @@ def process_input(data, mouse_re, hits, focus_sid, summary_tab,
                    for i in range(len(rest)))
     if "q" in rest or bare_esc:
         show_help = False
-        focus_sid = None
+        focus_sid = focus_bucket = None
         show_uerr = False
-    return focus_sid, summary_tab, show_help, show_uerr, delta
+    return focus_sid, focus_bucket, summary_tab, show_help, show_uerr, delta
 
 
 if __name__ == "__main__":
