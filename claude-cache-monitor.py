@@ -677,9 +677,12 @@ def panel(title, rows, inner, title_len=None):
     else:
         head, tl = title, title_len
     fill = max(inner - 3 - tl, 0)
-    out = [rgb(DIM2, "╭─ ") + head + rgb(DIM2, " " + "─" * fill + "╮")]
+    out = [rgb(DIM2, "╭─ ") + _clip(head, inner - 2) + rgb(DIM2, " " + "─" * fill + "╮")]
     for r in rows:
-        out.append(rgb(DIM2, "│") + _padcol(r, inner) + rgb(DIM2, "│"))
+        # Clip as well as pad: a content row wider than `inner` would otherwise
+        # widen the whole block, push the right border off-screen, and desync
+        # the column layout in hjoin. Every panel is exactly inner+2 wide.
+        out.append(rgb(DIM2, "│") + _padcol(_clip(r, inner), inner) + rgb(DIM2, "│"))
     out.append(rgb(DIM2, "╰" + "─" * inner + "╯"))
     return out
 
@@ -743,8 +746,8 @@ def summary_rows(buckets, inner, win_label, lean=False, compact_nums=False):
     rows = [
         kv(rgb(DIM, "input"), rgb(TEXT, bignum(total_input), bold=True)),
         kv(rgb(DIM, "output"), rgb(TEXT, bignum(agg["output"]), bold=True)),
-        kv(rgb(DIM, f"responses · {win_label}"), rgb(TEXT, fmt(agg["responses"]))),
-        kv(rgb(DIM, f"effective · {win_label}"), rgb(TEXT, fmt_compact(round(eff)),
+        kv(rgb(DIM, f"responses"), rgb(TEXT, fmt(agg["responses"]))),
+        kv(rgb(DIM, f"effective"), rgb(TEXT, fmt_compact(round(eff)),
            bold=True)),
     ]
     if not lean:
@@ -778,7 +781,7 @@ def session_rows(sessions, now, inner, cols=("c1h", "c12h", "ctx"),
     rows = [rgb(DIM, f"  {'last':<6}{'session':<{ident_w}}"
                      + "".join(heads[c] for c in cols))]
     if not active:
-        rows.append(rgb(DIM, f"  no sessions active in the last {fmt_window(ACTIVE_WINDOW)}"))
+        rows.append(rgb(DIM, f"  none"))
         return rows, []
 
     def bal(main, sub):
@@ -1416,7 +1419,7 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win")
         layout = {"page_title": True, "footer": True, "compact": False,
                   "axes": True, "chart_blanks": True, "panels_lean": False,
                   "panels_inline": True, "sess_cols": ["c1h", "c12h", "ctx"],
-                  "panel_cfg": {"summ_inner": SUMM_WIDE,
+                  "panel_cfg": {"summ_inner": SUMM_FULL,
                                 "sess_cols": ["c1h", "c12h", "ctx"],
                                 "ident": IDENT_MAX, "allow_inner": ALLOW_MAX,
                                 "compact_nums": False},
@@ -1628,7 +1631,10 @@ def main():
 
 
 GAP = 3
-SUMM_WIDE, SUMM_NARROW = 33, 24                 # summary inner: exact vs compact
+# SUMM_FULL is the non-lean floor: it must hold the widest cache-mix meter row
+# ("▆ 5m cache · subagent" + pct = 28). SUMM_MIN is the lean floor (no meters,
+# compact numbers). The summary may only shrink below SUMM_FULL when lean.
+SUMM_FULL, SUMM_MIN = 28, 16
 ALLOW_MAX, ALLOW_MIN = 26, 13                   # allowance inner range
 
 
@@ -1641,30 +1647,35 @@ def _panel_row_w(summ_inner, sess_cols, ident_w, allow_inner):
     return row
 
 
-def fit_panels(cols):
+def fit_panels(cols, lean):
     """Pick the richest inline panel config that fits `cols`, or None (all
     panels move to the s/e/w popups). To keep the ACTIVE SESSIONS panel with its
     context column alive on a quarter-screen, it first sheds its 12h then 1h
     columns, then progressively (1) truncates the session name, (2) compresses
-    the allowance panel, (3) renders the summary numbers compactly."""
+    the allowance panel, (3) — only when lean, since the cache-mix meters are
+    then hidden — renders the summary numbers compactly. `lean` mirrors
+    plan_layout: when False the summary shows the meters and is pinned to
+    SUMM_FULL. Each candidate is (summ, sess_cols, ident, allow, compact_nums)."""
     cands = []
-    # Wide -> narrow, full quality first.
     for sc in (["c1h", "c12h", "ctx"], ["c1h", "ctx"], ["ctx"]):
-        cands.append((SUMM_WIDE, sc, IDENT_MAX, ALLOW_MAX))
+        cands.append((SUMM_FULL, sc, IDENT_MAX, ALLOW_MAX, False))
     sc = ["ctx"]                                  # keep sessions + context, shrink rest
     for ident in (28, 24, 20, 16, IDENT_MIN):     # lever 1: truncate name
-        cands.append((SUMM_WIDE, sc, ident, ALLOW_MAX))
+        cands.append((SUMM_FULL, sc, ident, ALLOW_MAX, False))
     for allow in (22, 18, ALLOW_MIN):             # lever 2: compress allowance
-        cands.append((SUMM_WIDE, sc, IDENT_MIN, allow))
-    for summ in (30, 27, SUMM_NARROW):            # lever 3: compact summary numbers
-        cands.append((summ, sc, IDENT_MIN, ALLOW_MIN))
-    # Last resorts: drop the sessions panel, then shrink summary+allowance.
-    cands += [(SUMM_WIDE, None, 0, ALLOW_MAX), (SUMM_NARROW, None, 0, ALLOW_MIN)]
-    for summ_inner, sess_cols, ident, allow in cands:
+        cands.append((SUMM_FULL, sc, IDENT_MIN, allow, False))
+    if lean:                                      # lever 3: compact summary numbers
+        for summ in (24, 20, SUMM_MIN):
+            cands.append((summ, sc, IDENT_MIN, ALLOW_MIN, True))
+    # Last resorts: drop the sessions panel, then (lean only) shrink the rest.
+    cands.append((SUMM_FULL, None, 0, ALLOW_MAX, False))
+    if lean:
+        cands.append((SUMM_MIN, None, 0, ALLOW_MIN, True))
+    for summ_inner, sess_cols, ident, allow, compact_nums in cands:
         if cols >= _panel_row_w(summ_inner, sess_cols, ident, allow):
             return {"summ_inner": summ_inner, "sess_cols": sess_cols,
                     "ident": ident, "allow_inner": allow,
-                    "compact_nums": summ_inner < SUMM_WIDE}
+                    "compact_nums": compact_nums}
     return None
 
 
@@ -1704,7 +1715,7 @@ def plan_layout(rows, cols, sessions, now):
     # the minimum bar height; otherwise they move to the s/e/w popups and the
     # charts take the freed rows. panel_body is the EXACT rendered height (the
     # tallest of the three panels) so the charts fill the rest with no waste.
-    cfg = fit_panels(cols)
+    cfg = fit_panels(cols, lean)
     panel_body = 0
     if cfg is not None:
         summ = 4 if lean else 9             # summary_rows length
