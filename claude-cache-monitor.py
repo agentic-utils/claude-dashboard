@@ -668,12 +668,14 @@ def summary_title(summary_tab):
     return styled, off, segs
 
 
-def summary_rows(buckets, inner, win_label, lean=False):
+def summary_rows(buckets, inner, win_label, lean=False, compact_nums=False):
     """Summary figures over `buckets` (the active tab's window slice).
     `win_label` names the window in labels. The effective-token figure is for
     that window only — the 1h/full split is gone now that the tabs select the
     window. `lean` drops the cache-mix breakdown to save rows on short
-    terminals."""
+    terminals; `compact_nums` renders input/output as 55m rather than 55,123,456
+    to narrow the panel."""
+    bignum = fmt_compact if compact_nums else fmt
     agg = empty_bucket()
     for b in buckets:
         for k in agg:
@@ -690,8 +692,8 @@ def summary_rows(buckets, inner, win_label, lean=False):
               for b in buckets)
 
     rows = [
-        kv(rgb(DIM, "input"), rgb(TEXT, fmt(total_input), bold=True)),
-        kv(rgb(DIM, "output"), rgb(TEXT, fmt(agg["output"]), bold=True)),
+        kv(rgb(DIM, "input"), rgb(TEXT, bignum(total_input), bold=True)),
+        kv(rgb(DIM, "output"), rgb(TEXT, bignum(agg["output"]), bold=True)),
         kv(rgb(DIM, f"responses · {win_label}"), rgb(TEXT, fmt(agg["responses"]))),
         kv(rgb(DIM, f"effective · {win_label}"), rgb(TEXT, fmt_compact(round(eff)),
            bold=True)),
@@ -708,20 +710,23 @@ def summary_rows(buckets, inner, win_label, lean=False):
 
 
 SESS_COL_W = {"c1h": 20, "c12h": 20, "ctx": 12}   # widths of the optional columns
-SESS_BASE_W = 40                                   # indent(2) + last(6) + ident(32)
+SESS_FIXED_W = 8                                   # indent(2) + last(6)
+IDENT_MAX, IDENT_MIN = 32, 12                       # session-name column range
 
 
-def session_rows(sessions, now, inner, cols=("c1h", "c12h", "ctx")):
+def session_rows(sessions, now, inner, cols=("c1h", "c12h", "ctx"),
+                 ident_w=IDENT_MAX):
     """Return (rows, active_sids). active_sids is the ordered list of session
     ids for the DATA rows (header excluded), so callers can map a clicked row
-    index back to its session. `cols` selects which optional columns to show;
-    they drop progressively on narrow terminals (12h, then 1h, then context)."""
+    index back to its session. `cols` selects which optional columns to show
+    (they drop 12h, then 1h, then context on narrow terminals); `ident_w` is the
+    session-name column width (truncated narrower to keep sessions+ctx visible)."""
     cutoff = now - ACTIVE_WINDOW
     active = sorted((s for s in sessions.values() if s["last_act"] >= cutoff),
                     key=lambda s: s["last_act"], reverse=True)
     heads = {"c1h": f"{'1h main/sub':<20}", "c12h": f"{'12h main/sub':<20}",
              "ctx": f"{'context':<12}"}
-    rows = [rgb(DIM, f"  {'last':<6}{'session':<32}"
+    rows = [rgb(DIM, f"  {'last':<6}{'session':<{ident_w}}"
                      + "".join(heads[c] for c in cols))]
     if not active:
         rows.append(rgb(DIM, f"  no sessions active in the last {fmt_window(ACTIVE_WINDOW)}"))
@@ -757,7 +762,7 @@ def session_rows(sessions, now, inner, cols=("c1h", "c12h", "ctx")):
         # the project (cwd basename); else the session-id prefix. Truncated.
         proj = _clean(os.path.basename(s["cwd"])) if s["cwd"] else ""
         ident = s["name"] or proj or s["sid"][:8]
-        ident_col = rgb(TEXT, f"{ident[:32]:<32}")
+        ident_col = rgb(TEXT, f"{ident[:ident_w]:<{ident_w}}")
         cells = {"c1h": lambda: _padcol(bal(s["main_1h"], s["sub_1h"]), 20),
                  "c12h": lambda: _padcol(bal(s["main_12"], s["sub_12"]), 20),
                  "ctx": lambda: _padcol(ctx_cell(s), 12)}
@@ -1380,7 +1385,7 @@ CHARTS = [
 ]
 
 
-def summary_panel(buckets, summary_tab, inner, lean=False):
+def summary_panel(buckets, summary_tab, inner, lean=False, compact_nums=False):
     """Build the SUMMARY panel (tabbed) and its tab segments — shared by the
     inline layout and the key-opened popup."""
     if summary_tab == "aw":
@@ -1389,7 +1394,8 @@ def summary_panel(buckets, summary_tab, inner, lean=False):
     else:
         s_buckets, win_label = buckets, fmt_window(WINDOW)
     title, tlen, segs = summary_title(summary_tab)
-    body = summary_rows(s_buckets, inner, win_label, lean=lean)
+    body = summary_rows(s_buckets, inner, win_label, lean=lean,
+                        compact_nums=compact_nums)
     return panel(title, body, inner, title_len=tlen), segs
 
 
@@ -1402,6 +1408,10 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win")
         layout = {"page_title": True, "footer": True, "compact": False,
                   "axes": True, "chart_blanks": True, "panels_lean": False,
                   "panels_inline": True, "sess_cols": ["c1h", "c12h", "ctx"],
+                  "panel_cfg": {"summ_inner": SUMM_WIDE,
+                                "sess_cols": ["c1h", "c12h", "ctx"],
+                                "ident": IDENT_MAX, "allow_inner": ALLOW_MAX,
+                                "compact_nums": False},
                   "height": CHART_HEIGHT}
     height = layout["height"]
     compact, axes = layout["compact"], layout["axes"]
@@ -1437,19 +1447,24 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win")
 
     if layout["panels_inline"]:
         lean = layout["panels_lean"]
-        sess_cols = layout.get("sess_cols")
+        cfg = layout["panel_cfg"]
+        sess_cols = cfg["sess_cols"]
+        summ_inner, allow_inner = cfg["summ_inner"], cfg["allow_inner"]
         out.append("")
-        summ, s_segs = summary_panel(buckets, summary_tab, SUMM_INNER, lean=lean)
+        summ, s_segs = summary_panel(buckets, summary_tab, summ_inner, lean=lean,
+                                     compact_nums=cfg["compact_nums"])
         allow = panel("ALLOWANCE",
-                      allowance_rows(now, int(now.timestamp()), ALLOW_INNER, lean=lean),
-                      ALLOW_INNER)
-        summ_total, allow_total = SUMM_INNER + 2, ALLOW_INNER + 2
+                      allowance_rows(now, int(now.timestamp()), allow_inner, lean=lean),
+                      allow_inner)
+        summ_total, allow_total = summ_inner + 2, allow_inner + 2
 
         panels, active_sids, sess_total = [summ], [], 0
         if sess_cols is not None:         # sessions panel sheds columns by width
-            sess_inner = SESS_BASE_W + sum(SESS_COL_W[c] for c in sess_cols)
+            sess_inner = (SESS_FIXED_W + cfg["ident"]
+                          + sum(SESS_COL_W[c] for c in sess_cols))
             sess_rows, active_sids = session_rows(sessions, now, sess_inner,
-                                                  cols=tuple(sess_cols))
+                                                  cols=tuple(sess_cols),
+                                                  ident_w=cfg["ident"])
             if lean:                      # A4: cap the active-session list to 3
                 sess_rows, active_sids = sess_rows[:1 + 3], active_sids[:3]
             sess_total = sess_inner + 2
@@ -1482,10 +1497,11 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win")
             extra = "   ·   e sessions"
         else:
             extra = ""
-        out += ["", "  " + rgb(DIM, f"plan {plan or '?'}   ·   allowance live, "
-                               f"updated {stamp}   ·   charts every "
-                               f"{max(1, INTERVAL_SECONDS // 60)}m{extra}   ·   "
-                               f"? help   ·   ⌃C to exit")]
+        foot = (f"plan {plan or '?'}   ·   allowance live, updated {stamp}   ·   "
+                f"charts every {max(1, INTERVAL_SECONDS // 60)}m{extra}   ·   "
+                f"? help   ·   ⌃C to exit")
+        foot = foot[:TOTAL_WIDTH - 2]          # clip so it never wraps/overflows
+        out += ["", "  " + rgb(DIM, foot)]
     return "\n".join(out), hits
 
 
@@ -1604,27 +1620,43 @@ def main():
 
 
 GAP = 3
-SUMM_INNER, ALLOW_INNER = 33, 26
-SESS_COL_ORDER = (["c1h", "c12h", "ctx"], ["c1h", "ctx"], ["ctx"], [])
+SUMM_WIDE, SUMM_NARROW = 33, 24                 # summary inner: exact vs compact
+ALLOW_MAX, ALLOW_MIN = 26, 13                   # allowance inner range
 
 
-def panel_row_width(sess_cols):
-    """Total inline width of the panel row for a given sessions-column set, or
-    for no sessions panel when sess_cols is None (summary + allowance only)."""
-    summ_t, allow_t = SUMM_INNER + 2, ALLOW_INNER + 2
-    if sess_cols is None:
-        return summ_t + GAP + allow_t
-    sess_t = SESS_BASE_W + sum(SESS_COL_W[c] for c in sess_cols) + 2
-    return summ_t + GAP + sess_t + GAP + allow_t
+def _panel_row_w(summ_inner, sess_cols, ident_w, allow_inner):
+    """Total inline width of the panel row for a panel config."""
+    row = (summ_inner + 2) + GAP + (allow_inner + 2)
+    if sess_cols is not None:
+        sess_inner = SESS_FIXED_W + ident_w + sum(SESS_COL_W[c] for c in sess_cols)
+        row += GAP + (sess_inner + 2)
+    return row
 
 
-def choose_sess_cols(cols):
-    """Richest sessions-panel column set that fits `cols`, dropping 12h, then 1h,
-    then context. Returns None when not even the label-only panel fits (the
-    sessions panel then moves to the 'e' popup)."""
-    for sc in SESS_COL_ORDER:
-        if cols >= panel_row_width(sc):
-            return sc
+def fit_panels(cols):
+    """Pick the richest inline panel config that fits `cols`, or None (all
+    panels move to the s/e/w popups). To keep the ACTIVE SESSIONS panel with its
+    context column alive on a quarter-screen, it first sheds its 12h then 1h
+    columns, then progressively (1) truncates the session name, (2) compresses
+    the allowance panel, (3) renders the summary numbers compactly."""
+    cands = []
+    # Wide -> narrow, full quality first.
+    for sc in (["c1h", "c12h", "ctx"], ["c1h", "ctx"], ["ctx"]):
+        cands.append((SUMM_WIDE, sc, IDENT_MAX, ALLOW_MAX))
+    sc = ["ctx"]                                  # keep sessions + context, shrink rest
+    for ident in (28, 24, 20, 16, IDENT_MIN):     # lever 1: truncate name
+        cands.append((SUMM_WIDE, sc, ident, ALLOW_MAX))
+    for allow in (22, 18, ALLOW_MIN):             # lever 2: compress allowance
+        cands.append((SUMM_WIDE, sc, IDENT_MIN, allow))
+    for summ in (30, 27, SUMM_NARROW):            # lever 3: compact summary numbers
+        cands.append((summ, sc, IDENT_MIN, ALLOW_MIN))
+    # Last resorts: drop the sessions panel, then shrink summary+allowance.
+    cands += [(SUMM_WIDE, None, 0, ALLOW_MAX), (SUMM_NARROW, None, 0, ALLOW_MIN)]
+    for summ_inner, sess_cols, ident, allow in cands:
+        if cols >= _panel_row_w(summ_inner, sess_cols, ident, allow):
+            return {"summ_inner": summ_inner, "sess_cols": sess_cols,
+                    "ident": ident, "allow_inner": allow,
+                    "compact_nums": summ_inner < SUMM_WIDE}
     return None
 
 
@@ -1641,7 +1673,7 @@ def plan_layout(rows, cols, sessions, now):
     s/e/w popups."""
     cutoff = now - ACTIVE_WINDOW
     n_active = sum(1 for s in sessions.values() if s["last_act"] >= cutoff)
-    allow_len = len(allowance_rows(now, 0, ALLOW_INNER))
+    allow_len = len(allowance_rows(now, 0, ALLOW_MAX))
     L = {
         "page_title":   rows >= 34,
         "footer":       rows >= 31,
@@ -1650,23 +1682,32 @@ def plan_layout(rows, cols, sessions, now):
         "chart_blanks": rows >= 24,
         "panels_lean":  rows < 29,
     }
-    L["panels_inline"] = rows >= 15 and cols >= panel_row_width(None)
-    L["sess_cols"] = choose_sess_cols(cols) if L["panels_inline"] else None
     per_chart = (1 if L["compact"] else 2)
     if L["axes"]:
         per_chart += (1 if L["compact"] else 2)
-    chrome = 3 * per_chart
-    chrome += 2 if L["chart_blanks"] else 0
+    base = 3 * per_chart
+    base += 2 if L["chart_blanks"] else 0
     if L["page_title"]:
-        chrome += 3
+        base += 3
     if L["footer"]:
-        chrome += 2
-    if L["panels_inline"]:
+        base += 2
+
+    # Panels go inline only if they fit the width AND still leave the charts at
+    # height >= 3; otherwise they move to the s/e/w popups and the charts take
+    # the freed rows.
+    cfg = fit_panels(cols)
+    panel_body = 0
+    if cfg is not None:
         summ = 4 if L["panels_lean"] else 9
         sess = (1 + (min(n_active, 3) if L["panels_lean"] else n_active)
-                if L["sess_cols"] is not None else 0)
-        chrome += 1 + 2 + max(summ, sess, allow_len)        # blank+borders+body
-    L["height"] = max(3, min(CHART_HEIGHT, (rows - chrome - 1) // 3))
+                if cfg["sess_cols"] is not None else 0)
+        panel_body = 1 + 2 + max(summ, sess, allow_len)     # blank+borders+body
+        if (rows - base - panel_body - 1) // 3 < 3:
+            cfg, panel_body = None, 0
+    L["panels_inline"] = cfg is not None
+    L["panel_cfg"] = cfg
+    L["sess_cols"] = cfg["sess_cols"] if cfg else None
+    L["height"] = max(3, min(CHART_HEIGHT, (rows - base - panel_body - 1) // 3))
     return L
 
 
