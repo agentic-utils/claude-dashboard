@@ -60,18 +60,27 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 TRANSCRIPT_GLOB = os.path.expanduser("~/.claude/projects/**/*.jsonl")
+# These window/bucket dimensions are RESOLVED at startup in configure_dimensions()
+# from the CLI args and the terminal width; the values here are fallback defaults
+# for non-interactive use (import, piped --once when the size is unknown).
 WINDOW = timedelta(hours=12)
 BUCKET = timedelta(minutes=5)
-NUM_BUCKETS = int(WINDOW / BUCKET)          # 144
-WINDOW_HOURS = int(WINDOW.total_seconds() // 3600)
+NUM_BUCKETS = int(WINDOW / BUCKET)          # 144 (width = MARGIN + NUM_BUCKETS)
 INTERVAL_SECONDS = int(BUCKET.total_seconds())
 # How far back a session (and, in the detail popup, a subagent) counts as
-# "active". Default 1h; overridden by --active-window. Set in main(). Distinct
-# from the fixed "1h main/sub" token column, which stays a 1-hour metric.
+# "active". Default 1h; overridden by --active-window-hours. Set in main().
+# Distinct from the fixed "1h main/sub" token column, a fixed 1-hour metric.
 ACTIVE_WINDOW = timedelta(hours=1)
 CHART_HEIGHT = 8
+MIN_BAR_H = 2                               # floor so 3 charts fit ~9 rows (95x9)
 MARGIN = 8                                  # left gutter for the Y-axis scale
+RIGHT_RESERVE = 1                           # leave the last terminal column unused
 TOTAL_WIDTH = MARGIN + NUM_BUCKETS
+# When --window-hours is unset the window fills the terminal width and tracks it
+# live on resize (re-bucketing on the next collect); a fixed --window-hours does
+# not. Set in configure_dimensions().
+AUTOFIT = True
+MIN_BUCKETS = 20                            # narrowest chart we'll render
 
 # ── 24-bit truecolour palette ────────────────────────────────────────────────
 CO = {
@@ -163,6 +172,16 @@ def add_usage(bk, inp, f5, f1, read, fresh, out):
         bk["miss"] += fresh
     bk["output"] += out
     bk["responses"] += 1
+
+
+def eff_tokens(uncached, c5m, c1h, read, output):
+    """Effective tokens: everything normalised to base-input-token-equivalents
+    using Anthropic's per-token price multipliers. 5m cache write = 1.25x base
+    input, 1h write = 2x, cache read = 0.1x, uncached input = 1x, and OUTPUT =
+    5x base input (the output:input price ratio, uniform across Claude models).
+    One definition shared by the bucket summary and the per-session accounting
+    so the two never drift."""
+    return uncached + 1.25 * c5m + 2 * c1h + 0.1 * read + 5 * output
 
 
 def model_max_window(model):
@@ -358,7 +377,7 @@ def collect(now: datetime):
                     fresh = inp + creation
                     out = usage.get("output_tokens", 0) or 0
                     total_in = inp + creation + read
-                    eff = inp + 1.25 * f5 + 2 * f1 + 0.1 * read
+                    eff = eff_tokens(inp, f5, f1, read, out)
                     model = msg.get("model")
 
                     # Charts 1 & 2 + output/responses for the global bucket.
@@ -488,6 +507,54 @@ def _padcol(s, width):
     return s + " " * max(width - _visible_len(s), 0)
 
 
+def _clip(s, width):
+    """Truncate a (possibly ANSI-styled) string to `width` visible chars,
+    keeping SGR codes intact and resetting at the end."""
+    if _visible_len(s) <= width:
+        return s
+    out, vis, i = [], 0, 0
+    while i < len(s) and vis < width:
+        if s[i] == "\033":
+            j = i
+            while j < len(s) and s[j] != "m":
+                j += 1
+            out.append(s[i:j + 1])
+            i = j + 1
+        else:
+            out.append(s[i])
+            vis += 1
+            i += 1
+    out.append("\033[0m")
+    return "".join(out)
+
+
+def fit_overlay(lines, cols, rows, scroll):
+    """Fit a bordered modal into the terminal. Clips every line to the width;
+    when the modal is taller than the screen, pins the top and bottom border
+    rows and scrolls the middle, drawing a vertical scrollbar in the last inner
+    column. Returns (visible_lines, max_scroll)."""
+    maxw = min(max((_visible_len(l) for l in lines), default=0), cols)
+    if len(lines) <= rows:                       # fits whole: just clip width
+        return [_clip(ln, maxw) for ln in lines], 0
+
+    top, mid, bot = lines[0], lines[1:-1], lines[-1]
+    view_h = max(rows - 2, 1)                     # rows for the scrolling middle
+    max_scroll = max(0, len(mid) - view_h)
+    scroll = max(0, min(scroll, max_scroll))
+    window = mid[scroll:scroll + view_h]
+    inner_w = maxw - 1                            # last col is the scrollbar
+    thumb = max(1, round(view_h * view_h / len(mid)))
+    pos = round(scroll * (view_h - thumb) / max_scroll) if max_scroll else 0
+
+    out = [_clip(top, maxw)]
+    for i, ln in enumerate(window):
+        on = pos <= i < pos + thumb
+        out.append(_padcol(_clip(ln, inner_w), inner_w)
+                   + rgb(ACCENT if on else DIM2, "█" if on else "░"))
+    out.append(_clip(bot, maxw))
+    return out, max_scroll
+
+
 # ── charts ───────────────────────────────────────────────────────────────────
 
 def build_column(vc, total, maxt, height):
@@ -535,13 +602,25 @@ def build_column(vc, total, maxt, height):
     return col
 
 
-def render_chart(title, keys, buckets, height, now, anim=0):
+def render_chart(title, keys, buckets, height, now, anim=0,
+                 short_title=None, legend_items=None, compact=False, axes=True):
+    """Render one bar chart as a list of lines. Compact mode folds the title and
+    legend onto a single header line (using `short_title`) and drops the hourly
+    tick row, saving 2 rows. axes=False also drops the baseline rule. Non-compact
+    behaviour (title line only; legend drawn externally) is unchanged."""
     totals = [sum(b[k] for k in keys) for b in buckets]
     maxt = max(totals) if totals else 0
     columns = [build_column([(CO[k], b[k]) for k in keys], tot, maxt, height)
                for b, tot in zip(buckets, totals)]
 
-    lines = ["  " + rgb(ACCENT, "▸ ", bold=True) + rgb(TEXT, title, bold=True)]
+    if compact:
+        head = ("  " + rgb(ACCENT, "▸ ", bold=True)
+                + rgb(TEXT, short_title or title, bold=True))
+        if legend_items:
+            head += "   " + legend(legend_items)
+        lines = [head]
+    else:
+        lines = ["  " + rgb(ACCENT, "▸ ", bold=True) + rgb(TEXT, title, bold=True)]
     for row in range(height - 1, -1, -1):
         f = 0.5 + 0.5 * (row / (height - 1)) if height > 1 else 1.0
         if row % 2 == 1:                       # Y-axis scale, every other cell
@@ -560,6 +639,8 @@ def render_chart(title, keys, buckets, height, now, anim=0):
         body = "".join(cells)
         lines.append(label + body)
 
+    if not axes:                 # tightest tier: bars only, no baseline/ticks
+        return lines
     # X-axis baseline + absolute local hour ticks (H:00 only).
     axis = [" "] * NUM_BUCKETS
     local_cut = (now - WINDOW).astimezone()
@@ -577,7 +658,8 @@ def render_chart(title, keys, buckets, height, now, anim=0):
         tick += timedelta(hours=1)
     lines.append(rgb(DIM, "0".rjust(MARGIN - 1)) + " "
                  + rgb(DIM2, "└" + "─" * (NUM_BUCKETS - 1)))
-    lines.append(" " * MARGIN + rgb(DIM, "".join(axis)))
+    if not compact:              # compact folds labels into the header instead
+        lines.append(" " * MARGIN + rgb(DIM, "".join(axis)))
     return lines
 
 
@@ -587,12 +669,21 @@ def legend(items):
 
 # ── panels ───────────────────────────────────────────────────────────────────
 
-def panel(title, rows, inner):
-    fill = max(inner - 3 - _visible_len(title), 0)
-    out = [rgb(DIM2, "╭─ ") + rgb(ACCENT, title, bold=True)
-           + rgb(DIM2, " " + "─" * fill + "╮")]
+def panel(title, rows, inner, title_len=None):
+    """`title` is plain text (coloured here) unless `title_len` is given, in
+    which case `title` is taken as already-styled and `title_len` is its visible
+    width — used by the SUMMARY panel to draw multi-segment clickable tabs."""
+    if title_len is None:
+        head, tl = rgb(ACCENT, title, bold=True), _visible_len(title)
+    else:
+        head, tl = title, title_len
+    fill = max(inner - 3 - tl, 0)
+    out = [rgb(DIM2, "╭─ ") + _clip(head, inner - 2) + rgb(DIM2, " " + "─" * fill + "╮")]
     for r in rows:
-        out.append(rgb(DIM2, "│") + _padcol(r, inner) + rgb(DIM2, "│"))
+        # Clip as well as pad: a content row wider than `inner` would otherwise
+        # widen the whole block, push the right border off-screen, and desync
+        # the column layout in hjoin. Every panel is exactly inner+2 wide.
+        out.append(rgb(DIM2, "│") + _padcol(_clip(r, inner), inner) + rgb(DIM2, "│"))
     out.append(rgb(DIM2, "╰" + "─" * inner + "╯"))
     return out
 
@@ -608,7 +699,36 @@ def hjoin(*blocks, gap=3):
     return out
 
 
-def summary_rows(buckets, inner):
+TAB_WIN, TAB_AW = "__tab_win__", "__tab_aw__"
+
+
+def summary_title(summary_tab):
+    """Build the SUMMARY panel's tabbed title. Returns (styled, visible_len,
+    segments) where segments = [(token, lo_off, hi_off)] are 0-based char
+    offsets of each tab within the title text, for the click hit-map."""
+    sep = " · "
+    tabs = [(TAB_WIN, fmt_window(WINDOW)), (TAB_AW, fmt_window(ACTIVE_WINDOW))]
+    active = TAB_AW if summary_tab == "aw" else TAB_WIN
+    styled, off, segs = "", 0, []
+    for i, (tok, lab) in enumerate(tabs):
+        if i:
+            styled += rgb(DIM2, sep)
+            off += len(sep)
+        on = tok == active
+        styled += rgb(ACCENT if on else DIM, lab, bold=on)
+        segs.append((tok, off, off + len(lab) - 1))
+        off += len(lab)
+    return styled, off, segs
+
+
+def summary_rows(buckets, inner, win_label, lean=False, compact_nums=False):
+    """Summary figures over `buckets` (the active tab's window slice).
+    `win_label` names the window in labels. The effective-token figure is for
+    that window only — the 1h/full split is gone now that the tabs select the
+    window. `lean` drops the cache-mix breakdown to save rows on short
+    terminals; `compact_nums` renders input/output as 55m rather than 55,123,456
+    to narrow the panel."""
+    bignum = fmt_compact if compact_nums else fmt
     agg = empty_bucket()
     for b in buckets:
         for k in agg:
@@ -621,39 +741,49 @@ def summary_rows(buckets, inner):
     def meter(key, name, value):
         return kv(rgb(CO[key], CHIP) + " " + rgb(TEXT, name), rgb(TEXT, value))
 
-    def beff(bs):
-        return sum(b["uncached"] + 1.25 * b["c5m"] + 2 * b["c1h"] + 0.1 * b["read"]
-                   for b in bs)
+    eff = sum(eff_tokens(b["uncached"], b["c5m"], b["c1h"], b["read"], b["output"])
+              for b in buckets)
 
-    eff_12 = beff(buckets)
-    eff_1h = beff(buckets[-12:])     # 12 × 5-min buckets ≈ last hour
-
-    return [
-        kv(rgb(DIM, "input tokens"), rgb(TEXT, fmt(total_input), bold=True)),
-        kv(rgb(DIM, "output tokens"), rgb(TEXT, fmt(agg["output"]), bold=True)),
-        kv(rgb(DIM, f"responses · {WINDOW_HOURS}h"), rgb(TEXT, fmt(agg["responses"]))),
-        kv(rgb(DIM, "effective tokens · 1h/12h"),
-           rgb(TEXT, fmt_compact(round(eff_1h)) + " / " + fmt_compact(round(eff_12)),
-               bold=True)),
-        rgb(DIM2, "─" * inner),
-        meter("c5m", "5m cache · subagent", pct(agg["c5m"], total_input)),
-        meter("c1h", "1h cache · main", pct(agg["c1h"], total_input)),
-        meter("read", "read from cache", pct(agg["read"], total_input)),
-        meter("miss", "cache miss", pct(agg["miss"], total_input)),
+    rows = [
+        kv(rgb(DIM, "input"), rgb(TEXT, bignum(total_input), bold=True)),
+        kv(rgb(DIM, "output"), rgb(TEXT, bignum(agg["output"]), bold=True)),
+        kv(rgb(DIM, f"responses"), rgb(TEXT, fmt(agg["responses"]))),
+        kv(rgb(DIM, f"effective"), rgb(TEXT, fmt_compact(round(eff)),
+           bold=True)),
     ]
+    if not lean:
+        rows += [
+            rgb(DIM2, "─" * inner),
+            meter("c5m", "5m cache · subagent", pct(agg["c5m"], total_input)),
+            meter("c1h", "1h cache · main", pct(agg["c1h"], total_input)),
+            meter("read", "read from cache", pct(agg["read"], total_input)),
+            meter("miss", "cache miss", pct(agg["miss"], total_input)),
+        ]
+    return rows
 
 
-def session_rows(sessions, now, inner):
+SESS_COL_W = {"c1h": 20, "c12h": 20, "ctx": 9}    # widths of the optional columns
+SESS_FIXED_W = 8                                   # indent(2) + last(6)
+IDENT_MAX, IDENT_MIN = 32, 12                       # session-name column range
+
+
+def session_rows(sessions, now, inner, cols=("c1h", "c12h", "ctx"),
+                 ident_w=IDENT_MAX):
     """Return (rows, active_sids). active_sids is the ordered list of session
-    ids for the DATA rows (header excluded), in the same order as the rows, so
-    callers can map a clicked row index back to its session."""
+    ids for the DATA rows (header excluded), so callers can map a clicked row
+    index back to its session. `cols` selects which optional columns to show
+    (they drop 12h, then 1h, then context on narrow terminals); `ident_w` is the
+    session-name column width (truncated narrower to keep sessions+ctx visible)."""
     cutoff = now - ACTIVE_WINDOW
     active = sorted((s for s in sessions.values() if s["last_act"] >= cutoff),
                     key=lambda s: s["last_act"], reverse=True)
-    rows = [rgb(DIM, f"  {'last':<6}{'session':<32}"
-                     f"{'1h main/sub':<20}{'12h main/sub':<20}{'context':<12}")]
+    heads = {"c1h": f"{'1h main/sub':<{SESS_COL_W['c1h']}}",
+             "c12h": f"{'12h main/sub':<{SESS_COL_W['c12h']}}",
+             "ctx": f"{'context':<{SESS_COL_W['ctx']}}"}
+    rows = [rgb(DIM, f"  {'last':<6}{'session':<{ident_w}}"
+                     + "".join(heads[c] for c in cols))]
     if not active:
-        rows.append(rgb(DIM, f"  no sessions active in the last {fmt_window(ACTIVE_WINDOW)}"))
+        rows.append(rgb(DIM, f"  none"))
         return rows, []
 
     def bal(main, sub):
@@ -686,13 +816,12 @@ def session_rows(sessions, now, inner):
         # the project (cwd basename); else the session-id prefix. Truncated.
         proj = _clean(os.path.basename(s["cwd"])) if s["cwd"] else ""
         ident = s["name"] or proj or s["sid"][:8]
-        ident_col = rgb(TEXT, f"{ident[:32]:<32}")
-        rows.append(
-            indent + when_col + ident_col
-            + _padcol(bal(s["main_1h"], s["sub_1h"]), 20)
-            + _padcol(bal(s["main_12"], s["sub_12"]), 20)
-            + _padcol(ctx_cell(s), 12)
-        )
+        ident_col = rgb(TEXT, f"{ident[:ident_w]:<{ident_w}}")
+        cells = {"c1h": lambda: _padcol(bal(s["main_1h"], s["sub_1h"]), SESS_COL_W["c1h"]),
+                 "c12h": lambda: _padcol(bal(s["main_12"], s["sub_12"]), SESS_COL_W["c12h"]),
+                 "ctx": lambda: _padcol(ctx_cell(s), SESS_COL_W["ctx"])}
+        rows.append(indent + when_col + ident_col
+                    + "".join(cells[c]() for c in cols))
     return rows, active_sids
 
 
@@ -748,15 +877,16 @@ def render_popup(sid, sessions, now, cols, rows, anim=0):
             msg_txt = msg_txt[:max(room - 1, 0)] + "…"
         body.append(prefix + rgb(TEXT, msg_txt))
     body += [""]
-    body += ["  " + legend([("uncached", "uncached"),
-                            ("c5m", "5m · subagent"), ("c1h", "1h · main")])]
-    body += render_chart("Input tokens · cache write disposition",
-                         ["uncached", "c5m", "c1h"], sb, 5, now, anim)
-    body += ["", "  " + legend([("read", "from cache"),
-                                ("new", "new input"), ("miss", "cache miss")])]
-    body += render_chart("Context assembly", ["read", "new", "miss"], sb, 5, now, anim)
-    body += ["", "  " + legend([("output", "output tokens")])]
-    body += render_chart("Output tokens generated", ["output"], sb, 5, now, anim)
+    # Charts compact exactly like the main view: same breakpoints (drop tick row
+    # and fold title+legend below 39 rows, drop the baseline below 24), and the
+    # bar height shrinks to fit. Reserve ~header + subagent-table chrome; what
+    # doesn't fit still scrolls in the overlay viewport.
+    c = chart_compaction(rows)
+    chrome = 3 + 4 + 4                    # header(3) + subagent(~4) + borders/footer(4)
+    nonbar = (1 if c["compact"] else 2) + (1 if c["axes"] else 0)
+    ch = max(MIN_BAR_H, min(5, (rows - chrome - 3 * nonbar) // 3))
+    block, _ = chart_block(sb, ch, c["compact"], c["axes"], c["blanks"], now, anim)
+    body += block
 
     # Named subagent detail table — subagents active in the lookback window only.
     cutoff = now - ACTIVE_WINDOW
@@ -782,57 +912,132 @@ def render_popup(sid, sessions, now, cols, rows, anim=0):
                   + _padcol(rgb(DIM, "model"), 14)
                   + _padcol(rgb(DIM, "start"), 8) + _padcol(rgb(DIM, "stop"), 8)
                   + _padcol(rgb(DIM, "peak ctx"), 12) + rgb(DIM, "eff tkn"))
-        # Cap the table to whatever vertical space remains. The popup is the
-        # body plus 2 border rows; it must not exceed the terminal height.
-        # Reserve room for the footer (blank + close hint = 2) we add below.
-        footer_lines = 2
-        used = len(body) + 2 + footer_lines + 1   # +1 for the header row
-        room = max(rows - used, 0)
-        detail_rows = []
-        if room <= 0:
-            # No room even for one row: show how many were dropped.
-            detail_rows = ["  " + rgb(DIM, f"+{len(cands)} more (by eff)")]
-        elif len(cands) <= room:
-            detail_rows = [header] + [sub_row(sub) for sub in cands]
-        else:
-            # Keep the largest-by-eff that fit; reserve one row for the "+k more".
-            keep = sorted(cands, key=lambda sub: sub["eff"], reverse=True)[:room - 1]
-            keep_ids = {id(sub) for sub in keep}
-            shown = [sub for sub in cands if id(sub) in keep_ids]  # timeline order
-            detail_rows = ([header] + [sub_row(sub) for sub in shown]
-                           + ["  " + rgb(DIM, f"+{len(cands) - len(shown)} more (by eff)")])
-        body += detail_rows
+        # All subagents shown in timeline order; the overlay viewport scrolls if
+        # the popup is taller than the terminal.
+        body += [header] + [sub_row(sub) for sub in cands]
 
     body += ["", "  " + rgb(DIM, "click outside · q · esc to close")]
     return panel("SESSION DETAIL", body, inner)
 
 
-def render_help(now, cols, rows, scroll):
+def render_bucket_popup(idx, sessions, now, cols, rows):
+    """A bordered modal breaking one chart bar (a single bucket / time slice)
+    down by session, covering all three chart dimensions: input (uncached / 5m
+    write / 1h write), context (read / new / miss), output, and effective
+    tokens. Returns the list of lines, or None if the index is out of range."""
+    if not (0 <= idx < NUM_BUCKETS):
+        return None
+    inner = 92
+    cutoff = now - WINDOW
+    start = (cutoff + idx * BUCKET).astimezone()
+    end = (cutoff + (idx + 1) * BUCKET).astimezone()
+    span = f"{start:%H:%M}–{end:%H:%M}"
+
+    agg = empty_bucket()
+    entries = []                         # (label, bucket, eff, model)
+    for s in sessions.values():
+        b = s["buckets"][idx]
+        if b["uncached"] + b["c5m"] + b["c1h"] + b["read"] + b["output"] <= 0:
+            continue
+        for k in agg:
+            agg[k] += b[k]
+        label = (s["name"] or _clean(os.path.basename(s["cwd"]) or "")
+                 or s["sid"][:8])
+        e = eff_tokens(b["uncached"], b["c5m"], b["c1h"], b["read"], b["output"])
+        entries.append((label, b, e, s.get("model")))
+    entries.sort(key=lambda e: e[2], reverse=True)
+
+    head = (rgb(TEXT, f"bucket {span}", bold=True)
+            + rgb(DIM, f"   ·   {fmt_window(BUCKET)} slice   ·   "
+                       f"{len(entries)} session{'' if len(entries) == 1 else 's'}"))
+
+    # session(26) new(11) writes(11) reads(11) output(10) eff -> ~92 inner.
+    def row(label, b, eff, lab_style):
+        def c(v):
+            return rgb(TEXT, fmt_compact(round(v)))
+        return ("  " + _padcol(lab_style(label[:24]), 26)
+                + _padcol(c(b["uncached"]), 11)
+                + _padcol(c(b["c5m"] + b["c1h"]), 11)
+                + _padcol(c(b["read"]), 11)
+                + _padcol(c(b["output"]), 10)
+                + rgb(TEXT, fmt_compact(round(eff)), bold=True))
+
+    header = ("  " + _padcol(rgb(DIM, "session"), 26)
+              + _padcol(rgb(DIM, "new in"), 11) + _padcol(rgb(DIM, "writes"), 11)
+              + _padcol(rgb(DIM, "reads"), 11) + _padcol(rgb(DIM, "output"), 10)
+              + rgb(DIM, "eff"))
+
+    body = [head, ""]
+    if not entries:
+        body += [rgb(DIM, "  no activity in this slice")]
+    else:
+        body += [header]
+        agg_eff = eff_tokens(agg["uncached"], agg["c5m"], agg["c1h"],
+                             agg["read"], agg["output"])
+        # All sessions shown; the overlay viewport scrolls if it's taller than
+        # the terminal.
+        body += [row(lab, b, e, lambda t: rgb(TEXT, t)) for lab, b, e, _ in entries]
+        body += [rgb(DIM2, "─" * inner),
+                 row("all sessions", agg, agg_eff,
+                     lambda t: rgb(TEXT, t, bold=True))]
+
+    body += ["", "  " + rgb(DIM, "click outside · q · esc to close")]
+    return panel("BUCKET BREAKDOWN", body, inner)
+
+
+def render_panel_popup(view, buckets, sessions, now, rows, summary_tab):
+    """One of the three side panels rendered as a modal (used on terminals too
+    narrow/short to show them inline). Returns (lines, regions) where regions =
+    [(overlay_line, lo_off, hi_off, token)] are clickable spans in coordinates
+    relative to the overlay box; the caller offsets them by the box origin."""
+    if view == "summary":
+        inner = 40
+        p, segs = summary_panel(buckets, summary_tab, inner)
+        # Tabs sit on the title border (overlay line 0); text starts at offset 3
+        # after the "╭─ " prefix.
+        return p, [(0, 3 + lo, 3 + hi, tok) for tok, lo, hi in segs]
+    if view == "sessions":
+        inner = 92
+        sess_rows, active_sids = session_rows(sessions, now, inner)
+        maxdata = max(rows - 4, 1)              # borders + header + a little air
+        if len(active_sids) > maxdata:
+            sess_rows = sess_rows[:1 + maxdata]
+            active_sids = active_sids[:maxdata]
+        p = panel(f"ACTIVE SESSIONS · last {fmt_window(ACTIVE_WINDOW)}",
+                  sess_rows, inner)
+        # data row j -> overlay line 2+j (line 0 border, line 1 header).
+        return p, [(2 + j, 1, inner, sid) for j, sid in enumerate(active_sids)]
+    if view == "allow":
+        inner = 26
+        p = panel("ALLOWANCE",
+                  allowance_rows(now, int(now.timestamp()), inner), inner)
+        return p, []
+    return None, []
+
+
+def render_help(now, cols, rows):
     """A modal explaining every element of the dashboard and how to read it.
 
-    Sized to ~75% of the terminal and word-wrapped so nothing overflows
-    horizontally; scrollable, with a vertical scrollbar in the last column when
-    the content is taller than the visible area.
-
-    Content is authored as typed items so colour survives wrapping:
+    Word-wrapped to fit the width; the overlay viewport scrolls it when taller
+    than the screen. Content is authored as typed items so colour survives
+    wrapping:
       ("H",  text)      heading  (cyan, bold; never wraps — keep short)
       ("L",  text)      legend   (pre-coloured single line; never wraps)
       ("T",  text)      prose    (plain str, single colour; wrapped + DIM'd)
       ("G",  None)      gap      (one blank line)
 
-    Returns (panel_lines, max_scroll)."""
-    inner = max(int(cols * 0.75) - 2, 40)      # content width inside borders
-    ph = max(int(rows * 0.75), 12)             # total panel height
-    twidth = inner - 2                         # wrap prose narrower, leaving the
-    #                                            last 2 cols for gap + scrollbar.
+    Returns the list of panel lines."""
+    inner = max(min(int(cols * 0.75), 80) - 2, 30)   # content width inside borders
+    twidth = inner - 1                         # wrap prose, leaving a col for the
+    #                                            scrollbar fit_overlay may add.
 
     def ch(k):                                  # colour chip for a palette key
         return rgb(CO[k], CHIP)
 
     items = [
-        ("T", f"Live Claude Code cache-token usage, last {WINDOW_HOURS}h in "
-              f"5-minute buckets. Charts refresh every {INTERVAL_SECONDS // 60}m; "
-              "the screen animates."),
+        ("T", f"Live Claude Code cache-token usage, last {fmt_window(WINDOW)} in "
+              f"{fmt_window(BUCKET)} buckets. Charts refresh every "
+              f"{max(1, INTERVAL_SECONDS // 60)}m; the screen animates."),
         ("G", None),
         ("H", "CHARTS"),
         ("T", "y-axis = tokens, x-axis = clock hour."),
@@ -851,11 +1056,12 @@ def render_help(now, cols, rows, scroll):
         ("G", None),
         ("H", "EFFECTIVE TOKENS"),
         ("T", "True cost in token-equivalents. Formula: 1x uncached + "
-              "1.25x 5m-write + 2x 1h-write + 0.1x cache-read."),
+              "1.25x 5m-write + 2x 1h-write + 0.1x cache-read + 5x output."),
         ("G", None),
         ("H", "SUMMARY"),
-        ("T", "12h totals: input, output, responses, effective tokens (1h / 12h), "
-              "plus the cache-mix chips."),
+        ("T", "Totals for the window: input, output, responses, effective tokens, "
+              "plus the cache-mix chips. Click the title TABS to switch between "
+              "the full window and the active window."),
         ("G", None),
         ("H", "ACTIVE SESSIONS"),
         ("T", f"Sessions active in the last {fmt_window(ACTIVE_WINDOW)} "
@@ -887,8 +1093,18 @@ def render_help(now, cols, rows, scroll):
               f"{fmt_window(ACTIVE_WINDOW)} (peak ctx + eff tkn), and any recent "
               "error."),
         ("G", None),
+        ("H", "CLICK A BAR"),
+        ("T", "Opens a breakdown of that one time bucket by session: new input, "
+              "cache writes, cache reads, output, and effective tokens."),
+        ("G", None),
+        ("H", "SMALL TERMINALS"),
+        ("T", "The layout degrades to fit: charts compact, panels move off-screen. "
+              "On a narrow/short terminal press s / e / w to open the SUMMARY / "
+              "active-sessions / allowance panels as popups."),
+        ("G", None),
         ("H", "KEYS"),
-        ("T", "? help · up/down PgUp/PgDn j/k scroll · q / esc close · ^C quit."),
+        ("T", "? help · s/e/w panels · click bar/session/tab · up/down PgUp/PgDn "
+              "j/k scroll · q / esc step back · ^C quit."),
     ]
 
     # Flatten to coloured lines. Headings/legends/gaps -> one line; prose ->
@@ -906,26 +1122,9 @@ def render_help(now, cols, rows, scroll):
             for piece in _wrap(text, twidth):
                 lines.append(rgb(DIM, piece))
 
-    vis = ph - 2                                # panel() uses 2 rows for borders
-    max_scroll = max(0, len(lines) - vis)
-    scroll = max(0, min(scroll, max_scroll))
-
-    if len(lines) <= vis:
-        body = lines                            # fits; let panel pad. No scrollbar.
-    else:
-        window = lines[scroll:scroll + vis]
-        # Scrollbar track of `vis` cells: thumb height proportional to the
-        # visible fraction, thumb position proportional to the scroll fraction.
-        thumb = max(1, round(vis * vis / len(lines)))
-        top = round(scroll / max_scroll * (vis - thumb)) if max_scroll else 0
-        top = max(0, min(top, vis - thumb))
-        body = []
-        for i in range(vis):
-            cell = (rgb(ACCENT, "█") if top <= i < top + thumb
-                    else rgb(DIM2, "│"))
-            body.append(_padcol(window[i], inner - 1) + cell)
-
-    return panel("HELP · how to read this dashboard", body, inner), max_scroll
+    # Full panel; the overlay viewport (fit_overlay) handles scrolling + the
+    # scrollbar so this fits any terminal height.
+    return panel("HELP · how to read this dashboard", lines, inner)
 
 
 def _wrap(text, width):
@@ -1133,7 +1332,7 @@ def retry_str(now):
     return f"retry in {secs // 60}:{secs % 60:02d}"
 
 
-def allowance_rows(now, anim, inner):
+def allowance_rows(now, anim, inner, lean=False):
     u = _usage
     err = u.get("err")
     rc = retry_str(now)
@@ -1149,7 +1348,10 @@ def allowance_rows(now, anim, inner):
     d = u["data"]
     byk = {l.get("kind"): l for l in d.get("limits", [])}
     rows = []
-    for kind, label in (("session", "5-hour session"), ("weekly_all", "weekly")):
+    kinds = (("session", "5-hour session"),)
+    if not lean:                 # lean tier drops the weekly gauge to save rows
+        kinds += (("weekly_all", "weekly"),)
+    for kind, label in kinds:
         lim = byk.get(kind)
         if not lim:
             continue
@@ -1187,131 +1389,380 @@ def render_too_small(cols, rows, need_rows):
     return "\n".join(out)
 
 
-def render_frame(now, buckets, sessions, anim=0, height=CHART_HEIGHT):
-    """Return (frame_str, hits). hits maps clickable session rows to ids:
-    [(term_row, x_lo, x_hi, sid), ...], one per ACTIVE-SESSIONS data row,
-    using 1-based terminal coordinates."""
-    local = now.astimezone()
-    title = "CLAUDE CODE · CACHE TELEMETRY"
-    clock = f"{local:%a %d %b · %H:%M:%S %Z}"
-    pad = max(TOTAL_WIDTH - _visible_len(title) - len(clock) - 4, 1)
+CHARTS = [
+    ("Input tokens · cache write disposition", "Input", ["uncached", "c5m", "c1h"],
+     [("uncached", "uncached"), ("c5m", "5m · subagent"), ("c1h", "1h · main")]),
+    ("Context assembly", "Context", ["read", "new", "miss"],
+     [("read", "from cache"), ("new", "new input"), ("miss", "cache miss")]),
+    ("Output tokens generated", "Output", ["output"],
+     [("output", "output tokens")]),
+]
 
-    out = [
-        " " + rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, title, bold=True)
-        + " " * pad + rgb(DIM, clock),
-        grad_rule(TOTAL_WIDTH, ACCENT2, ACCENT),
-        "",
-        "  " + legend([("uncached", "uncached"),
-                       ("c5m", "5m · subagent"), ("c1h", "1h · main")]),
-    ]
-    out += render_chart("Input tokens · cache write disposition",
-                        ["uncached", "c5m", "c1h"], buckets, height, now, anim)
-    out += ["",
-            "  " + legend([("read", "from cache"),
-                           ("new", "new input"), ("miss", "cache miss")])]
-    out += render_chart("Context assembly",
-                        ["read", "new", "miss"], buckets, height, now, anim)
-    out += ["", "  " + legend([("output", "output tokens")])]
-    out += render_chart("Output tokens generated",
-                        ["output"], buckets, height, now, anim)
 
-    out += [""]
-    summ_inner, sess_inner, allow_inner = 40, 92, 26
-    sess_rows, active_sids = session_rows(sessions, now, sess_inner)
-    summ = panel("SUMMARY · 12h", summary_rows(buckets, summ_inner), summ_inner)
-    sess = panel(f"ACTIVE SESSIONS · last {fmt_window(ACTIVE_WINDOW)}", sess_rows, sess_inner)
-    # Loading dots tick ~1 Hz (not the 10 Hz chart shimmer) so they don't blur.
-    slow = int(now.timestamp())
-    allow = panel("ALLOWANCE", allowance_rows(now, slow, allow_inner), allow_inner)
+def chart_block(buckets, height, compact, axes, blanks, now, anim=0):
+    """Render the three stacked charts with shared compaction so the main view
+    and the session popup degrade identically: `compact` folds each chart's
+    title+legend onto one line and drops the tick row, `axes` keeps the baseline,
+    `blanks` keeps the blank line between charts. Returns (lines, bar_idx) where
+    bar_idx are 0-based indices into `lines` that sit over the bars (clickable)."""
+    out, bar_idx = [], []
+    for i, (title, short, keys, leg) in enumerate(CHARTS):
+        if i and blanks:
+            out.append("")
+        if not compact:
+            out.append("  " + legend(leg))
+        start = len(out)
+        out.extend(render_chart(title, keys, buckets, height, now, anim,
+                                short_title=short, legend_items=leg,
+                                compact=compact, axes=axes))
+        bar_idx.extend(range(start + 1, start + 1 + height))   # bars follow header
+    return out, bar_idx
 
-    # Hit map: the sessions panel sits in the middle column. Within its column,
-    # line 0 is the panel title border, line 1 is the column header, lines 2..
-    # are data rows. panel_start is the 0-based `out` index of the hjoin block's
-    # first line, so data row j is at out index panel_start+2+j -> terminal row
-    # panel_start+2+j+1 (1-based).
-    gap = 3
-    summ_total = summ_inner + 2          # inner + 2 border columns
-    sess_total = sess_inner + 2
-    x_lo = summ_total + gap + 1
-    x_hi = summ_total + gap + sess_total
-    panel_start = len(out)
-    out += hjoin(summ, sess, allow, gap=gap)
-    # 4th tuple element is a TOKEN: a session sid, or the sentinel "__usage__".
-    hits = [(panel_start + 2 + j + 1, x_lo, x_hi, sid)
-            for j, sid in enumerate(active_sids)]
-    # Make the ALLOWANCE panel clickable when there's a live usage error to show
-    # (opens the USAGE CALL ERROR overlay). Its column span sits to the right of
-    # the summary + sessions panels.
-    if _usage.get("err") and _usage["err"] != "loading…":
-        allow_lo = summ_total + gap + sess_total + gap + 1
-        allow_hi = allow_lo + (allow_inner + 2) - 1
-        hits += [(panel_start + k + 1, allow_lo, allow_hi, "__usage__")
-                 for k in range(len(allow))]
 
-    plan = " · ".join(p for p in (_usage.get("sub"), _usage.get("tier")) if p)
-    stamp = _usage["at"].astimezone().strftime("%H:%M:%S") if _usage.get("at") else "—"
-    out += ["", "  " + rgb(DIM, f"plan {plan or '?'}   ·   allowance live, "
-                           f"updated {stamp}   ·   charts every "
-                           f"{INTERVAL_SECONDS // 60}m   ·   ? help   ·   ⌃C to exit")]
+def chart_compaction(rows):
+    """The compaction flags for a given terminal height, shared by the main view
+    and the popup: same breakpoints as plan_layout."""
+    return {"compact": rows < 39, "axes": rows >= 24, "blanks": rows >= 24}
+
+
+def summary_panel(buckets, summary_tab, inner, lean=False, compact_nums=False):
+    """Build the SUMMARY panel (tabbed) and its tab segments — shared by the
+    inline layout and the key-opened popup."""
+    if summary_tab == "aw":
+        n = max(1, round(ACTIVE_WINDOW / BUCKET))
+        s_buckets, win_label = buckets[-n:], fmt_window(ACTIVE_WINDOW)
+    else:
+        s_buckets, win_label = buckets, fmt_window(WINDOW)
+    title, tlen, segs = summary_title(summary_tab)
+    body = summary_rows(s_buckets, inner, win_label, lean=lean,
+                        compact_nums=compact_nums)
+    return panel(title, body, inner, title_len=tlen), segs
+
+
+def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
+                 cols=None, rows=None):
+    """Return (frame_str, hits). hits maps clickable regions to TOKENS:
+    [(term_row, x_lo, x_hi, token), ...] in 1-based terminal coordinates. A token
+    is a session sid, a SUMMARY tab (TAB_WIN/TAB_AW), "__chart__", or
+    "__usage__". `layout` is a plan_layout() dict; None means the full layout."""
+    if layout is None:
+        layout = {"page_title": True, "footer": True, "compact": False,
+                  "axes": True, "chart_blanks": True, "panels_lean": False,
+                  "panels_inline": True, "sess_cols": ["c1h", "c12h", "ctx"],
+                  "panel_cfg": {"summ_inner": SUMM_FULL,
+                                "sess_cols": ["c1h", "c12h", "ctx"],
+                                "ident": IDENT_MAX, "allow_inner": ALLOW_MAX,
+                                "compact_nums": False},
+                  "height": CHART_HEIGHT}
+    height = layout["height"]
+    compact, axes = layout["compact"], layout["axes"]
+    out, hits = [], []
+
+    if layout["page_title"]:
+        local = now.astimezone()
+        title = "CLAUDE CODE · CACHE TELEMETRY"
+        clock = f"{local:%a %d %b · %H:%M:%S %Z}"
+        pad = max(TOTAL_WIDTH - _visible_len(title) - len(clock) - 4, 1)
+        out += [
+            " " + rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, title, bold=True)
+            + " " * pad + rgb(DIM, clock),
+            grad_rule(TOTAL_WIDTH, ACCENT2, ACCENT),
+            "",
+        ]
+
+    # Charts. Bar rows carry the "__chart__" hit token (process_input derives the
+    # bucket from the click x). Shared with the popup via chart_block.
+    base = len(out)
+    block, bar_idx = chart_block(buckets, height, compact, axes,
+                                 layout["chart_blanks"], now, anim)
+    out += block
+    hits += [(base + ri + 1, MARGIN + 1, MARGIN + NUM_BUCKETS, "__chart__")
+             for ri in bar_idx]
+
+    if layout["panels_inline"]:
+        lean = layout["panels_lean"]
+        cfg = layout["panel_cfg"]
+        sess_cols = cfg["sess_cols"]
+        summ_inner, allow_inner = cfg["summ_inner"], cfg["allow_inner"]
+        out.append("")
+        summ, s_segs = summary_panel(buckets, summary_tab, summ_inner, lean=lean,
+                                     compact_nums=cfg["compact_nums"])
+        allow = panel("ALLOWANCE",
+                      allowance_rows(now, int(now.timestamp()), allow_inner, lean=lean),
+                      allow_inner)
+        summ_total, allow_total = summ_inner + 2, allow_inner + 2
+
+        panels, active_sids, sess_total = [summ], [], 0
+        if sess_cols is not None:         # sessions panel sheds columns by width
+            sess_inner = (SESS_FIXED_W + cfg["ident"]
+                          + sum(SESS_COL_W[c] for c in sess_cols))
+            sess_rows, active_sids = session_rows(sessions, now, sess_inner,
+                                                  cols=tuple(sess_cols),
+                                                  ident_w=cfg["ident"])
+            if lean:                      # A4: cap the active-session list to 3
+                sess_rows, active_sids = sess_rows[:1 + 3], active_sids[:3]
+            sess_total = sess_inner + 2
+            panels.append(panel(f"ACTIVE SESSIONS · last {fmt_window(ACTIVE_WINDOW)}",
+                                 sess_rows, sess_inner))
+        panels.append(allow)
+
+        panel_start = len(out)
+        out += hjoin(*panels, gap=GAP)
+        tab_row = panel_start + 1
+        hits += [(tab_row, 4 + lo, 4 + hi, tok) for tok, lo, hi in s_segs]
+        if sess_cols is not None:
+            x_lo = summ_total + GAP + 1
+            x_hi = summ_total + GAP + sess_total
+            hits += [(panel_start + 2 + j + 1, x_lo, x_hi, sid)
+                     for j, sid in enumerate(active_sids)]
+            allow_x0 = summ_total + GAP + sess_total + GAP + 1
+        else:
+            allow_x0 = summ_total + GAP + 1
+        if _usage.get("err") and _usage["err"] != "loading…":
+            hits += [(panel_start + k + 1, allow_x0, allow_x0 + allow_total - 1,
+                      "__usage__") for k in range(len(allow))]
+
+    if layout["footer"]:
+        plan = " · ".join(p for p in (_usage.get("sub"), _usage.get("tier")) if p)
+        stamp = _usage["at"].astimezone().strftime("%H:%M:%S") if _usage.get("at") else "—"
+        if not layout["panels_inline"]:
+            extra = "   ·   s/e/w panels"
+        elif layout.get("sess_cols") is None:
+            extra = "   ·   e sessions"
+        else:
+            extra = ""
+        foot = (f"plan {plan or '?'}   ·   allowance live, updated {stamp}   ·   "
+                f"charts every {max(1, INTERVAL_SECONDS // 60)}m{extra}   ·   "
+                f"? help   ·   ⌃C to exit")
+        foot = foot[:TOTAL_WIDTH - 2]          # clip so it never wraps/overflows
+        out += ["", "  " + rgb(DIM, foot)]
     return "\n".join(out), hits
+
+
+def term_cols():
+    """Terminal width, or a 12h-at-5m fallback (152) when it can't be probed
+    (piped --once) so non-interactive output keeps the historical default."""
+    try:
+        return os.get_terminal_size().columns
+    except OSError:
+        return MARGIN + 144
+
+
+def configure_dimensions(args, cols, fail):
+    """Resolve BUCKET / WINDOW / NUM_BUCKETS / ACTIVE_WINDOW / TOTAL_WIDTH /
+    INTERVAL_SECONDS from the CLI args and terminal width; `fail(msg)` reports a
+    validation error and exits. NUM_BUCKETS is fixed HERE at startup — the chart
+    is MARGIN + NUM_BUCKETS columns wide, so history is bounded by terminal
+    width. --window-hours unset => fill the available width (wider terminal =
+    more history); given => fixed and validated to fit."""
+    global BUCKET, WINDOW, NUM_BUCKETS, ACTIVE_WINDOW, TOTAL_WIDTH, INTERVAL_SECONDS
+    global AUTOFIT
+
+    bucket_min, aw_hours = args.bucket_minutes, args.active_window_hours
+    if bucket_min < 1:
+        fail("--bucket-minutes must be >= 1")
+    if aw_hours <= 0:
+        fail("--active-window-hours must be > 0")
+
+    AUTOFIT = args.window_hours is None
+    # Reserve the rightmost terminal column (RIGHT_RESERVE): writing a glyph to
+    # the last column is unreliable — the per-line clear in the paint loop erases
+    # it on some terminals, dropping a panel's right border at exact-fit widths.
+    # Keeping everything within cols-1 sidesteps it entirely.
+    avail = max(cols - MARGIN - RIGHT_RESERVE, 1)   # bucket columns width allows
+    if AUTOFIT:
+        nb = max(avail, MIN_BUCKETS)        # fill the terminal (tracks resize)
+    else:
+        if args.window_hours <= 0:
+            fail("--window-hours must be > 0")
+        win_min = round(args.window_hours * 60)
+        if win_min % bucket_min:
+            fail(f"--window-hours*60 ({win_min}) must be divisible by "
+                 f"--bucket-minutes ({bucket_min})")
+        nb = win_min // bucket_min
+        if nb > avail:
+            fail(f"--window-hours {args.window_hours:g} needs {nb} bars "
+                 f"({MARGIN + nb + RIGHT_RESERVE} cols) but the terminal is {cols} wide. Widen "
+                 f"it, lower --window-hours, or raise --bucket-minutes.")
+    win_min = nb * bucket_min
+
+    if bucket_min > aw_hours * 60:
+        fail(f"--bucket-minutes ({bucket_min}) must be <= "
+             f"--active-window-hours*60 ({aw_hours * 60:g})")
+    if aw_hours >= win_min / 60:
+        fail(f"--active-window-hours ({aw_hours:g}) must be < the window "
+             f"({win_min / 60:g}h)")
+
+    BUCKET = timedelta(minutes=bucket_min)
+    WINDOW = timedelta(minutes=win_min)
+    NUM_BUCKETS = nb
+    TOTAL_WIDTH = MARGIN + NUM_BUCKETS
+    ACTIVE_WINDOW = max(timedelta(hours=aw_hours), BUCKET)
+    INTERVAL_SECONDS = args.interval if args.interval else bucket_min * 60
+    args.interval = INTERVAL_SECONDS        # the run loop reads args.interval
+
+
+def refit_width(cols):
+    """Autofit only: resize the window to the current terminal width. Returns
+    True if the bucket count changed, so the caller forces a re-collect (the
+    per-session bucket arrays are sized to NUM_BUCKETS)."""
+    global WINDOW, NUM_BUCKETS, TOTAL_WIDTH
+    if not AUTOFIT:
+        return False
+    nb = max(cols - MARGIN - RIGHT_RESERVE, MIN_BUCKETS)
+    if nb == NUM_BUCKETS:
+        return False
+    NUM_BUCKETS, WINDOW, TOTAL_WIDTH = nb, BUCKET * nb, MARGIN + nb
+    return True
 
 
 def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--once", action="store_true", help="render one frame and exit")
-    ap.add_argument("--interval", type=int, default=INTERVAL_SECONDS,
-                    metavar="SECONDS", help="seconds between refreshes (default 300)")
-    ap.add_argument("--active-window", type=int, default=60, metavar="MINUTES",
+    ap.add_argument("--interval", type=int, default=None, metavar="SECONDS",
+                    help="seconds between transcript refreshes "
+                         "(default: one bucket)")
+    ap.add_argument("--window-hours", type=float, default=None, metavar="HOURS",
+                    help="chart history span. Unset: fill the terminal width "
+                         "(wider terminal -> more history). Given: fixed, and "
+                         "validated to fit the width.")
+    ap.add_argument("--bucket-minutes", type=int, default=5, metavar="MINUTES",
+                    help="width of one chart bar / bucket (default 5)")
+    ap.add_argument("--active-window-hours", type=float, default=1.0,
+                    metavar="HOURS",
                     help="how far back a session (and, in the detail popup, its "
-                         "subagents) counts as active (default 60)")
+                         "subagents, and the SUMMARY active-window tab) counts "
+                         "as active (default 1)")
     args = ap.parse_args()
-    global ACTIVE_WINDOW
-    ACTIVE_WINDOW = timedelta(minutes=max(args.active_window, 1))
+
+    cols = term_cols()
+    configure_dimensions(args, cols, ap.error)
 
     if args.once:
         now = datetime.now(timezone.utc)
         fetch_usage()                       # synchronous: single frame needs it
         buckets, sessions = collect(now)
-        height = CHART_HEIGHT
+        layout = None                       # full layout by default
+        rows = None
         if sys.stdout.isatty():
             try:
-                _, rows = os.get_terminal_size()
-                height = fit_height(rows, sessions, now)
+                cols, rows = os.get_terminal_size()
+                layout = plan_layout(rows, cols, sessions, now)
             except OSError:
                 pass
-        frame, _hits = render_frame(now, buckets, sessions, height=height)
+        frame, _hits = render_frame(now, buckets, sessions, layout=layout,
+                                    cols=cols, rows=rows)
         print(frame)
         return
 
     run_live(args)
 
 
-def fit_height(rows, sessions, now):
-    """Pick a chart height so the whole frame fits in `rows` terminal lines with
-    ~2 spare, killing the overflow that caused scroll/flicker on short screens.
+GAP = 3
+# SUMM_FULL is the non-lean floor: it must hold the widest cache-mix meter row
+# ("▆ 5m cache · subagent" + pct = 28). SUMM_MIN is the lean floor (no meters,
+# compact numbers). The summary may only shrink below SUMM_FULL when lean.
+SUMM_FULL, SUMM_MIN = 28, 16
+ALLOW_MAX, ALLOW_MIN = 26, 14                   # allowance inner range
 
-    Fixed (non-bar) chrome = everything except the 3*height bar rows:
-      banner+rule+blank+legend (4) + 3 legends-between/blanks (handled below)
-      + per-chart title+baseline+axis (3 each -> 9) + blank before panels (1)
-      + panels block (2 borders + body) + blank + footer (2).
-    """
+
+def _panel_row_w(summ_inner, sess_cols, ident_w, allow_inner):
+    """Total inline width of the panel row for a panel config."""
+    row = (summ_inner + 2) + GAP + (allow_inner + 2)
+    if sess_cols is not None:
+        sess_inner = SESS_FIXED_W + ident_w + sum(SESS_COL_W[c] for c in sess_cols)
+        row += GAP + (sess_inner + 2)
+    return row
+
+
+def fit_panels(cols, lean):
+    """Pick the richest inline panel config that fits `cols`, or None (all
+    panels move to the s/e/w popups). To keep the ACTIVE SESSIONS panel with its
+    context column alive on a quarter-screen, it first sheds its 12h then 1h
+    columns, then progressively (1) truncates the session name, (2) compresses
+    the allowance panel, (3) — only when lean, since the cache-mix meters are
+    then hidden — renders the summary numbers compactly. `lean` mirrors
+    plan_layout: when False the summary shows the meters and is pinned to
+    SUMM_FULL. Each candidate is (summ, sess_cols, ident, allow, compact_nums)."""
+    cands = []
+    for sc in (["c1h", "c12h", "ctx"], ["c1h", "ctx"], ["ctx"]):
+        cands.append((SUMM_FULL, sc, IDENT_MAX, ALLOW_MAX, False))
+    sc = ["ctx"]                                  # keep sessions + context, shrink rest
+    for ident in (28, 24, 20, 16, IDENT_MIN):     # lever 1: truncate name
+        cands.append((SUMM_FULL, sc, ident, ALLOW_MAX, False))
+    for allow in (22, 18, ALLOW_MIN):             # lever 2: compress allowance
+        cands.append((SUMM_FULL, sc, IDENT_MIN, allow, False))
+    if lean:                                      # lever 3: compact summary numbers
+        for summ in (24, 20, SUMM_MIN):
+            cands.append((summ, sc, IDENT_MIN, ALLOW_MIN, True))
+    # Last resorts: drop the sessions panel, then (lean only) shrink the rest.
+    cands.append((SUMM_FULL, None, 0, ALLOW_MAX, False))
+    if lean:
+        cands.append((SUMM_MIN, None, 0, ALLOW_MIN, True))
+    for summ_inner, sess_cols, ident, allow, compact_nums in cands:
+        if cols >= _panel_row_w(summ_inner, sess_cols, ident, allow):
+            return {"summ_inner": summ_inner, "sess_cols": sess_cols,
+                    "ident": ident, "allow_inner": allow,
+                    "compact_nums": compact_nums}
+    return None
+
+
+def plan_layout(rows, cols, sessions, now):
+    """Decide which elements render inline, degrading as the terminal shrinks,
+    and pick the chart bar height to fill what's left.
+
+    Height ladder: <39 fold each chart title+legend onto one line and drop the
+    tick row; <34 drop the page title; <31 drop the footer; <29 lean the panels
+    (no cache breakdown / weekly gauge, <=3 sessions); <24 drop chart baselines
+    and inter-chart blanks; <15 drop inline panels.
+    Width ladder: the sessions panel sheds columns (12h -> 1h -> context ->
+    none) to keep fitting; below ~66 cols even summary+allowance move to the
+    s/e/w popups."""
     cutoff = now - ACTIVE_WINDOW
     n_active = sum(1 for s in sessions.values() if s["last_act"] >= cutoff)
-    panels_body = max(8, 1 + n_active, len(allowance_rows(now, 0, 26)))
-    # 4 (header block) + 3*2 (blank+legend before charts 2&3 plus first legend
-    # already counted) ... count explicitly to avoid drift:
-    fixed_chrome = (
-        4                       # banner, rule, blank, legend-1
-        + 3                     # chart-1 title+baseline+axis
-        + 2 + 3                 # blank+legend-2, chart-2 chrome
-        + 2 + 3                 # blank+legend-3, chart-3 chrome
-        + 1                     # blank before panels
-        + 2 + panels_body       # panels block (2 borders + body)
-        + 2                     # blank + footer
-    )
-    height = (rows - fixed_chrome - 2) // 3
-    return max(3, min(10, height))
+    lean = rows < 29
+    L = {
+        "page_title":   rows >= 34,
+        "footer":       rows >= 31,
+        "compact":      rows < 39,
+        "axes":         rows >= 24,
+        "chart_blanks": rows >= 24,
+        "panels_lean":  lean,
+    }
+    per_chart = (1 if L["compact"] else 2)
+    if L["axes"]:
+        per_chart += (1 if L["compact"] else 2)
+    base = 3 * per_chart
+    base += 2 if L["chart_blanks"] else 0
+    if L["page_title"]:
+        base += 3
+    if L["footer"]:
+        base += 2
+
+    # Panels go inline only if they fit the width AND still leave the charts at
+    # the minimum bar height; otherwise they move to the s/e/w popups and the
+    # charts take the freed rows. panel_body is the EXACT rendered height (the
+    # tallest of the three panels) so the charts fill the rest with no waste.
+    cfg = fit_panels(cols - RIGHT_RESERVE, lean)
+    panel_body = 0
+    if cfg is not None:
+        summ = 4 if lean else 9             # summary_rows length
+        if cfg["sess_cols"] is None:
+            sess = 0
+        elif n_active == 0:
+            sess = 2                        # header + "no sessions" line
+        else:
+            sess = 1 + (min(n_active, 3) if lean else n_active)
+        alw = len(allowance_rows(now, 0, cfg["allow_inner"], lean=lean))
+        panel_body = 1 + 2 + max(summ, sess, alw)           # blank+borders+body
+        if (rows - base - panel_body) // 3 < MIN_BAR_H:
+            cfg, panel_body = None, 0
+    L["panels_inline"] = cfg is not None
+    L["panel_cfg"] = cfg
+    L["sess_cols"] = cfg["sess_cols"] if cfg else None
+    L["height"] = max(MIN_BAR_H, min(CHART_HEIGHT, (rows - base - panel_body) // 3))
+    return L
 
 
 def run_live(args):
@@ -1320,7 +1771,13 @@ def run_live(args):
     fd = sys.stdin.fileno() if alt else None
     old_term = None
     if alt:
-        sys.stdout.write("\033[?1049h\033[?25l")   # alt screen, hide cursor
+        # Alt screen, hide cursor, and DISABLE autowrap (?7l): a glyph written
+        # to the last terminal column otherwise leaves a pending wrap that some
+        # terminals/tmux smear or drop — which dropped the rightmost panel's
+        # border at widths where the panel row exactly filled the screen. With
+        # autowrap off, full-width lines render in place (and any stray
+        # over-width line clips instead of wrapping + desyncing the layout).
+        sys.stdout.write("\033[?1049h\033[?25l\033[?7l")
         # Enable SGR mouse reporting + cbreak input so clicks/keys arrive
         # immediately. cbreak (not raw) keeps ISIG, so ⌃C still raises.
         try:
@@ -1340,10 +1797,12 @@ def run_live(args):
     anim = 0
     hits = []
     focus_sid = None
+    focus_bucket = None
+    panel_view = None            # None | "summary" | "sessions" | "allow"
+    summary_tab = "win"
     show_help = False
     show_uerr = False
-    help_scroll = 0
-    prev_show_help = False
+    overlay_scroll = 0
     prev_okey = None
     mouse_re = re.compile(r"\033\[<(\d+);(\d+);(\d+)([Mm])")
     try:
@@ -1358,6 +1817,12 @@ def run_live(args):
                 cols, rows = os.get_terminal_size()
             except OSError:
                 cols, rows = TOTAL_WIDTH, 50
+            # Autofit: a width change resizes the window, which re-buckets — so
+            # force a re-collect this tick (per-session bucket arrays are sized
+            # to NUM_BUCKETS). Shrinking the terminal now just shows less history
+            # instead of tripping the too-small notice.
+            if refit_width(cols):
+                last_collect = None
             # Heavy transcript scan only every --interval; allowance more often.
             if last_collect is None or (now - last_collect).total_seconds() >= args.interval:
                 buckets, sessions = collect(now)
@@ -1374,26 +1839,29 @@ def run_live(args):
                 kick_usage()        # fetch_usage owns retry_at (sets/clears it)
                 last_usage = now
 
-            height = fit_height(rows, sessions, now) if alt else CHART_HEIGHT
+            layout = (plan_layout(rows, cols, sessions, now) if alt
+                      else None)
             # Fast repaint every tick: animates loading, keeps the clock live,
             # and surfaces the background usage fetch within ~1s of completion.
-            frame, hits = render_frame(now, buckets, sessions, anim, height)
+            frame, hits = render_frame(now, buckets, sessions, anim, layout,
+                                       summary_tab, cols=cols, rows=rows)
             # Too small to fit? The frame would overflow and scroll, desyncing the
             # click hit-regions onto the wrong rows. Show a notice and drop hits so
             # clicks can't misfire; close any overlay until there's room again.
-            if alt and (cols < TOTAL_WIDTH or frame.count("\n") + 1 > rows):
+            if alt and (cols < TOTAL_WIDTH or rows < 9
+                        or frame.count("\n") + 1 > rows):
                 hits = []
                 show_help = show_uerr = False
-                focus_sid = None
-                frame = render_too_small(cols, rows, height * 3 + 30)
+                panel_view = None
+                focus_sid = focus_bucket = None
+                frame = render_too_small(cols, rows, 9)
             if alt:
-                # One overlay at a time: help > usage-error > popup.
-                overlay, okey = None, None
+                # One overlay at a time: help > usage-error > session > bucket >
+                # panel popup. overlay_regions carries a modal popup's clickable
+                # spans (relative to the box); translated to screen hits below.
+                overlay, okey, overlay_regions = None, None, []
                 if show_help:
-                    if not prev_show_help:        # freshly opened: reset scroll
-                        help_scroll = 0
-                    overlay, max_scroll = render_help(now, cols, rows, help_scroll)
-                    help_scroll = max(0, min(help_scroll, max_scroll))
+                    overlay = render_help(now, cols, rows)
                     okey = "help"
                 elif show_uerr:
                     overlay = render_usage_error(now, cols, rows)
@@ -1407,6 +1875,26 @@ def run_live(args):
                         focus_sid = None
                     else:
                         okey = ("popup", focus_sid)
+                elif focus_bucket is not None:
+                    overlay = render_bucket_popup(focus_bucket, sessions, now, cols, rows)
+                    if overlay is None:
+                        focus_bucket = None
+                    else:
+                        okey = ("bucket", focus_bucket)
+                elif panel_view is not None:
+                    overlay, overlay_regions = render_panel_popup(
+                        panel_view, buckets, sessions, now, rows, summary_tab)
+                    if overlay is None:
+                        panel_view = None
+                    else:
+                        okey = ("panel", panel_view, summary_tab)
+                if overlay is not None:
+                    # Reset scroll on a fresh/changed overlay, then fit it to the
+                    # terminal (clip width, scroll + scrollbar when too tall).
+                    if okey != prev_okey:
+                        overlay_scroll = 0
+                    overlay, max_scroll = fit_overlay(overlay, cols, rows, overlay_scroll)
+                    overlay_scroll = max(0, min(overlay_scroll, max_scroll))
                 if overlay is None:
                     # No overlay: full base repaint each tick (shimmer live).
                     body = "\033[H" + frame.replace("\n", "\033[K\n") + "\033[K\033[J"
@@ -1416,6 +1904,15 @@ def run_live(args):
                     ow = max((_visible_len(x) for x in overlay), default=0)
                     row0 = max((rows - oh) // 2, 1)
                     col0 = max((cols - ow) // 2, 1)
+                    # A modal panel popup is clickable: translate its box-relative
+                    # regions to screen coords and make them THE hit map (base
+                    # regions are hidden under the modal). Only when it fits
+                    # un-scrolled — a scrolled view shifts the row indices, so we
+                    # drop row clicks there (scroll/close still work).
+                    hits = []
+                    if overlay_regions and max_scroll == 0:
+                        hits = [(row0 + li, col0 + lo, col0 + hi, tok)
+                                for li, lo, hi, tok in overlay_regions]
                     # Paint the base ONCE when the overlay opens or switches, then
                     # only redraw the overlay box in place each tick. Repainting
                     # the whole base every tick under the overlay — with its full-
@@ -1430,7 +1927,6 @@ def run_live(args):
                     for k, pl in enumerate(overlay):
                         sys.stdout.write(f"\033[{row0 + k};{col0}H" + _padcol(pl, ow))
                 prev_okey = okey
-                prev_show_help = show_help
             else:
                 sys.stdout.write(frame + "\n")
             sys.stdout.flush()
@@ -1444,11 +1940,13 @@ def run_live(args):
                         data = os.read(fd, 4096).decode("utf-8", "ignore")
                     except OSError:
                         data = ""
-                    focus_sid, show_help, show_uerr, scroll_delta = process_input(
-                        data, mouse_re, hits, focus_sid, show_help, show_uerr)
-                    # Only the help overlay scrolls; the delta is clamped each
-                    # render and ignored when help is closed (reset on open).
-                    help_scroll += scroll_delta
+                    (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
+                     show_uerr, scroll_delta) = process_input(
+                        data, mouse_re, hits, focus_sid, focus_bucket,
+                        panel_view, summary_tab, show_help, show_uerr)
+                    # Any open overlay scrolls; the delta is clamped to the
+                    # overlay's range each render (and reset when it changes).
+                    overlay_scroll += scroll_delta
             else:
                 time.sleep(TICK_SECONDS)
           except Exception:
@@ -1464,20 +1962,26 @@ def run_live(args):
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
                 except (termios.error, ValueError, OSError):
                     pass
-            sys.stdout.write("\033[?25h\033[?1049l")   # show cursor, leave alt
+            sys.stdout.write("\033[?7h\033[?25h\033[?1049l")   # re-enable wrap, show cursor, leave alt
             sys.stdout.flush()
 
 
-def process_input(data, mouse_re, hits, focus_sid, show_help, show_uerr):
-    """Update (focus_sid, show_help, show_uerr) from a chunk of terminal input
-    and return a scroll delta for the (only scrollable) help overlay.
+def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
+                  summary_tab, show_help, show_uerr):
+    """Update the overlay/selection state from a chunk of terminal input and
+    return a scroll delta for the (only scrollable) help overlay.
 
-    A left-click on a session row opens/switches its popup; a click on the
-    ALLOWANCE panel (token "__usage__") opens the usage-error overlay; a click
-    outside closes whatever overlay is open. '?' toggles help; q/bare-esc closes
-    every overlay. Mouse wheel and arrow/PgUp/PgDn/j/k scroll the help overlay.
+    A left-click on a session row opens/switches its popup; a click on a chart
+    bar (token "__chart__") drills into that bucket; a click on a SUMMARY tab
+    (TAB_WIN/TAB_AW) switches the summary window; a click on the ALLOWANCE panel
+    (token "__usage__") opens the usage-error overlay; a click outside closes
+    whatever overlay is open. '?' toggles help; s/e/w toggle the SUMMARY /
+    sessions / allowance popups (for layouts too small to show them inline);
+    q/bare-esc steps back one overlay level. Mouse wheel and arrow/PgUp/PgDn/j/k
+    scroll the help overlay.
 
-    Returns (focus_sid, show_help, show_uerr, scroll_delta)."""
+    Returns (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
+    show_uerr, scroll_delta)."""
     delta = 0
     for m in mouse_re.finditer(data):
         button, x, y, final = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
@@ -1494,15 +1998,23 @@ def process_input(data, mouse_re, hits, focus_sid, show_help, show_uerr):
                 continue
             hit = next((tok for (tr, lo, hi, tok) in hits
                         if tr == y and lo <= x <= hi), None)
-            if hit == "__usage__":
+            if hit in (TAB_WIN, TAB_AW):   # switch summary window, leave overlays
+                summary_tab = "aw" if hit == TAB_AW else "win"
+            elif hit == "__chart__":       # drill into the clicked bucket
+                focus_bucket = x - MARGIN - 1
+                focus_sid, show_uerr = None, False
+            elif hit == "__usage__":
                 show_uerr = True
-                focus_sid = None           # one overlay at a time
-            elif hit is not None:
+                focus_sid = focus_bucket = None   # one overlay at a time
+            elif hit is not None:          # session row (incl. from a popup)
                 focus_sid = hit
+                focus_bucket = None
                 show_uerr = False
-            elif show_uerr or focus_sid is not None:
+            elif (show_uerr or focus_sid is not None or focus_bucket is not None
+                  or panel_view is not None):
                 show_uerr = False
-                focus_sid = None
+                focus_sid = focus_bucket = None
+                panel_view = None
     # Strip mouse sequences, then handle keys. Arrow/PgUp/PgDn are multi-byte
     # escape SEQUENCES starting with "\x1b[" — detect and consume them FIRST so
     # a bare ESC (a "\x1b" not part of such a sequence) is the only thing that
@@ -1516,16 +2028,29 @@ def process_input(data, mouse_re, hits, focus_sid, show_help, show_uerr):
     delta += rest.count("j") - rest.count("k")           # vim-style scroll
     if "?" in rest:
         show_help = not show_help
-    # Close on q or a BARE esc only. Any remaining "\x1b[" here is a CSI sequence
-    # we don't handle (not a close); a lone "\x1b" with nothing after it is a
-    # real ESC press → close.
+    # s/e/w toggle the panel popups (summary / sessions [e]ntries / [w]allowance).
+    # Opening a panel closes any session/bucket drill-down underneath it.
+    for key, view in (("s", "summary"), ("e", "sessions"), ("w", "allow")):
+        if key in rest:
+            panel_view = None if panel_view == view else view
+            focus_sid = focus_bucket = None
+    # q or a BARE esc steps back ONE overlay level (a "\x1b[" here is an unhandled
+    # CSI sequence, not a close; a lone "\x1b" is a real ESC press).
     bare_esc = any(rest[i] == "\x1b" and (i + 1 >= len(rest) or rest[i + 1] != "[")
                    for i in range(len(rest)))
     if "q" in rest or bare_esc:
-        show_help = False
-        focus_sid = None
-        show_uerr = False
-    return focus_sid, show_help, show_uerr, delta
+        if show_help:
+            show_help = False
+        elif show_uerr:
+            show_uerr = False
+        elif focus_sid is not None:
+            focus_sid = None
+        elif focus_bucket is not None:
+            focus_bucket = None
+        elif panel_view is not None:
+            panel_view = None
+    return (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
+            show_uerr, delta)
 
 
 if __name__ == "__main__":
