@@ -877,15 +877,16 @@ def render_popup(sid, sessions, now, cols, rows, anim=0):
             msg_txt = msg_txt[:max(room - 1, 0)] + "…"
         body.append(prefix + rgb(TEXT, msg_txt))
     body += [""]
-    body += ["  " + legend([("uncached", "uncached"),
-                            ("c5m", "5m · subagent"), ("c1h", "1h · main")])]
-    body += render_chart("Input tokens · cache write disposition",
-                         ["uncached", "c5m", "c1h"], sb, 5, now, anim)
-    body += ["", "  " + legend([("read", "from cache"),
-                                ("new", "new input"), ("miss", "cache miss")])]
-    body += render_chart("Context assembly", ["read", "new", "miss"], sb, 5, now, anim)
-    body += ["", "  " + legend([("output", "output tokens")])]
-    body += render_chart("Output tokens generated", ["output"], sb, 5, now, anim)
+    # Charts compact exactly like the main view: same breakpoints (drop tick row
+    # and fold title+legend below 39 rows, drop the baseline below 24), and the
+    # bar height shrinks to fit. Reserve ~header + subagent-table chrome; what
+    # doesn't fit still scrolls in the overlay viewport.
+    c = chart_compaction(rows)
+    chrome = 3 + 4 + 4                    # header(3) + subagent(~4) + borders/footer(4)
+    nonbar = (1 if c["compact"] else 2) + (1 if c["axes"] else 0)
+    ch = max(MIN_BAR_H, min(5, (rows - chrome - 3 * nonbar) // 3))
+    block, _ = chart_block(sb, ch, c["compact"], c["axes"], c["blanks"], now, anim)
+    body += block
 
     # Named subagent detail table — subagents active in the lookback window only.
     cutoff = now - ACTIVE_WINDOW
@@ -1398,6 +1399,32 @@ CHARTS = [
 ]
 
 
+def chart_block(buckets, height, compact, axes, blanks, now, anim=0):
+    """Render the three stacked charts with shared compaction so the main view
+    and the session popup degrade identically: `compact` folds each chart's
+    title+legend onto one line and drops the tick row, `axes` keeps the baseline,
+    `blanks` keeps the blank line between charts. Returns (lines, bar_idx) where
+    bar_idx are 0-based indices into `lines` that sit over the bars (clickable)."""
+    out, bar_idx = [], []
+    for i, (title, short, keys, leg) in enumerate(CHARTS):
+        if i and blanks:
+            out.append("")
+        if not compact:
+            out.append("  " + legend(leg))
+        start = len(out)
+        out.extend(render_chart(title, keys, buckets, height, now, anim,
+                                short_title=short, legend_items=leg,
+                                compact=compact, axes=axes))
+        bar_idx.extend(range(start + 1, start + 1 + height))   # bars follow header
+    return out, bar_idx
+
+
+def chart_compaction(rows):
+    """The compaction flags for a given terminal height, shared by the main view
+    and the popup: same breakpoints as plan_layout."""
+    return {"compact": rows < 39, "axes": rows >= 24, "blanks": rows >= 24}
+
+
 def summary_panel(buckets, summary_tab, inner, lean=False, compact_nums=False):
     """Build the SUMMARY panel (tabbed) and its tab segments — shared by the
     inline layout and the key-opened popup."""
@@ -1444,20 +1471,13 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
         ]
 
     # Charts. Bar rows carry the "__chart__" hit token (process_input derives the
-    # bucket from the click x). In compact mode the title+legend fold into the
-    # chart header; otherwise the legend is a separate line above each chart.
-    chart_rows = []
-    for i, (title, short, keys, leg) in enumerate(CHARTS):
-        if i and layout["chart_blanks"]:
-            out.append("")
-        if not compact:
-            out.append("  " + legend(leg))
-        start = len(out)
-        out.extend(render_chart(title, keys, buckets, height, now, anim,
-                                short_title=short, legend_items=leg,
-                                compact=compact, axes=axes))
-        chart_rows.extend(range(start + 2, start + 1 + height + 1))
-    hits += [(r, MARGIN + 1, MARGIN + NUM_BUCKETS, "__chart__") for r in chart_rows]
+    # bucket from the click x). Shared with the popup via chart_block.
+    base = len(out)
+    block, bar_idx = chart_block(buckets, height, compact, axes,
+                                 layout["chart_blanks"], now, anim)
+    out += block
+    hits += [(base + ri + 1, MARGIN + 1, MARGIN + NUM_BUCKETS, "__chart__")
+             for ri in bar_idx]
 
     if layout["panels_inline"]:
         lean = layout["panels_lean"]
@@ -1516,15 +1536,6 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
                 f"? help   ·   ⌃C to exit")
         foot = foot[:TOTAL_WIDTH - 2]          # clip so it never wraps/overflows
         out += ["", "  " + rgb(DIM, foot)]
-
-    # DEBUG: terminal size, right-aligned to the last USED column (we reserve the
-    # rightmost terminal column, so the used width is cols-RIGHT_RESERVE). If the
-    # final char is still missing, the terminal is dropping more than one column.
-    actual = cols if cols is not None else TOTAL_WIDTH
-    usable = (actual - RIGHT_RESERVE) if cols is not None else TOTAL_WIDTH
-    dbg = f"term {actual}x{rows if rows is not None else '?'} · chart {TOTAL_WIDTH}"
-    dbg = dbg[:usable]
-    out.append(" " * max(usable - len(dbg), 0) + rgb(WARN_C, dbg))
     return "\n".join(out), hits
 
 
@@ -1724,7 +1735,6 @@ def plan_layout(rows, cols, sessions, now):
         per_chart += (1 if L["compact"] else 2)
     base = 3 * per_chart
     base += 2 if L["chart_blanks"] else 0
-    base += 1                               # DEBUG terminal-size line (bottom)
     if L["page_title"]:
         base += 3
     if L["footer"]:
