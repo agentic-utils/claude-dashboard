@@ -1411,7 +1411,8 @@ def summary_panel(buckets, summary_tab, inner, lean=False, compact_nums=False):
     return panel(title, body, inner, title_len=tlen), segs
 
 
-def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win"):
+def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
+                 cols=None, rows=None):
     """Return (frame_str, hits). hits maps clickable regions to TOKENS:
     [(term_row, x_lo, x_hi, token), ...] in 1-based terminal coordinates. A token
     is a session sid, a SUMMARY tab (TAB_WIN/TAB_AW), "__chart__", or
@@ -1514,6 +1515,14 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win")
                 f"? help   ·   ⌃C to exit")
         foot = foot[:TOTAL_WIDTH - 2]          # clip so it never wraps/overflows
         out += ["", "  " + rgb(DIM, foot)]
+
+    # DEBUG: terminal size, right-aligned so its LAST char sits in the LAST
+    # displayable column — a live probe for last-column truncation. If the final
+    # digit/char is missing, the terminal is dropping the last column.
+    cw = cols if cols is not None else TOTAL_WIDTH
+    dbg = f"term {cw}x{rows if rows is not None else '?'} · chart {TOTAL_WIDTH}"
+    dbg = dbg[:cw]
+    out.append(" " * max(cw - len(dbg), 0) + rgb(WARN_C, dbg))
     return "\n".join(out), hits
 
 
@@ -1618,13 +1627,15 @@ def main():
         fetch_usage()                       # synchronous: single frame needs it
         buckets, sessions = collect(now)
         layout = None                       # full layout by default
+        rows = None
         if sys.stdout.isatty():
             try:
                 cols, rows = os.get_terminal_size()
                 layout = plan_layout(rows, cols, sessions, now)
             except OSError:
                 pass
-        frame, _hits = render_frame(now, buckets, sessions, layout=layout)
+        frame, _hits = render_frame(now, buckets, sessions, layout=layout,
+                                    cols=cols, rows=rows)
         print(frame)
         return
 
@@ -1707,6 +1718,7 @@ def plan_layout(rows, cols, sessions, now):
         per_chart += (1 if L["compact"] else 2)
     base = 3 * per_chart
     base += 2 if L["chart_blanks"] else 0
+    base += 1                               # DEBUG terminal-size line (bottom)
     if L["page_title"]:
         base += 3
     if L["footer"]:
@@ -1816,7 +1828,7 @@ def run_live(args):
             # Fast repaint every tick: animates loading, keeps the clock live,
             # and surfaces the background usage fetch within ~1s of completion.
             frame, hits = render_frame(now, buckets, sessions, anim, layout,
-                                       summary_tab)
+                                       summary_tab, cols=cols, rows=rows)
             # Too small to fit? The frame would overflow and scroll, desyncing the
             # click hit-regions onto the wrong rows. Show a notice and drop hits so
             # clicks can't misfire; close any overlay until there's room again.
