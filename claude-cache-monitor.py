@@ -604,10 +604,16 @@ def legend(items):
 
 # ── panels ───────────────────────────────────────────────────────────────────
 
-def panel(title, rows, inner):
-    fill = max(inner - 3 - _visible_len(title), 0)
-    out = [rgb(DIM2, "╭─ ") + rgb(ACCENT, title, bold=True)
-           + rgb(DIM2, " " + "─" * fill + "╮")]
+def panel(title, rows, inner, title_len=None):
+    """`title` is plain text (coloured here) unless `title_len` is given, in
+    which case `title` is taken as already-styled and `title_len` is its visible
+    width — used by the SUMMARY panel to draw multi-segment clickable tabs."""
+    if title_len is None:
+        head, tl = rgb(ACCENT, title, bold=True), _visible_len(title)
+    else:
+        head, tl = title, title_len
+    fill = max(inner - 3 - tl, 0)
+    out = [rgb(DIM2, "╭─ ") + head + rgb(DIM2, " " + "─" * fill + "╮")]
     for r in rows:
         out.append(rgb(DIM2, "│") + _padcol(r, inner) + rgb(DIM2, "│"))
     out.append(rgb(DIM2, "╰" + "─" * inner + "╯"))
@@ -625,7 +631,34 @@ def hjoin(*blocks, gap=3):
     return out
 
 
-def summary_rows(buckets, inner):
+TAB_WIN, TAB_AW = "__tab_win__", "__tab_aw__"
+
+
+def summary_title(summary_tab):
+    """Build the SUMMARY panel's tabbed title. Returns (styled, visible_len,
+    segments) where segments = [(token, lo_off, hi_off)] are 0-based char
+    offsets of each tab within the title text, for the click hit-map."""
+    sep = " · "
+    tabs = [(TAB_WIN, fmt_window(WINDOW)), (TAB_AW, fmt_window(ACTIVE_WINDOW))]
+    active = TAB_AW if summary_tab == "aw" else TAB_WIN
+    styled, off, segs = "", 0, []
+    for i, (tok, lab) in enumerate(tabs):
+        if i:
+            styled += rgb(DIM2, sep)
+            off += len(sep)
+        on = tok == active
+        styled += rgb(ACCENT if on else DIM, lab, bold=on)
+        segs.append((tok, off, off + len(lab) - 1))
+        off += len(lab)
+    return styled, off, segs
+
+
+def summary_rows(buckets, inner, win_label, split_eff, lean=False):
+    """Summary figures over `buckets` (a window slice). `win_label` names the
+    window in labels. `split_eff` shows the effective-token split (last-hour /
+    full window) — only meaningful on the full-window tab; the active-window tab
+    collapses it to a single figure. `lean` drops the cache-mix breakdown to
+    save vertical rows on short terminals."""
     agg = empty_bucket()
     for b in buckets:
         for k in agg:
@@ -642,22 +675,29 @@ def summary_rows(buckets, inner):
         return sum(eff_tokens(b["uncached"], b["c5m"], b["c1h"], b["read"], b["output"])
                    for b in bs)
 
-    eff_12 = beff(buckets)
-    eff_1h = beff(buckets[-buckets_per_hour():])     # last hour of buckets
+    if split_eff:
+        eff_full, eff_1h = beff(buckets), beff(buckets[-buckets_per_hour():])
+        eff_label = f"effective tokens · 1h/{win_label}"
+        eff_val = fmt_compact(round(eff_1h)) + " / " + fmt_compact(round(eff_full))
+    else:
+        eff_label = f"effective tokens · {win_label}"
+        eff_val = fmt_compact(round(beff(buckets)))
 
-    return [
+    rows = [
         kv(rgb(DIM, "input tokens"), rgb(TEXT, fmt(total_input), bold=True)),
         kv(rgb(DIM, "output tokens"), rgb(TEXT, fmt(agg["output"]), bold=True)),
-        kv(rgb(DIM, f"responses · {fmt_window(WINDOW)}"), rgb(TEXT, fmt(agg["responses"]))),
-        kv(rgb(DIM, "effective tokens · 1h/12h"),
-           rgb(TEXT, fmt_compact(round(eff_1h)) + " / " + fmt_compact(round(eff_12)),
-               bold=True)),
-        rgb(DIM2, "─" * inner),
-        meter("c5m", "5m cache · subagent", pct(agg["c5m"], total_input)),
-        meter("c1h", "1h cache · main", pct(agg["c1h"], total_input)),
-        meter("read", "read from cache", pct(agg["read"], total_input)),
-        meter("miss", "cache miss", pct(agg["miss"], total_input)),
+        kv(rgb(DIM, f"responses · {win_label}"), rgb(TEXT, fmt(agg["responses"]))),
+        kv(rgb(DIM, eff_label), rgb(TEXT, eff_val, bold=True)),
     ]
+    if not lean:
+        rows += [
+            rgb(DIM2, "─" * inner),
+            meter("c5m", "5m cache · subagent", pct(agg["c5m"], total_input)),
+            meter("c1h", "1h cache · main", pct(agg["c1h"], total_input)),
+            meter("read", "read from cache", pct(agg["read"], total_input)),
+            meter("miss", "cache miss", pct(agg["miss"], total_input)),
+        ]
+    return rows
 
 
 def session_rows(sessions, now, inner):
@@ -1204,10 +1244,11 @@ def render_too_small(cols, rows, need_rows):
     return "\n".join(out)
 
 
-def render_frame(now, buckets, sessions, anim=0, height=CHART_HEIGHT):
-    """Return (frame_str, hits). hits maps clickable session rows to ids:
-    [(term_row, x_lo, x_hi, sid), ...], one per ACTIVE-SESSIONS data row,
-    using 1-based terminal coordinates."""
+def render_frame(now, buckets, sessions, anim=0, height=CHART_HEIGHT,
+                 summary_tab="win"):
+    """Return (frame_str, hits). hits maps clickable regions to TOKENS:
+    [(term_row, x_lo, x_hi, token), ...] in 1-based terminal coordinates. A
+    token is a session sid, a SUMMARY tab (TAB_WIN/TAB_AW), or "__usage__"."""
     local = now.astimezone()
     title = "CLAUDE CODE · CACHE TELEMETRY"
     clock = f"{local:%a %d %b · %H:%M:%S %Z}"
@@ -1235,7 +1276,17 @@ def render_frame(now, buckets, sessions, anim=0, height=CHART_HEIGHT):
     out += [""]
     summ_inner, sess_inner, allow_inner = 40, 92, 26
     sess_rows, active_sids = session_rows(sessions, now, sess_inner)
-    summ = panel("SUMMARY · 12h", summary_rows(buckets, summ_inner), summ_inner)
+    # SUMMARY: two clickable tabs — full window vs the active window. Each tab
+    # aggregates over its own bucket slice; the eff split shows only on the full
+    # tab (on the AW tab the whole pane already IS that window).
+    if summary_tab == "aw":
+        n = max(1, round(ACTIVE_WINDOW / BUCKET))
+        s_buckets, win_label, split = buckets[-n:], fmt_window(ACTIVE_WINDOW), False
+    else:
+        s_buckets, win_label, split = buckets, fmt_window(WINDOW), True
+    s_title, s_tlen, s_segs = summary_title(summary_tab)
+    summ = panel(s_title, summary_rows(s_buckets, summ_inner, win_label, split),
+                 summ_inner, title_len=s_tlen)
     sess = panel(f"ACTIVE SESSIONS · last {fmt_window(ACTIVE_WINDOW)}", sess_rows, sess_inner)
     # Loading dots tick ~1 Hz (not the 10 Hz chart shimmer) so they don't blur.
     slow = int(now.timestamp())
@@ -1253,9 +1304,14 @@ def render_frame(now, buckets, sessions, anim=0, height=CHART_HEIGHT):
     x_hi = summ_total + gap + sess_total
     panel_start = len(out)
     out += hjoin(summ, sess, allow, gap=gap)
-    # 4th tuple element is a TOKEN: a session sid, or the sentinel "__usage__".
+    # 4th tuple element is a TOKEN: a session sid, a SUMMARY tab, or "__usage__".
     hits = [(panel_start + 2 + j + 1, x_lo, x_hi, sid)
             for j, sid in enumerate(active_sids)]
+    # SUMMARY tabs live on the panel's title border (out line panel_start ->
+    # terminal row panel_start+1). Title text starts at terminal col 4, after
+    # the "╭─ " prefix; seg offsets are 0-based within that text.
+    tab_row = panel_start + 1
+    hits += [(tab_row, 4 + lo, 4 + hi, tok) for tok, lo, hi in s_segs]
     # Make the ALLOWANCE panel clickable when there's a live usage error to show
     # (opens the USAGE CALL ERROR overlay). Its column span sits to the right of
     # the summary + sessions panels.
@@ -1424,6 +1480,7 @@ def run_live(args):
     anim = 0
     hits = []
     focus_sid = None
+    summary_tab = "win"
     show_help = False
     show_uerr = False
     help_scroll = 0
@@ -1461,7 +1518,8 @@ def run_live(args):
             height = fit_height(rows, sessions, now) if alt else CHART_HEIGHT
             # Fast repaint every tick: animates loading, keeps the clock live,
             # and surfaces the background usage fetch within ~1s of completion.
-            frame, hits = render_frame(now, buckets, sessions, anim, height)
+            frame, hits = render_frame(now, buckets, sessions, anim, height,
+                                       summary_tab)
             # Too small to fit? The frame would overflow and scroll, desyncing the
             # click hit-regions onto the wrong rows. Show a notice and drop hits so
             # clicks can't misfire; close any overlay until there's room again.
@@ -1528,8 +1586,10 @@ def run_live(args):
                         data = os.read(fd, 4096).decode("utf-8", "ignore")
                     except OSError:
                         data = ""
-                    focus_sid, show_help, show_uerr, scroll_delta = process_input(
-                        data, mouse_re, hits, focus_sid, show_help, show_uerr)
+                    (focus_sid, summary_tab, show_help, show_uerr,
+                     scroll_delta) = process_input(
+                        data, mouse_re, hits, focus_sid, summary_tab,
+                        show_help, show_uerr)
                     # Only the help overlay scrolls; the delta is clamped each
                     # render and ignored when help is closed (reset on open).
                     help_scroll += scroll_delta
@@ -1552,16 +1612,19 @@ def run_live(args):
             sys.stdout.flush()
 
 
-def process_input(data, mouse_re, hits, focus_sid, show_help, show_uerr):
-    """Update (focus_sid, show_help, show_uerr) from a chunk of terminal input
-    and return a scroll delta for the (only scrollable) help overlay.
+def process_input(data, mouse_re, hits, focus_sid, summary_tab,
+                  show_help, show_uerr):
+    """Update (focus_sid, summary_tab, show_help, show_uerr) from a chunk of
+    terminal input and return a scroll delta for the (only scrollable) help
+    overlay.
 
-    A left-click on a session row opens/switches its popup; a click on the
-    ALLOWANCE panel (token "__usage__") opens the usage-error overlay; a click
-    outside closes whatever overlay is open. '?' toggles help; q/bare-esc closes
-    every overlay. Mouse wheel and arrow/PgUp/PgDn/j/k scroll the help overlay.
+    A left-click on a session row opens/switches its popup; a click on a SUMMARY
+    tab (TAB_WIN/TAB_AW) switches the summary window; a click on the ALLOWANCE
+    panel (token "__usage__") opens the usage-error overlay; a click outside
+    closes whatever overlay is open. '?' toggles help; q/bare-esc closes every
+    overlay. Mouse wheel and arrow/PgUp/PgDn/j/k scroll the help overlay.
 
-    Returns (focus_sid, show_help, show_uerr, scroll_delta)."""
+    Returns (focus_sid, summary_tab, show_help, show_uerr, scroll_delta)."""
     delta = 0
     for m in mouse_re.finditer(data):
         button, x, y, final = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
@@ -1578,7 +1641,9 @@ def process_input(data, mouse_re, hits, focus_sid, show_help, show_uerr):
                 continue
             hit = next((tok for (tr, lo, hi, tok) in hits
                         if tr == y and lo <= x <= hi), None)
-            if hit == "__usage__":
+            if hit in (TAB_WIN, TAB_AW):   # switch summary window, leave overlays
+                summary_tab = "aw" if hit == TAB_AW else "win"
+            elif hit == "__usage__":
                 show_uerr = True
                 focus_sid = None           # one overlay at a time
             elif hit is not None:
@@ -1609,7 +1674,7 @@ def process_input(data, mouse_re, hits, focus_sid, show_help, show_uerr):
         show_help = False
         focus_sid = None
         show_uerr = False
-    return focus_sid, show_help, show_uerr, delta
+    return focus_sid, summary_tab, show_help, show_uerr, delta
 
 
 if __name__ == "__main__":
