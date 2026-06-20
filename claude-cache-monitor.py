@@ -72,6 +72,7 @@ INTERVAL_SECONDS = int(BUCKET.total_seconds())
 # Distinct from the fixed "1h main/sub" token column, a fixed 1-hour metric.
 ACTIVE_WINDOW = timedelta(hours=1)
 CHART_HEIGHT = 8
+MIN_BAR_H = 2                               # floor so 3 charts fit ~9 rows (95x9)
 MARGIN = 8                                  # left gutter for the Y-axis scale
 TOTAL_WIDTH = MARGIN + NUM_BUCKETS
 # When --window-hours is unset the window fills the terminal width and tracks it
@@ -505,6 +506,54 @@ def _padcol(s, width):
     return s + " " * max(width - _visible_len(s), 0)
 
 
+def _clip(s, width):
+    """Truncate a (possibly ANSI-styled) string to `width` visible chars,
+    keeping SGR codes intact and resetting at the end."""
+    if _visible_len(s) <= width:
+        return s
+    out, vis, i = [], 0, 0
+    while i < len(s) and vis < width:
+        if s[i] == "\033":
+            j = i
+            while j < len(s) and s[j] != "m":
+                j += 1
+            out.append(s[i:j + 1])
+            i = j + 1
+        else:
+            out.append(s[i])
+            vis += 1
+            i += 1
+    out.append("\033[0m")
+    return "".join(out)
+
+
+def fit_overlay(lines, cols, rows, scroll):
+    """Fit a bordered modal into the terminal. Clips every line to the width;
+    when the modal is taller than the screen, pins the top and bottom border
+    rows and scrolls the middle, drawing a vertical scrollbar in the last inner
+    column. Returns (visible_lines, max_scroll)."""
+    maxw = min(max((_visible_len(l) for l in lines), default=0), cols)
+    if len(lines) <= rows:                       # fits whole: just clip width
+        return [_clip(ln, maxw) for ln in lines], 0
+
+    top, mid, bot = lines[0], lines[1:-1], lines[-1]
+    view_h = max(rows - 2, 1)                     # rows for the scrolling middle
+    max_scroll = max(0, len(mid) - view_h)
+    scroll = max(0, min(scroll, max_scroll))
+    window = mid[scroll:scroll + view_h]
+    inner_w = maxw - 1                            # last col is the scrollbar
+    thumb = max(1, round(view_h * view_h / len(mid)))
+    pos = round(scroll * (view_h - thumb) / max_scroll) if max_scroll else 0
+
+    out = [_clip(top, maxw)]
+    for i, ln in enumerate(window):
+        on = pos <= i < pos + thumb
+        out.append(_padcol(_clip(ln, inner_w), inner_w)
+                   + rgb(ACCENT if on else DIM2, "█" if on else "░"))
+    out.append(_clip(bot, maxw))
+    return out, max_scroll
+
+
 # ── charts ───────────────────────────────────────────────────────────────────
 
 def build_column(vc, total, maxt, height):
@@ -857,26 +906,9 @@ def render_popup(sid, sessions, now, cols, rows, anim=0):
                   + _padcol(rgb(DIM, "model"), 14)
                   + _padcol(rgb(DIM, "start"), 8) + _padcol(rgb(DIM, "stop"), 8)
                   + _padcol(rgb(DIM, "peak ctx"), 12) + rgb(DIM, "eff tkn"))
-        # Cap the table to whatever vertical space remains. The popup is the
-        # body plus 2 border rows; it must not exceed the terminal height.
-        # Reserve room for the footer (blank + close hint = 2) we add below.
-        footer_lines = 2
-        used = len(body) + 2 + footer_lines + 1   # +1 for the header row
-        room = max(rows - used, 0)
-        detail_rows = []
-        if room <= 0:
-            # No room even for one row: show how many were dropped.
-            detail_rows = ["  " + rgb(DIM, f"+{len(cands)} more (by eff)")]
-        elif len(cands) <= room:
-            detail_rows = [header] + [sub_row(sub) for sub in cands]
-        else:
-            # Keep the largest-by-eff that fit; reserve one row for the "+k more".
-            keep = sorted(cands, key=lambda sub: sub["eff"], reverse=True)[:room - 1]
-            keep_ids = {id(sub) for sub in keep}
-            shown = [sub for sub in cands if id(sub) in keep_ids]  # timeline order
-            detail_rows = ([header] + [sub_row(sub) for sub in shown]
-                           + ["  " + rgb(DIM, f"+{len(cands) - len(shown)} more (by eff)")])
-        body += detail_rows
+        # All subagents shown in timeline order; the overlay viewport scrolls if
+        # the popup is taller than the terminal.
+        body += [header] + [sub_row(sub) for sub in cands]
 
     body += ["", "  " + rgb(DIM, "click outside · q · esc to close")]
     return panel("SESSION DETAIL", body, inner)
@@ -936,13 +968,9 @@ def render_bucket_popup(idx, sessions, now, cols, rows):
         body += [header]
         agg_eff = eff_tokens(agg["uncached"], agg["c5m"], agg["c1h"],
                              agg["read"], agg["output"])
-        # Cap to vertical room: header + total row + footer(2) + borders(2).
-        used = len(body) + 1 + 2 + 2 + 1
-        room = max(rows - used, 1)
-        shown = entries[:room] if len(entries) > room else entries
-        body += [row(lab, b, e, lambda t: rgb(TEXT, t)) for lab, b, e, _ in shown]
-        if len(entries) > len(shown):
-            body += ["  " + rgb(DIM, f"+{len(entries) - len(shown)} more (by eff)")]
+        # All sessions shown; the overlay viewport scrolls if it's taller than
+        # the terminal.
+        body += [row(lab, b, e, lambda t: rgb(TEXT, t)) for lab, b, e, _ in entries]
         body += [rgb(DIM2, "─" * inner),
                  row("all sessions", agg, agg_eff,
                      lambda t: rgb(TEXT, t, bold=True))]
@@ -981,24 +1009,21 @@ def render_panel_popup(view, buckets, sessions, now, rows, summary_tab):
     return None, []
 
 
-def render_help(now, cols, rows, scroll):
+def render_help(now, cols, rows):
     """A modal explaining every element of the dashboard and how to read it.
 
-    Sized to ~75% of the terminal and word-wrapped so nothing overflows
-    horizontally; scrollable, with a vertical scrollbar in the last column when
-    the content is taller than the visible area.
-
-    Content is authored as typed items so colour survives wrapping:
+    Word-wrapped to fit the width; the overlay viewport scrolls it when taller
+    than the screen. Content is authored as typed items so colour survives
+    wrapping:
       ("H",  text)      heading  (cyan, bold; never wraps — keep short)
       ("L",  text)      legend   (pre-coloured single line; never wraps)
       ("T",  text)      prose    (plain str, single colour; wrapped + DIM'd)
       ("G",  None)      gap      (one blank line)
 
-    Returns (panel_lines, max_scroll)."""
-    inner = max(int(cols * 0.75) - 2, 40)      # content width inside borders
-    ph = max(int(rows * 0.75), 12)             # total panel height
-    twidth = inner - 2                         # wrap prose narrower, leaving the
-    #                                            last 2 cols for gap + scrollbar.
+    Returns the list of panel lines."""
+    inner = max(min(int(cols * 0.75), 80) - 2, 30)   # content width inside borders
+    twidth = inner - 1                         # wrap prose, leaving a col for the
+    #                                            scrollbar fit_overlay may add.
 
     def ch(k):                                  # colour chip for a palette key
         return rgb(CO[k], CHIP)
@@ -1091,26 +1116,9 @@ def render_help(now, cols, rows, scroll):
             for piece in _wrap(text, twidth):
                 lines.append(rgb(DIM, piece))
 
-    vis = ph - 2                                # panel() uses 2 rows for borders
-    max_scroll = max(0, len(lines) - vis)
-    scroll = max(0, min(scroll, max_scroll))
-
-    if len(lines) <= vis:
-        body = lines                            # fits; let panel pad. No scrollbar.
-    else:
-        window = lines[scroll:scroll + vis]
-        # Scrollbar track of `vis` cells: thumb height proportional to the
-        # visible fraction, thumb position proportional to the scroll fraction.
-        thumb = max(1, round(vis * vis / len(lines)))
-        top = round(scroll / max_scroll * (vis - thumb)) if max_scroll else 0
-        top = max(0, min(top, vis - thumb))
-        body = []
-        for i in range(vis):
-            cell = (rgb(ACCENT, "█") if top <= i < top + thumb
-                    else rgb(DIM2, "│"))
-            body.append(_padcol(window[i], inner - 1) + cell)
-
-    return panel("HELP · how to read this dashboard", body, inner), max_scroll
+    # Full panel; the overlay viewport (fit_overlay) handles scrolling + the
+    # scrollbar so this fits any terminal height.
+    return panel("HELP · how to read this dashboard", lines, inner)
 
 
 def _wrap(text, width):
@@ -1673,14 +1681,14 @@ def plan_layout(rows, cols, sessions, now):
     s/e/w popups."""
     cutoff = now - ACTIVE_WINDOW
     n_active = sum(1 for s in sessions.values() if s["last_act"] >= cutoff)
-    allow_len = len(allowance_rows(now, 0, ALLOW_MAX))
+    lean = rows < 29
     L = {
         "page_title":   rows >= 34,
         "footer":       rows >= 31,
         "compact":      rows < 39,
         "axes":         rows >= 24,
         "chart_blanks": rows >= 24,
-        "panels_lean":  rows < 29,
+        "panels_lean":  lean,
     }
     per_chart = (1 if L["compact"] else 2)
     if L["axes"]:
@@ -1693,21 +1701,27 @@ def plan_layout(rows, cols, sessions, now):
         base += 2
 
     # Panels go inline only if they fit the width AND still leave the charts at
-    # height >= 3; otherwise they move to the s/e/w popups and the charts take
-    # the freed rows.
+    # the minimum bar height; otherwise they move to the s/e/w popups and the
+    # charts take the freed rows. panel_body is the EXACT rendered height (the
+    # tallest of the three panels) so the charts fill the rest with no waste.
     cfg = fit_panels(cols)
     panel_body = 0
     if cfg is not None:
-        summ = 4 if L["panels_lean"] else 9
-        sess = (1 + (min(n_active, 3) if L["panels_lean"] else n_active)
-                if cfg["sess_cols"] is not None else 0)
-        panel_body = 1 + 2 + max(summ, sess, allow_len)     # blank+borders+body
-        if (rows - base - panel_body - 1) // 3 < 3:
+        summ = 4 if lean else 9             # summary_rows length
+        if cfg["sess_cols"] is None:
+            sess = 0
+        elif n_active == 0:
+            sess = 2                        # header + "no sessions" line
+        else:
+            sess = 1 + (min(n_active, 3) if lean else n_active)
+        alw = len(allowance_rows(now, 0, cfg["allow_inner"], lean=lean))
+        panel_body = 1 + 2 + max(summ, sess, alw)           # blank+borders+body
+        if (rows - base - panel_body) // 3 < MIN_BAR_H:
             cfg, panel_body = None, 0
     L["panels_inline"] = cfg is not None
     L["panel_cfg"] = cfg
     L["sess_cols"] = cfg["sess_cols"] if cfg else None
-    L["height"] = max(3, min(CHART_HEIGHT, (rows - base - panel_body - 1) // 3))
+    L["height"] = max(MIN_BAR_H, min(CHART_HEIGHT, (rows - base - panel_body) // 3))
     return L
 
 
@@ -1742,8 +1756,7 @@ def run_live(args):
     summary_tab = "win"
     show_help = False
     show_uerr = False
-    help_scroll = 0
-    prev_show_help = False
+    overlay_scroll = 0
     prev_okey = None
     mouse_re = re.compile(r"\033\[<(\d+);(\d+);(\d+)([Mm])")
     try:
@@ -1802,10 +1815,7 @@ def run_live(args):
                 # spans (relative to the box); translated to screen hits below.
                 overlay, okey, overlay_regions = None, None, []
                 if show_help:
-                    if not prev_show_help:        # freshly opened: reset scroll
-                        help_scroll = 0
-                    overlay, max_scroll = render_help(now, cols, rows, help_scroll)
-                    help_scroll = max(0, min(help_scroll, max_scroll))
+                    overlay = render_help(now, cols, rows)
                     okey = "help"
                 elif show_uerr:
                     overlay = render_usage_error(now, cols, rows)
@@ -1832,6 +1842,13 @@ def run_live(args):
                         panel_view = None
                     else:
                         okey = ("panel", panel_view, summary_tab)
+                if overlay is not None:
+                    # Reset scroll on a fresh/changed overlay, then fit it to the
+                    # terminal (clip width, scroll + scrollbar when too tall).
+                    if okey != prev_okey:
+                        overlay_scroll = 0
+                    overlay, max_scroll = fit_overlay(overlay, cols, rows, overlay_scroll)
+                    overlay_scroll = max(0, min(overlay_scroll, max_scroll))
                 if overlay is None:
                     # No overlay: full base repaint each tick (shimmer live).
                     body = "\033[H" + frame.replace("\n", "\033[K\n") + "\033[K\033[J"
@@ -1843,8 +1860,11 @@ def run_live(args):
                     col0 = max((cols - ow) // 2, 1)
                     # A modal panel popup is clickable: translate its box-relative
                     # regions to screen coords and make them THE hit map (base
-                    # regions are hidden under the modal).
-                    if overlay_regions:
+                    # regions are hidden under the modal). Only when it fits
+                    # un-scrolled — a scrolled view shifts the row indices, so we
+                    # drop row clicks there (scroll/close still work).
+                    hits = []
+                    if overlay_regions and max_scroll == 0:
                         hits = [(row0 + li, col0 + lo, col0 + hi, tok)
                                 for li, lo, hi, tok in overlay_regions]
                     # Paint the base ONCE when the overlay opens or switches, then
@@ -1861,7 +1881,6 @@ def run_live(args):
                     for k, pl in enumerate(overlay):
                         sys.stdout.write(f"\033[{row0 + k};{col0}H" + _padcol(pl, ow))
                 prev_okey = okey
-                prev_show_help = show_help
             else:
                 sys.stdout.write(frame + "\n")
             sys.stdout.flush()
@@ -1879,9 +1898,9 @@ def run_live(args):
                      show_uerr, scroll_delta) = process_input(
                         data, mouse_re, hits, focus_sid, focus_bucket,
                         panel_view, summary_tab, show_help, show_uerr)
-                    # Only the help overlay scrolls; the delta is clamped each
-                    # render and ignored when help is closed (reset on open).
-                    help_scroll += scroll_delta
+                    # Any open overlay scrolls; the delta is clamped to the
+                    # overlay's range each render (and reset when it changes).
+                    overlay_scroll += scroll_delta
             else:
                 time.sleep(TICK_SECONDS)
           except Exception:
