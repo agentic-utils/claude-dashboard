@@ -922,9 +922,9 @@ def render_popup(sid, sessions, now, cols, rows, anim=0):
 
 def render_bucket_popup(idx, sessions, now, cols, rows):
     """A bordered modal breaking one chart bar (a single bucket / time slice)
-    down by session, covering all three chart dimensions: input (uncached / 5m
-    write / 1h write), context (read / new / miss), output, and effective
-    tokens. Returns the list of lines, or None if the index is out of range."""
+    down by session, covering all three chart dimensions: input (uncached new
+    in / 5m write / 1h write), context (cache hit / miss), output, and
+    effective tokens. Returns the list of lines, or None if out of range."""
     if not (0 <= idx < NUM_BUCKETS):
         return None
     inner = 92
@@ -951,20 +951,24 @@ def render_bucket_popup(idx, sessions, now, cols, rows):
             + rgb(DIM, f"   ·   {fmt_window(BUCKET)} slice   ·   "
                        f"{len(entries)} session{'' if len(entries) == 1 else 's'}"))
 
-    # session(26) new(11) writes(11) reads(11) output(10) eff -> ~92 inner.
+    # session(26) in/5m/1h/hit/miss/out(9 each) eff -> ~92 inner.
+    W = 9
     def row(label, b, eff, lab_style):
         def c(v):
             return rgb(TEXT, fmt_compact(round(v)))
         return ("  " + _padcol(lab_style(label[:24]), 26)
-                + _padcol(c(b["uncached"]), 11)
-                + _padcol(c(b["c5m"] + b["c1h"]), 11)
-                + _padcol(c(b["read"]), 11)
-                + _padcol(c(b["output"]), 10)
+                + _padcol(c(b["uncached"]), W)
+                + _padcol(c(b["c5m"]), W)
+                + _padcol(c(b["c1h"]), W)
+                + _padcol(c(b["read"]), W)
+                + _padcol(c(b["miss"]), W)
+                + _padcol(c(b["output"]), W)
                 + rgb(TEXT, fmt_compact(round(eff)), bold=True))
 
+    def h(t):
+        return _padcol(rgb(DIM, t), W)
     header = ("  " + _padcol(rgb(DIM, "session"), 26)
-              + _padcol(rgb(DIM, "new in"), 11) + _padcol(rgb(DIM, "writes"), 11)
-              + _padcol(rgb(DIM, "reads"), 11) + _padcol(rgb(DIM, "output"), 10)
+              + h("in") + h("5m") + h("1h") + h("hit") + h("miss") + h("out")
               + rgb(DIM, "eff"))
 
     body = [head, ""]
