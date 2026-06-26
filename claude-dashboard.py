@@ -37,7 +37,7 @@ Key facts baked in:
   - Each API response spans several JSONL lines sharing one message.id, so
     responses are de-duplicated by message.id.
 
-Press H (or click "H history" in the footer) for a longer-span HISTORY view:
+Press H (or click the History menu tab) for a longer-span HISTORY view:
 the same three charts over a configurable window (--history-hours, default 168 =
 1 week) with an auto-scaled bucket and a day-by-day axis, a SUMMARY with a $ cost
 estimate and cache-hit rate, and click-a-bar drill-down. No active-sessions or
@@ -152,6 +152,22 @@ def rgb(c, text, bold=False):
     r, g, b = c
     b0 = "\033[1m" if bold else ""
     return f"{b0}\033[38;2;{r};{g};{b}m{text}\033[0m"
+
+
+def styled(text, fg, bg=None, bold=False, underline=False):
+    """rgb() plus optional background and SGR-4 underline — the underline is for
+    Win3.1-style menu accelerator letters."""
+    if text == "":
+        return ""
+    codes = []
+    if bold:
+        codes.append("1")
+    if underline:
+        codes.append("4")
+    codes.append(f"38;2;{fg[0]};{fg[1]};{fg[2]}")
+    if bg is not None:
+        codes.append(f"48;2;{bg[0]};{bg[1]};{bg[2]}")
+    return f"\033[{';'.join(codes)}m{text}\033[0m"
 
 
 def shade(c, f):
@@ -806,6 +822,38 @@ def hjoin(*blocks, gap=3):
 
 
 TAB_WIN, TAB_AW = "__tab_win__", "__tab_aw__"
+VIEW_LIVE, VIEW_HIST = "__live__", "__history__"
+
+
+def _menu_cell(label, ul_idx, on):
+    """One Win3.1 menu tab: padded label, accelerator letter at `ul_idx`
+    underlined. Active tab is highlighted (dark text on an accent block)."""
+    fg = (18, 18, 28) if on else TEXT
+    bg = ACCENT if on else None
+    cell = " " + label + " "
+    i = ul_idx + 1                         # +1 for the leading pad space
+    return (styled(cell[:i], fg, bg, bold=on)
+            + styled(cell[i], fg, bg, bold=on, underline=True)
+            + styled(cell[i + 1:], fg, bg, bold=on))
+
+
+def view_tabs(mode):
+    """The Live / History menu-bar tabs (accelerator letters L/H underlined,
+    active tab highlighted). Returns (styled, visible_len, segs) where
+    segs = [(token, lo_off, hi_off)] are 0-based char offsets for the hit-map."""
+    tabs = [(VIEW_LIVE, "Live", 0), (VIEW_HIST, "History", 0)]   # underline char 0
+    active = VIEW_HIST if mode == "history" else VIEW_LIVE
+    sep = " "
+    out, off, segs = "", 0, []
+    for i, (tok, lab, ul) in enumerate(tabs):
+        if i:
+            out += sep
+            off += len(sep)
+        width = len(lab) + 2               # padded cell width
+        out += _menu_cell(lab, ul, tok == active)
+        segs.append((tok, off, off + width - 1))
+        off += width
+    return out, off, segs
 
 
 def summary_title(summary_tab):
@@ -1232,7 +1280,7 @@ def render_help(now, cols, rows):
               "active-sessions / allowance panels as popups."),
         ("G", None),
         ("H", "HISTORY"),
-        ("T", f"Press H (or click \"H history\" in the footer) for a longer-span "
+        ("T", f"Press H (or click the History tab / footer span) for a longer-span "
               f"view — default last {fmt_window(HIST_WINDOW)}, configurable via "
               "--history-hours. The three charts plus a 4th stacking effective "
               "tokens by model, all with a coarser auto-scaled bucket and a "
@@ -1240,12 +1288,12 @@ def render_help(now, cols, rows):
               "rate) and an ACTIVITY heatmap (effective tokens by weekday × "
               "hour). Click a bar to break the slice down by session. On a small "
               "screen the two panels move to popups — press S (summary) / M "
-              "(heatmap). H or q returns to live."),
+              "(heatmap). L (or q) returns to the Live tab."),
         ("G", None),
         ("H", "KEYS"),
-        ("T", "? help · H history · S/M history popups · s/e/w live panels · "
-              "click bar/session/tab · up/down PgUp/PgDn j/k scroll · "
-              "q / esc step back · ^C quit."),
+        ("T", "? help · L live / H history tabs · S/M history popups · "
+              "s/e/w live panels · click bar/session/tab · "
+              "up/down PgUp/PgDn j/k scroll · q / esc step back · ^C quit."),
     ]
 
     # Flatten to coloured lines. Headings/legends/gaps -> one line; prose ->
@@ -1665,7 +1713,7 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
     """Return (frame_str, hits). hits maps clickable regions to TOKENS:
     [(term_row, x_lo, x_hi, token), ...] in 1-based terminal coordinates. A token
     is a session sid, a SUMMARY tab (TAB_WIN/TAB_AW), "__chart__", "__usage__",
-    "__history__" (toggle history view), or "__exit__" (quit). `layout` is a
+    "__history__"/"__live__" (select that view), or "__exit__" (quit). `layout` is a
     plan_layout() dict; None means the full layout. `mode` is "live" or
     "history" — history uses a longer span, day-axis, and a single summary."""
     global VIEW_WINDOW, VIEW_BUCKET, VIEW_DAILY
@@ -1688,16 +1736,27 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
 
     if layout["page_title"]:
         local = now.astimezone()
-        title = ("CLAUDE CODE · HISTORY · last " + fmt_window(HIST_WINDOW)
-                 if mode == "history" else "CLAUDE CODE · CACHE TELEMETRY")
+        brand = rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, "CLAUDE CODE", bold=True)
+        brand_len = 2 + len("CLAUDE CODE")
+        tabs_str, tabs_len, segs = view_tabs(mode)
+        ctx = ("HISTORY · last " + fmt_window(HIST_WINDOW)
+               if mode == "history" else "live")
         clock = f"{local:%a %d %b · %H:%M:%S %Z}"
-        pad = max(TOTAL_WIDTH - _visible_len(title) - len(clock) - 4, 1)
+        right = rgb(DIM, ctx + "   " + clock)
+        right_len = _visible_len(right)
+        BRAND_GAP = 4
+        pad = max(TOTAL_WIDTH - brand_len - BRAND_GAP - tabs_len - right_len - 2, 1)
         out += [
-            " " + rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, title, bold=True)
-            + " " * pad + rgb(DIM, clock),
+            " " + brand + " " * BRAND_GAP + tabs_str + " " * pad + right,
             grad_rule(TOTAL_WIDTH, ACCENT2, ACCENT),
             "",
         ]
+        # Tab click targets. Line is " "(col1) + brand + BRAND_GAP spaces + tabs;
+        # so the tab string starts at column 1+brand_len+BRAND_GAP+1 (1-based).
+        tab_x0 = 1 + brand_len + BRAND_GAP
+        title_row = len(out) - 2
+        for tok, lo, hi in segs:
+            hits.append((title_row, tab_x0 + lo + 1, tab_x0 + hi + 1, tok))
 
     # Charts. Bar rows carry the "__chart__" hit token (process_input derives the
     # bucket from the click x). Shared with the popup via chart_block.
@@ -1769,13 +1828,13 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
         if mode == "history":
             if layout.get("history_panels") == "inline":
                 foot = (f"history · {fmt_window(HIST_BUCKET)} buckets   ·   "
-                        f"click a bar   ·   H live   ·   ? help   ·   ⌃C to exit")
-                spans = [("H live", "__history__"), ("⌃C to exit", "__exit__")]
+                        f"click a bar   ·   L live   ·   ? help   ·   ⌃C to exit")
+                spans = [("L live", "__live__"), ("⌃C to exit", "__exit__")]
             else:                          # panels didn't fit — offer the popups
                 foot = (f"history · {fmt_window(HIST_BUCKET)} buckets   ·   "
-                        f"S summary   ·   M heatmap   ·   H live   ·   ⌃C to exit")
+                        f"S summary   ·   M heatmap   ·   L live   ·   ⌃C to exit")
                 spans = [("S summary", "__hsummary__"), ("M heatmap", "__heatmap__"),
-                         ("H live", "__history__"), ("⌃C to exit", "__exit__")]
+                         ("L live", "__live__"), ("⌃C to exit", "__exit__")]
         else:
             plan = " · ".join(p for p in (_usage.get("sub"), _usage.get("tier")) if p)
             stamp = _usage["at"].astimezone().strftime("%H:%M:%S") if _usage.get("at") else "—"
@@ -2342,10 +2401,11 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     q/bare-esc steps back one overlay level. Mouse wheel and arrow/PgUp/PgDn/j/k
     scroll the help overlay.
 
-    'H' (or a click on the footer "H history"/"H live" span) toggles the history
-    view; in history (when the panels don't fit inline) S / M open the SUMMARY /
-    heatmap popups via panel_view ("hsummary"/"heatmap"); a click on the footer
-    "⌃C to exit" span requests quit.
+    'H'/'L' (or a click on the Live/History menu-bar tabs, or the footer
+    "H history"/"L live" span) select the history/live view; in history (when
+    the panels don't fit inline) S / M open the SUMMARY / heatmap popups via
+    panel_view ("hsummary"/"heatmap"); a click on the footer "⌃C to exit" span
+    requests quit.
 
     Returns (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
     show_uerr, show_history, quit_flag, scroll_delta)."""
@@ -2374,8 +2434,8 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             elif hit == "__usage__":
                 show_uerr = True
                 focus_sid = focus_bucket = None   # one overlay at a time
-            elif hit == "__history__":     # footer H span: toggle history view
-                show_history = not show_history
+            elif hit in ("__history__", "__live__"):   # Live/History tab or span
+                show_history = (hit == "__history__")
                 focus_sid = focus_bucket = panel_view = None
                 show_uerr = show_help = False
             elif hit in ("__hsummary__", "__heatmap__"):   # footer S/M popups
@@ -2407,9 +2467,14 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     delta += rest.count("j") - rest.count("k")           # vim-style scroll
     if "?" in rest:
         show_help = not show_help
-    # H (either case) toggles the history view; closes any open overlay/popup.
+    # Menu accelerators: H selects the History tab, L the Live tab (each closes
+    # any open overlay/popup). Deterministic, mirroring the menu-bar tabs.
     if "H" in rest or "h" in rest:
-        show_history = not show_history
+        show_history = True
+        focus_sid = focus_bucket = panel_view = None
+        show_uerr = False
+    if "L" in rest or "l" in rest:
+        show_history = False
         focus_sid = focus_bucket = panel_view = None
         show_uerr = False
     # Panel popup toggles. In history: S = window SUMMARY, M = activity heatmap

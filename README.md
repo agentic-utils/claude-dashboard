@@ -36,14 +36,16 @@ shows): 5-hour session + weekly gauges with reset times.
 effective tokens, the model in use, and the named subagents that ran in the last
 hour (each with peak context + effective tokens). Press **`?`** for in-app help.
 
-**HISTORY** — press **`H`** (or click *"H history"* in the footer) for a
-longer-span view: the same three charts over the **last 168 hours (1 week)** by
-default, with a coarser auto-scaled bucket and a day-by-day X-axis. It drops the
-active-sessions and allowance panels and shows a **SUMMARY** scoped to the window
-with a **`$` cost estimate** (effective tokens × base-input price) and a
-**cache-hit rate**. Click a bar to break that slice down by session. `H` or `q`
-returns to the live view. Configure with `--history-hours` /
-`--history-bucket-minutes` / `--price-per-mtok`.
+**LIVE / HISTORY tabs** — a Win3.1-style menu bar at the top with the
+accelerator letter underlined: press **`L`** for **Live**, **`H`** for
+**History** (or click the tabs). The **HISTORY** view shows the same three charts
+over the **last 168 hours (1 week)** by default, with a coarser auto-scaled
+bucket and a day-by-day X-axis. It drops the active-sessions and allowance panels
+and shows a **SUMMARY** scoped to the window with a **`$` cost estimate**
+(effective tokens × base-input price) and a **cache-hit rate**, plus a 4th chart
+(model mix) and an **ACTIVITY heatmap** (weekday × hour). Click a bar to break
+that slice down by session. `L` or `q` returns to Live. Configure with
+`--history-hours` / `--history-bucket-minutes` / `--price-per-mtok`.
 
 ## Run
 
@@ -54,9 +56,9 @@ returns to the live view. Configure with `--history-hours` /
 ./claude-dashboard.py --history-hours 336   # 2-week history span (press H)
 ```
 
-Keys: `?` help · `H` history view · `↑/↓` `PgUp/PgDn` `j/k` scroll help ·
-`q`/`esc` close overlay / leave history · click a session/bar for detail ·
-`Ctrl-C` (or click *"⌃C to exit"*) to quit.
+Keys: `?` help · `L` live / `H` history tabs · `S`/`M` history popups · `↑/↓`
+`PgUp/PgDn` `j/k` scroll help · `q`/`esc` close overlay / leave history · click a
+tab/session/bar for detail · `Ctrl-C` (or click *"⌃C to exit"*) to quit.
 
 ## How it works / requirements
 
