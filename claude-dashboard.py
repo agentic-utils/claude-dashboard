@@ -1105,10 +1105,20 @@ def render_bucket_popup(idx, sessions, now, cols, rows):
 
 
 def render_panel_popup(view, buckets, sessions, now, rows, summary_tab):
-    """One of the three side panels rendered as a modal (used on terminals too
+    """One of the side panels rendered as a modal (used on terminals too
     narrow/short to show them inline). Returns (lines, regions) where regions =
     [(overlay_line, lo_off, hi_off, token)] are clickable spans in coordinates
-    relative to the overlay box; the caller offsets them by the box origin."""
+    relative to the overlay box; the caller offsets them by the box origin.
+    The history view contributes "hsummary" (window summary + $ cost) and
+    "heatmap" (the activity grid)."""
+    if view == "hsummary":              # history SUMMARY popup (with $ cost)
+        inner = SUMM_FULL
+        rows_ = summary_rows(buckets, inner, fmt_window(HIST_WINDOW),
+                             show_cost=True)
+        return panel("SUMMARY · last " + fmt_window(HIST_WINDOW), rows_, inner), []
+    if view == "heatmap":               # history ACTIVITY heatmap popup
+        p, _ = heatmap_panel(HIST_HEAT)
+        return p, []
     if view == "summary":
         inner = 40
         p, segs = summary_panel(buckets, summary_tab, inner)
@@ -1226,13 +1236,14 @@ def render_help(now, cols, rows):
               f"view — default last {fmt_window(HIST_WINDOW)}, configurable via "
               "--history-hours. The three charts plus a 4th stacking effective "
               "tokens by model, all with a coarser auto-scaled bucket and a "
-              "day-by-day axis; a SUMMARY with a $ cost estimate and cache-hit "
-              "rate. Click a bar to break the slice down by session. Press M for "
-              "an activity heatmap (effective tokens by weekday × hour). H or q "
-              "returns to live."),
+              "day-by-day axis; alongside a SUMMARY ($ cost estimate + cache-hit "
+              "rate) and an ACTIVITY heatmap (effective tokens by weekday × "
+              "hour). Click a bar to break the slice down by session. On a small "
+              "screen the two panels move to popups — press S (summary) / M "
+              "(heatmap). H or q returns to live."),
         ("G", None),
         ("H", "KEYS"),
-        ("T", "? help · H history · M heatmap (in history) · s/e/w panels · "
+        ("T", "? help · H history · S/M history popups · s/e/w live panels · "
               "click bar/session/tab · up/down PgUp/PgDn j/k scroll · "
               "q / esc step back · ^C quit."),
     ]
@@ -1535,56 +1546,39 @@ def heat_color(frac):
     return stops[-1][1]
 
 
-def render_heatmap(now, heat, cols, rows):
-    """Full-page activity heatmap: effective tokens by local weekday (Mon..Sun)
-    × hour-of-day (0..23) over the history window. A toggled history sub-view
-    (key m / footer "M charts"). Returns (frame, hits)."""
-    out, hits = [], []
-    local = now.astimezone()
-    title = "CLAUDE CODE · HISTORY · activity · last " + fmt_window(HIST_WINDOW)
-    clock = f"{local:%a %d %b · %H:%M:%S %Z}"
-    pad = max(TOTAL_WIDTH - _visible_len(title) - len(clock) - 4, 1)
-    out += [
-        " " + rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, title, bold=True)
-        + " " * pad + rgb(DIM, clock),
-        grad_rule(TOTAL_WIDTH, ACCENT2, ACCENT),
-        "",
-    ]
+def heatmap_content(heat):
+    """Build the activity-heatmap panel body (no title/border): an hour header,
+    7 weekday rows of 2-col cells coloured less->more by effective tokens, a
+    per-day total column, and an intensity ramp. Returns (rows, inner) for use
+    in panel() — both inline (beside the history SUMMARY) and as the M popup."""
     days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
     maxv = max((v for r in (heat or []) for v in r), default=0.0)
     if not heat or maxv <= 0:
-        out.append("  " + rgb(DIM, "no activity in the window yet"))
-    else:
-        CW = 2                                  # each hour cell is 2 cols wide
-        # Hour header: even hours labelled, aligned to the cell's left column.
-        hdr = "".join(f"{h:02d}" if h % 2 == 0 else " " * CW for h in range(24))
-        out.append("      " + rgb(DIM, hdr) + rgb(DIM, "   total"))
-        for d in range(7):
-            cells = []
-            for h in range(24):
-                v = heat[d][h]
-                if v <= 0:
-                    cells.append(rgb(DIM2, "·" * CW))
-                else:
-                    cells.append(rgb(heat_color(v / maxv), "█" * CW))
-            tot = sum(heat[d])
-            tot_s = rgb(TEXT, fmt_compact(round(tot))) if tot > 0 else rgb(DIM, "·")
-            out.append("  " + rgb(TEXT, f"{days[d]:<4}") + "".join(cells)
-                       + "   " + tot_s)
-        ramp = "".join(rgb(heat_color(i / 8), "█") for i in range(9))
-        out += ["", "  " + rgb(DIM, "less ") + ramp + rgb(DIM, " more")
-                + rgb(DIM, "   ·   effective tokens by weekday × local hour")]
-    foot = "heatmap   ·   M charts   ·   H live   ·   ? help   ·   ⌃C to exit"
-    foot = foot[:TOTAL_WIDTH - 2]
-    out += ["", "  " + rgb(DIM, foot)]
-    foot_row = len(out)
-    for sub, tok in (("M charts", "__heatmap__"), ("H live", "__history__"),
-                     ("⌃C to exit", "__exit__")):
-        i = foot.find(sub)
-        if i >= 0:
-            lo = i + 3
-            hits.append((foot_row, lo, lo + _visible_len(sub) - 1, tok))
-    return "\n".join(out), hits
+        rows = [rgb(DIM, "no activity in the window yet")]
+        return rows, max(_visible_len(r) for r in rows)
+    CW = 2                                      # each hour cell is 2 cols wide
+    # Hour header: even hours labelled, aligned to the cell's left column. The
+    # 5-col prefix matches the "Mon  " day-label width below.
+    hdr = "".join(f"{h:02d}" if h % 2 == 0 else " " * CW for h in range(24))
+    rows = [rgb(DIM, " " * 5 + hdr + "  total")]
+    for d in range(7):
+        cells = []
+        for h in range(24):
+            v = heat[d][h]
+            cells.append(rgb(DIM2, "·" * CW) if v <= 0
+                         else rgb(heat_color(v / maxv), "█" * CW))
+        tot = sum(heat[d])
+        tot_s = rgb(TEXT, fmt_compact(round(tot))) if tot > 0 else rgb(DIM, "·")
+        rows.append(rgb(TEXT, f"{days[d]:<4} ") + "".join(cells) + "  " + tot_s)
+    ramp = "".join(rgb(heat_color(i / 8), "█") for i in range(9))
+    rows += ["", rgb(DIM, "less ") + ramp + rgb(DIM, " more   weekday × local hour")]
+    return rows, max(_visible_len(r) for r in rows)
+
+
+def heatmap_panel(heat):
+    """The activity heatmap as a titled panel (returns (lines, inner))."""
+    rows, inner = heatmap_content(heat)
+    return panel("ACTIVITY · weekday × hour", rows, inner), inner
 
 
 CHARTS = [
@@ -1716,14 +1710,18 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
              for ri in bar_idx]
 
     if mode == "history":
-        # History: one SUMMARY panel (input/output/responses/effective + $ cost +
-        # cache-hit + cache-mix), scoped to the week. No sessions/allowance.
-        if layout.get("history_summary"):
+        # History: SUMMARY ($ cost + cache-hit + cache-mix, scoped to the week)
+        # and the ACTIVITY heatmap side by side. When they don't fit they move
+        # to the S/M popups (history_panels == "popup") and nothing renders here.
+        if layout.get("history_panels") == "inline":
             inner = layout["panel_cfg"]["summ_inner"]
             srows = summary_rows(buckets, inner, fmt_window(HIST_WINDOW),
                                  lean=layout["panels_lean"], show_cost=True)
+            summ_panel = panel("SUMMARY · last " + fmt_window(HIST_WINDOW),
+                               srows, inner)
+            heat_panel, _ = heatmap_panel(HIST_HEAT)
             out.append("")
-            out += panel("SUMMARY · last " + fmt_window(HIST_WINDOW), srows, inner)
+            out += hjoin(summ_panel, heat_panel, gap=GAP)
     elif layout["panels_inline"]:
         lean = layout["panels_lean"]
         cfg = layout["panel_cfg"]
@@ -1769,10 +1767,15 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
 
     if layout["footer"]:
         if mode == "history":
-            foot = (f"history · {fmt_window(HIST_BUCKET)} buckets   ·   "
-                    f"M heatmap   ·   H live   ·   ? help   ·   ⌃C to exit")
-            spans = [("M heatmap", "__heatmap__"), ("H live", "__history__"),
-                     ("⌃C to exit", "__exit__")]
+            if layout.get("history_panels") == "inline":
+                foot = (f"history · {fmt_window(HIST_BUCKET)} buckets   ·   "
+                        f"click a bar   ·   H live   ·   ? help   ·   ⌃C to exit")
+                spans = [("H live", "__history__"), ("⌃C to exit", "__exit__")]
+            else:                          # panels didn't fit — offer the popups
+                foot = (f"history · {fmt_window(HIST_BUCKET)} buckets   ·   "
+                        f"S summary   ·   M heatmap   ·   H live   ·   ⌃C to exit")
+                spans = [("S summary", "__hsummary__"), ("M heatmap", "__heatmap__"),
+                         ("H live", "__history__"), ("⌃C to exit", "__exit__")]
         else:
             plan = " · ".join(p for p in (_usage.get("sub"), _usage.get("tier")) if p)
             stamp = _usage["at"].astimezone().strftime("%H:%M:%S") if _usage.get("at") else "—"
@@ -2046,8 +2049,10 @@ def plan_layout(rows, cols, sessions, now, history=False):
         base += 2
 
     if history:
-        # 4 charts (3 standard + model-mix) and one SUMMARY panel (with $ cost +
-        # cache-hit); no sessions/allowance. Recompute the chart base for 4.
+        # 4 charts (3 standard + model-mix), then a panel row of SUMMARY (with $
+        # cost + cache-hit) and the ACTIVITY heatmap side by side. If the width
+        # can't hold both or the charts would drop below MIN_BAR_H, the panels
+        # move to the S/M popups and the charts take the freed rows.
         ncharts = 4
         hbase = ncharts * per_chart + ((ncharts - 1) if L["chart_blanks"] else 0)
         if L["page_title"]:
@@ -2055,11 +2060,15 @@ def plan_layout(rows, cols, sessions, now, history=False):
         if L["footer"]:
             hbase += 2
         summ = (6 if lean else 11)          # summary_rows length incl. cost lines
-        panel_body = 1 + 2 + summ           # blank + borders + body
-        if (rows - hbase - panel_body) // ncharts < MIN_BAR_H:
-            panel_body = 0                  # no room — drop the panel, charts grow
-        L["panels_inline"] = panel_body > 0
-        L["history_summary"] = panel_body > 0
+        HEAT_ROWS, HEAT_INNER = 10, 61      # header+7 days+blank+ramp ; grid width
+        panel_body = 1 + 2 + max(summ, HEAT_ROWS)   # blank + borders + tallest panel
+        row_w = (SUMM_FULL + 2) + GAP + (HEAT_INNER + 2)
+        inline = ((cols - RIGHT_RESERVE) >= row_w
+                  and (rows - hbase - panel_body) // ncharts >= MIN_BAR_H)
+        if not inline:
+            panel_body = 0                  # popups instead — charts take the rows
+        L["history_panels"] = "inline" if inline else "popup"
+        L["panels_inline"] = inline
         L["panel_cfg"] = {"summ_inner": SUMM_FULL}
         L["sess_cols"] = None
         L["height"] = max(MIN_BAR_H,
@@ -2125,7 +2134,6 @@ def run_live(args):
     # history view is open — a week-wide transcript scan is heavy.
     hist_buckets, hist_sessions, last_hist_collect = [], {}, None
     show_history = False
-    show_heatmap = False         # history activity-heatmap sub-view (key m)
     anim = 0
     hits = []
     focus_sid = None
@@ -2184,15 +2192,11 @@ def run_live(args):
                         track_models=True, track_heatmap=True)
                     last_hist_collect = now
                 cur_buckets, cur_sessions = hist_buckets, hist_sessions
-                if show_heatmap:
-                    layout = None
-                    frame, hits = render_heatmap(now, HIST_HEAT, cols, rows)
-                else:
-                    layout = (plan_layout(rows, cols, hist_sessions, now,
-                                          history=True) if alt else None)
-                    frame, hits = render_frame(now, hist_buckets, hist_sessions,
-                                               anim, layout, summary_tab,
-                                               cols=cols, rows=rows, mode="history")
+                layout = (plan_layout(rows, cols, hist_sessions, now,
+                                      history=True) if alt else None)
+                frame, hits = render_frame(now, hist_buckets, hist_sessions,
+                                           anim, layout, summary_tab,
+                                           cols=cols, rows=rows, mode="history")
             else:
                 cur_buckets, cur_sessions = buckets, sessions
                 layout = plan_layout(rows, cols, sessions, now) if alt else None
@@ -2295,11 +2299,11 @@ def run_live(args):
                     except OSError:
                         data = ""
                     (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
-                     show_uerr, show_history, show_heatmap, quit_flag,
+                     show_uerr, show_history, quit_flag,
                      scroll_delta) = process_input(
                         data, mouse_re, hits, focus_sid, focus_bucket,
                         panel_view, summary_tab, show_help, show_uerr,
-                        show_history, show_heatmap)
+                        show_history)
                     if quit_flag:              # footer "⌃C to exit" was clicked
                         break
                     # Any open overlay scrolls; the delta is clamped to the
@@ -2325,7 +2329,7 @@ def run_live(args):
 
 
 def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
-                  summary_tab, show_help, show_uerr, show_history, show_heatmap):
+                  summary_tab, show_help, show_uerr, show_history):
     """Update the overlay/selection state from a chunk of terminal input and
     return a scroll delta for the (only scrollable) help overlay.
 
@@ -2339,11 +2343,12 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     scroll the help overlay.
 
     'H' (or a click on the footer "H history"/"H live" span) toggles the history
-    view; 'm' (or "M heatmap"/"M charts") toggles the heatmap sub-view within
-    history; a click on the footer "⌃C to exit" span requests quit.
+    view; in history (when the panels don't fit inline) S / M open the SUMMARY /
+    heatmap popups via panel_view ("hsummary"/"heatmap"); a click on the footer
+    "⌃C to exit" span requests quit.
 
     Returns (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
-    show_uerr, show_history, show_heatmap, quit_flag, scroll_delta)."""
+    show_uerr, show_history, quit_flag, scroll_delta)."""
     delta = 0
     quit_flag = False
     for m in mouse_re.finditer(data):
@@ -2371,14 +2376,13 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
                 focus_sid = focus_bucket = None   # one overlay at a time
             elif hit == "__history__":     # footer H span: toggle history view
                 show_history = not show_history
-                show_heatmap = False
                 focus_sid = focus_bucket = panel_view = None
                 show_uerr = show_help = False
-            elif hit == "__heatmap__":     # footer M span: toggle heatmap sub-view
-                if show_history:
-                    show_heatmap = not show_heatmap
-                    focus_sid = focus_bucket = panel_view = None
-                    show_uerr = False
+            elif hit in ("__hsummary__", "__heatmap__"):   # footer S/M popups
+                view = "hsummary" if hit == "__hsummary__" else "heatmap"
+                panel_view = None if panel_view == view else view
+                focus_sid = focus_bucket = None
+                show_uerr = False
             elif hit == "__exit__":        # footer ⌃C span: quit
                 quit_flag = True
             elif hit is not None:          # session row (incl. from a popup)
@@ -2406,22 +2410,17 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     # H (either case) toggles the history view; closes any open overlay/popup.
     if "H" in rest or "h" in rest:
         show_history = not show_history
-        show_heatmap = False
         focus_sid = focus_bucket = panel_view = None
         show_uerr = False
-    # m (either case) toggles the activity-heatmap sub-view, history only.
-    if ("m" in rest or "M" in rest) and show_history:
-        show_heatmap = not show_heatmap
-        focus_sid = focus_bucket = panel_view = None
-        show_uerr = False
-    # s/e/w toggle the panel popups (summary / sessions [e]ntries / [w]allowance).
-    # Opening a panel closes any session/bucket drill-down underneath it. Disabled
-    # in history view (those panels are live-only).
-    if not show_history:
-        for key, view in (("s", "summary"), ("e", "sessions"), ("w", "allow")):
-            if key in rest:
-                panel_view = None if panel_view == view else view
-                focus_sid = focus_bucket = None
+    # Panel popup toggles. In history: S = window SUMMARY, M = activity heatmap
+    # (the inline-fallback popups). In live: s/e/w = summary / sessions /
+    # allowance. Opening a popup closes any session/bucket drill-down underneath.
+    keymap = ((("s", "hsummary"), ("m", "heatmap")) if show_history
+              else (("s", "summary"), ("e", "sessions"), ("w", "allow")))
+    for key, view in keymap:
+        if key in rest or key.upper() in rest:
+            panel_view = None if panel_view == view else view
+            focus_sid = focus_bucket = None
     # q or a BARE esc steps back ONE overlay level (a "\x1b[" here is an unhandled
     # CSI sequence, not a close; a lone "\x1b" is a real ESC press). With nothing
     # else open it exits the history view back to live.
@@ -2438,12 +2437,10 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             focus_bucket = None
         elif panel_view is not None:
             panel_view = None
-        elif show_heatmap:
-            show_heatmap = False
         elif show_history:
             show_history = False
     return (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
-            show_uerr, show_history, show_heatmap, quit_flag, delta)
+            show_uerr, show_history, quit_flag, delta)
 
 
 if __name__ == "__main__":
