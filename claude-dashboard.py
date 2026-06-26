@@ -101,6 +101,9 @@ HISTORY_BUCKET_MIN = None                   # None => auto-scale; else fixed min
 HIST_WINDOW = timedelta(hours=HISTORY_HOURS)
 HIST_BUCKET = timedelta(minutes=70)
 HIST_NUM_BUCKETS = NUM_BUCKETS
+# 7×24 grid of effective tokens (local weekday Mon..Sun × hour 0..23) for the
+# history activity-heatmap sub-view; populated by collect(track_heatmap=True).
+HIST_HEAT = None
 # $ cost estimate = effective-tokens × base-input price. Effective tokens are in
 # base-input-token-equivalents, so one blended per-MTok input price converts them
 # to dollars. Default = Opus 4.8 input ($5/MTok); --price-per-mtok overrides.
@@ -344,7 +347,7 @@ def new_session(sid, ts, rec, num_buckets=None):
 
 
 def collect(now: datetime, window=None, bucket=None, num_buckets=None,
-            track_models=False):
+            track_models=False, track_heatmap=False):
     """Return (buckets, sessions): time buckets oldest->newest plus per-session
     cache stats, all from de-duplicated usage records. `window`/`bucket`/
     `num_buckets` default to the live globals; the history view passes its own
@@ -362,6 +365,7 @@ def collect(now: datetime, window=None, bucket=None, num_buckets=None,
     if track_models:
         for b in buckets:
             b["models"] = {}        # model id -> effective tokens (extra key)
+    heat = [[0.0] * 24 for _ in range(7)] if track_heatmap else None
     sessions: dict[str, dict] = {}
     seen: set[str] = set()
     titles: dict[str, str] = {}   # sid -> custom session title (latest /rename)
@@ -445,6 +449,9 @@ def collect(now: datetime, window=None, bucket=None, num_buckets=None,
                     if track_models:        # history model-mix: eff tokens by model
                         mk = short_model(model)
                         b["models"][mk] = b["models"].get(mk, 0) + eff
+                    if heat is not None:    # activity heatmap: eff by weekday×hour
+                        loc = ts.astimezone()
+                        heat[loc.weekday()][loc.hour] += eff
 
                     # Per-session drill-down: split fresh tokens (new work) by
                     # main thread vs subagent (sidechain). Fresh, not total
@@ -521,6 +528,9 @@ def collect(now: datetime, window=None, bucket=None, num_buckets=None,
         if s is not None:
             s["name"] = t
 
+    if track_heatmap:
+        global HIST_HEAT
+        HIST_HEAT = heat
     return buckets, sessions
 
 
@@ -1214,14 +1224,17 @@ def render_help(now, cols, rows):
         ("H", "HISTORY"),
         ("T", f"Press H (or click \"H history\" in the footer) for a longer-span "
               f"view — default last {fmt_window(HIST_WINDOW)}, configurable via "
-              "--history-hours. Same charts with a coarser auto-scaled bucket and "
-              "a day-by-day axis, plus a SUMMARY with a $ cost estimate and cache-"
-              "hit rate. Click a bar to break the slice down by session. H or q "
+              "--history-hours. The three charts plus a 4th stacking effective "
+              "tokens by model, all with a coarser auto-scaled bucket and a "
+              "day-by-day axis; a SUMMARY with a $ cost estimate and cache-hit "
+              "rate. Click a bar to break the slice down by session. Press M for "
+              "an activity heatmap (effective tokens by weekday × hour). H or q "
               "returns to live."),
         ("G", None),
         ("H", "KEYS"),
-        ("T", "? help · H history · s/e/w panels · click bar/session/tab · "
-              "up/down PgUp/PgDn j/k scroll · q / esc step back · ^C quit."),
+        ("T", "? help · H history · M heatmap (in history) · s/e/w panels · "
+              "click bar/session/tab · up/down PgUp/PgDn j/k scroll · "
+              "q / esc step back · ^C quit."),
     ]
 
     # Flatten to coloured lines. Headings/legends/gaps -> one line; prose ->
@@ -1506,6 +1519,74 @@ def render_too_small(cols, rows, need_rows):
     return "\n".join(out)
 
 
+def heat_color(frac):
+    """Colour ramp for the activity heatmap: cold grey -> blue -> green ->
+    yellow -> red as `frac` goes 0..1."""
+    stops = [(0.0, DIM2), (0.12, CO["uncached"]), (0.4, OK_C),
+             (0.7, WARN_C), (1.0, HOT_C)]
+    frac = max(0.0, min(1.0, frac))
+    for i in range(len(stops) - 1):
+        f0, c0 = stops[i]
+        f1, c1 = stops[i + 1]
+        if frac <= f1:
+            t = 0 if f1 == f0 else (frac - f0) / (f1 - f0)
+            return (int(lerp(c0[0], c1[0], t)), int(lerp(c0[1], c1[1], t)),
+                    int(lerp(c0[2], c1[2], t)))
+    return stops[-1][1]
+
+
+def render_heatmap(now, heat, cols, rows):
+    """Full-page activity heatmap: effective tokens by local weekday (Mon..Sun)
+    × hour-of-day (0..23) over the history window. A toggled history sub-view
+    (key m / footer "M charts"). Returns (frame, hits)."""
+    out, hits = [], []
+    local = now.astimezone()
+    title = "CLAUDE CODE · HISTORY · activity · last " + fmt_window(HIST_WINDOW)
+    clock = f"{local:%a %d %b · %H:%M:%S %Z}"
+    pad = max(TOTAL_WIDTH - _visible_len(title) - len(clock) - 4, 1)
+    out += [
+        " " + rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, title, bold=True)
+        + " " * pad + rgb(DIM, clock),
+        grad_rule(TOTAL_WIDTH, ACCENT2, ACCENT),
+        "",
+    ]
+    days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    maxv = max((v for r in (heat or []) for v in r), default=0.0)
+    if not heat or maxv <= 0:
+        out.append("  " + rgb(DIM, "no activity in the window yet"))
+    else:
+        CW = 2                                  # each hour cell is 2 cols wide
+        # Hour header: even hours labelled, aligned to the cell's left column.
+        hdr = "".join(f"{h:02d}" if h % 2 == 0 else " " * CW for h in range(24))
+        out.append("      " + rgb(DIM, hdr) + rgb(DIM, "   total"))
+        for d in range(7):
+            cells = []
+            for h in range(24):
+                v = heat[d][h]
+                if v <= 0:
+                    cells.append(rgb(DIM2, "·" * CW))
+                else:
+                    cells.append(rgb(heat_color(v / maxv), "█" * CW))
+            tot = sum(heat[d])
+            tot_s = rgb(TEXT, fmt_compact(round(tot))) if tot > 0 else rgb(DIM, "·")
+            out.append("  " + rgb(TEXT, f"{days[d]:<4}") + "".join(cells)
+                       + "   " + tot_s)
+        ramp = "".join(rgb(heat_color(i / 8), "█") for i in range(9))
+        out += ["", "  " + rgb(DIM, "less ") + ramp + rgb(DIM, " more")
+                + rgb(DIM, "   ·   effective tokens by weekday × local hour")]
+    foot = "heatmap   ·   M charts   ·   H live   ·   ? help   ·   ⌃C to exit"
+    foot = foot[:TOTAL_WIDTH - 2]
+    out += ["", "  " + rgb(DIM, foot)]
+    foot_row = len(out)
+    for sub, tok in (("M charts", "__heatmap__"), ("H live", "__history__"),
+                     ("⌃C to exit", "__exit__")):
+        i = foot.find(sub)
+        if i >= 0:
+            lo = i + 3
+            hits.append((foot_row, lo, lo + _visible_len(sub) - 1, tok))
+    return "\n".join(out), hits
+
+
 CHARTS = [
     ("Input tokens · cache write disposition", "Input", ["uncached", "c5m", "c1h"],
      [("uncached", "uncached"), ("c5m", "5m · subagent"), ("c1h", "1h · main")]),
@@ -1689,8 +1770,9 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
     if layout["footer"]:
         if mode == "history":
             foot = (f"history · {fmt_window(HIST_BUCKET)} buckets   ·   "
-                    f"click a bar   ·   H live   ·   ? help   ·   ⌃C to exit")
-            hist_tok = "H live"
+                    f"M heatmap   ·   H live   ·   ? help   ·   ⌃C to exit")
+            spans = [("M heatmap", "__heatmap__"), ("H live", "__history__"),
+                     ("⌃C to exit", "__exit__")]
         else:
             plan = " · ".join(p for p in (_usage.get("sub"), _usage.get("tier")) if p)
             stamp = _usage["at"].astimezone().strftime("%H:%M:%S") if _usage.get("at") else "—"
@@ -1703,14 +1785,15 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
             foot = (f"plan {plan or '?'}   ·   allowance live, updated {stamp}   ·   "
                     f"charts every {max(1, INTERVAL_SECONDS // 60)}m{extra}   ·   "
                     f"H history   ·   ? help   ·   ⌃C to exit")
-            hist_tok = "H history"
+            spans = [("H history", "__history__"), ("⌃C to exit", "__exit__")]
         foot = foot[:TOTAL_WIDTH - 2]          # clip so it never wraps/overflows
         out += ["", "  " + rgb(DIM, foot)]
-        # Clickable footer spans: the H phrase toggles the view, "⌃C to exit"
-        # quits. Coords are 1-based; the line has a 2-col indent, so a substring
-        # at plain index i sits at terminal column i+3. Skip any clipped off.
+        # Clickable footer spans (H toggles history, M toggles the heatmap,
+        # "⌃C to exit" quits). Coords are 1-based; the line has a 2-col indent,
+        # so a substring at plain index i sits at terminal column i+3. Skip any
+        # clipped off the end.
         foot_row = len(out)
-        for sub, tok in ((hist_tok, "__history__"), ("⌃C to exit", "__exit__")):
+        for sub, tok in spans:
             i = foot.find(sub)
             if i >= 0:
                 lo = i + 3
@@ -2042,6 +2125,7 @@ def run_live(args):
     # history view is open — a week-wide transcript scan is heavy.
     hist_buckets, hist_sessions, last_hist_collect = [], {}, None
     show_history = False
+    show_heatmap = False         # history activity-heatmap sub-view (key m)
     anim = 0
     hits = []
     focus_sid = None
@@ -2090,23 +2174,31 @@ def run_live(args):
             # History view: collect its (longer, coarser) buckets on demand —
             # on entry, on --interval, and after a resize. Select which dataset
             # and mode this tick renders.
+            # Fast repaint every tick: animates loading, keeps the clock live,
+            # and surfaces the background usage fetch within ~1s of completion.
             if show_history:
                 if (last_hist_collect is None
                         or (now - last_hist_collect).total_seconds() >= args.interval):
                     hist_buckets, hist_sessions = collect(
                         now, HIST_WINDOW, HIST_BUCKET, HIST_NUM_BUCKETS,
-                        track_models=True)
+                        track_models=True, track_heatmap=True)
                     last_hist_collect = now
-                cur_buckets, cur_sessions, cur_mode = hist_buckets, hist_sessions, "history"
+                cur_buckets, cur_sessions = hist_buckets, hist_sessions
+                if show_heatmap:
+                    layout = None
+                    frame, hits = render_heatmap(now, HIST_HEAT, cols, rows)
+                else:
+                    layout = (plan_layout(rows, cols, hist_sessions, now,
+                                          history=True) if alt else None)
+                    frame, hits = render_frame(now, hist_buckets, hist_sessions,
+                                               anim, layout, summary_tab,
+                                               cols=cols, rows=rows, mode="history")
             else:
-                cur_buckets, cur_sessions, cur_mode = buckets, sessions, "live"
-            layout = (plan_layout(rows, cols, cur_sessions, now,
-                                  history=show_history) if alt else None)
-            # Fast repaint every tick: animates loading, keeps the clock live,
-            # and surfaces the background usage fetch within ~1s of completion.
-            frame, hits = render_frame(now, cur_buckets, cur_sessions, anim, layout,
-                                       summary_tab, cols=cols, rows=rows,
-                                       mode=cur_mode)
+                cur_buckets, cur_sessions = buckets, sessions
+                layout = plan_layout(rows, cols, sessions, now) if alt else None
+                frame, hits = render_frame(now, buckets, sessions, anim, layout,
+                                           summary_tab, cols=cols, rows=rows,
+                                           mode="live")
             # Too small to fit? The frame would overflow and scroll, desyncing the
             # click hit-regions onto the wrong rows. Show a notice and drop hits so
             # clicks can't misfire; close any overlay until there's room again.
@@ -2203,9 +2295,11 @@ def run_live(args):
                     except OSError:
                         data = ""
                     (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
-                     show_uerr, show_history, quit_flag, scroll_delta) = process_input(
+                     show_uerr, show_history, show_heatmap, quit_flag,
+                     scroll_delta) = process_input(
                         data, mouse_re, hits, focus_sid, focus_bucket,
-                        panel_view, summary_tab, show_help, show_uerr, show_history)
+                        panel_view, summary_tab, show_help, show_uerr,
+                        show_history, show_heatmap)
                     if quit_flag:              # footer "⌃C to exit" was clicked
                         break
                     # Any open overlay scrolls; the delta is clamped to the
@@ -2231,7 +2325,7 @@ def run_live(args):
 
 
 def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
-                  summary_tab, show_help, show_uerr, show_history):
+                  summary_tab, show_help, show_uerr, show_history, show_heatmap):
     """Update the overlay/selection state from a chunk of terminal input and
     return a scroll delta for the (only scrollable) help overlay.
 
@@ -2245,10 +2339,11 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     scroll the help overlay.
 
     'H' (or a click on the footer "H history"/"H live" span) toggles the history
-    view; a click on the footer "⌃C to exit" span requests quit.
+    view; 'm' (or "M heatmap"/"M charts") toggles the heatmap sub-view within
+    history; a click on the footer "⌃C to exit" span requests quit.
 
     Returns (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
-    show_uerr, show_history, quit_flag, scroll_delta)."""
+    show_uerr, show_history, show_heatmap, quit_flag, scroll_delta)."""
     delta = 0
     quit_flag = False
     for m in mouse_re.finditer(data):
@@ -2276,8 +2371,14 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
                 focus_sid = focus_bucket = None   # one overlay at a time
             elif hit == "__history__":     # footer H span: toggle history view
                 show_history = not show_history
+                show_heatmap = False
                 focus_sid = focus_bucket = panel_view = None
                 show_uerr = show_help = False
+            elif hit == "__heatmap__":     # footer M span: toggle heatmap sub-view
+                if show_history:
+                    show_heatmap = not show_heatmap
+                    focus_sid = focus_bucket = panel_view = None
+                    show_uerr = False
             elif hit == "__exit__":        # footer ⌃C span: quit
                 quit_flag = True
             elif hit is not None:          # session row (incl. from a popup)
@@ -2305,6 +2406,12 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     # H (either case) toggles the history view; closes any open overlay/popup.
     if "H" in rest or "h" in rest:
         show_history = not show_history
+        show_heatmap = False
+        focus_sid = focus_bucket = panel_view = None
+        show_uerr = False
+    # m (either case) toggles the activity-heatmap sub-view, history only.
+    if ("m" in rest or "M" in rest) and show_history:
+        show_heatmap = not show_heatmap
         focus_sid = focus_bucket = panel_view = None
         show_uerr = False
     # s/e/w toggle the panel popups (summary / sessions [e]ntries / [w]allowance).
@@ -2331,10 +2438,12 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             focus_bucket = None
         elif panel_view is not None:
             panel_view = None
+        elif show_heatmap:
+            show_heatmap = False
         elif show_history:
             show_history = False
     return (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
-            show_uerr, show_history, quit_flag, delta)
+            show_uerr, show_history, show_heatmap, quit_flag, delta)
 
 
 if __name__ == "__main__":
