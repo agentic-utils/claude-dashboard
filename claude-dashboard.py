@@ -37,6 +37,12 @@ Key facts baked in:
   - Each API response spans several JSONL lines sharing one message.id, so
     responses are de-duplicated by message.id.
 
+Press H (or click "H history" in the footer) for a longer-span HISTORY view:
+the same three charts over a configurable window (--history-hours, default 168 =
+1 week) with an auto-scaled bucket and a day-by-day axis, a SUMMARY with a $ cost
+estimate and cache-hit rate, and click-a-bar drill-down. No active-sessions or
+allowance panels there.
+
 Stdlib only. --once prints a single frame; --interval overrides the period.
 """
 
@@ -82,6 +88,31 @@ TOTAL_WIDTH = MARGIN + NUM_BUCKETS
 AUTOFIT = True
 MIN_BUCKETS = 20                            # narrowest chart we'll render
 
+# ── history view ──────────────────────────────────────────────────────────────
+# A separate, longer-span view (H key / footer) reusing the same chart machinery
+# with a coarser bucket. NUM_BUCKETS (the chart width) is shared with the live
+# view; the history WINDOW is fixed (--history-hours, default 168 = 1 week) and
+# the bucket is derived as window/width, so the span stays exactly a week while
+# the bucket scales to the terminal. --history-bucket-minutes overrides the
+# bucket instead, deriving the window as bucket*width. Resolved at startup and
+# on resize by compute_history_dims().
+HISTORY_HOURS = 168.0
+HISTORY_BUCKET_MIN = None                   # None => auto-scale; else fixed minutes
+HIST_WINDOW = timedelta(hours=HISTORY_HOURS)
+HIST_BUCKET = timedelta(minutes=70)
+HIST_NUM_BUCKETS = NUM_BUCKETS
+# $ cost estimate = effective-tokens × base-input price. Effective tokens are in
+# base-input-token-equivalents, so one blended per-MTok input price converts them
+# to dollars. Default = Opus 4.8 input ($5/MTok); --price-per-mtok overrides.
+PRICE_PER_MTOK = 5.0
+# Active view dimensions, set per render by render_frame from its `mode` arg. In
+# live mode they mirror WINDOW/BUCKET; in history mode they hold HIST_WINDOW/
+# HIST_BUCKET so the chart axis, bucket-popup span, and summary label all read
+# the right window without threading params through the whole render stack.
+VIEW_WINDOW = WINDOW
+VIEW_BUCKET = BUCKET
+VIEW_DAILY = False                          # day-boundary X-axis (history) vs hourly
+
 # ── 24-bit truecolour palette ────────────────────────────────────────────────
 CO = {
     "uncached": (84, 160, 255),     # blue
@@ -108,7 +139,7 @@ USAGE_REFRESH = 300                 # seconds between live-usage refetches
 USAGE_BACKOFF = 900                 # after a 429, wait this long before retrying
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "claude-cache-monitor.log")
+                        "claude-dashboard.log")
 logging.basicConfig(filename=LOG_PATH, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ccmon")
@@ -278,10 +309,12 @@ def short_model(m):
     return _clean(m[7:] if m.startswith("claude-") else m)
 
 
-def new_session(sid, ts, rec):
+def new_session(sid, ts, rec, num_buckets=None):
     """Factory for a per-session stats dict. `last` means the last SUCCESSFUL
     turn ts (None until a usage record is seen); `last_act` is the last ANY
-    activity ts (usage or surfaced error)."""
+    activity ts (usage or surfaced error). `num_buckets` sizes the per-session
+    bucket array; defaults to the global (live) NUM_BUCKETS."""
+    nb = NUM_BUCKETS if num_buckets is None else num_buckets
     return {
         "sid": sid, "name": None, "last": None, "cwd": rec.get("cwd") or "",
         "main_12": 0, "sub_12": 0, "main_1h": 0, "sub_1h": 0,
@@ -290,18 +323,23 @@ def new_session(sid, ts, rec):
         "eff_main_1h": 0.0, "eff_main_12": 0.0,
         "eff_sub_1h": 0.0, "eff_sub_12": 0.0,
         "subs": {},   # agentId -> per-subagent detail
-        "buckets": [empty_bucket() for _ in range(NUM_BUCKETS)],
+        "buckets": [empty_bucket() for _ in range(nb)],
         "err": None, "last_act": ts,
     }
 
 
-def collect(now: datetime):
+def collect(now: datetime, window=None, bucket=None, num_buckets=None):
     """Return (buckets, sessions): time buckets oldest->newest plus per-session
-    cache stats, all from de-duplicated usage records."""
-    cutoff = now - WINDOW
+    cache stats, all from de-duplicated usage records. `window`/`bucket`/
+    `num_buckets` default to the live globals; the history view passes its own
+    (longer) span and coarser bucket so the same scan feeds both views."""
+    window = WINDOW if window is None else window
+    bucket = BUCKET if bucket is None else bucket
+    num_buckets = NUM_BUCKETS if num_buckets is None else num_buckets
+    cutoff = now - window
     last_hour = now - timedelta(hours=1)
     mtime_floor = cutoff.timestamp() - 1
-    buckets = [empty_bucket() for _ in range(NUM_BUCKETS)]
+    buckets = [empty_bucket() for _ in range(num_buckets)]
     sessions: dict[str, dict] = {}
     seen: set[str] = set()
     titles: dict[str, str] = {}   # sid -> custom session title (latest /rename)
@@ -344,7 +382,7 @@ def collect(now: datetime):
                     # no usage, so they'd be skipped by the usage check below.
                     # Handle them first: record the latest error per session.
                     if msg.get("isApiErrorMessage"):
-                        s = sessions.get(sid) or sessions.setdefault(sid, new_session(sid, ts, rec))
+                        s = sessions.get(sid) or sessions.setdefault(sid, new_session(sid, ts, rec, num_buckets))
                         status = rec.get("apiErrorStatus")
                         text = _err_text(rec)
                         if s["err"] is None or ts >= s["err"]["ts"]:
@@ -364,8 +402,8 @@ def collect(now: datetime):
                             continue
                         seen.add(key)
 
-                    idx = int((ts - cutoff) / BUCKET)
-                    idx = min(max(idx, 0), NUM_BUCKETS - 1)
+                    idx = int((ts - cutoff) / bucket)
+                    idx = min(max(idx, 0), num_buckets - 1)
                     b = buckets[idx]
 
                     cc = usage.get("cache_creation") or {}
@@ -390,7 +428,7 @@ def collect(now: datetime):
                     side = "sub" if rec.get("isSidechain") else "main"
                     s = sessions.get(sid)
                     if s is None:
-                        s = sessions[sid] = new_session(sid, ts, rec)
+                        s = sessions[sid] = new_session(sid, ts, rec, num_buckets)
                     # `last` = last SUCCESSFUL turn (the "last prompt" baseline and
                     # the success cutoff for errored_last); `last_act` = any activity.
                     if s["last"] is None or ts > s["last"]:
@@ -641,23 +679,41 @@ def render_chart(title, keys, buckets, height, now, anim=0,
 
     if not axes:                 # tightest tier: bars only, no baseline/ticks
         return lines
-    # X-axis baseline + absolute local hour ticks (H:00 only).
-    axis = [" "] * NUM_BUCKETS
-    local_cut = (now - WINDOW).astimezone()
+    # X-axis baseline + tick labels. Live (VIEW_DAILY off): hourly "H:00".
+    # History (VIEW_DAILY on): one label per local-midnight day boundary ("Mon26")
+    # so a week of bars stays readable. Dimensions come from the active view
+    # (VIEW_WINDOW/VIEW_BUCKET) and the rendered bucket count.
+    nb = len(buckets)
+    axis = [" "] * nb
+    local_cut = (now - VIEW_WINDOW).astimezone()
     local_now = now.astimezone()
-    tick = local_cut.replace(minute=0, second=0, microsecond=0)
-    if tick < local_cut:
-        tick += timedelta(hours=1)
+    span = VIEW_BUCKET.total_seconds()
+    if VIEW_DAILY:
+        tick = local_cut.replace(hour=0, minute=0, second=0, microsecond=0)
+        if tick < local_cut:
+            tick += timedelta(days=1)
+        step = timedelta(days=1)
+
+        def fmt_lab(d):
+            return f"{d:%a%d}"
+    else:
+        tick = local_cut.replace(minute=0, second=0, microsecond=0)
+        if tick < local_cut:
+            tick += timedelta(hours=1)
+        step = timedelta(hours=1)
+
+        def fmt_lab(d):
+            return f"{d.hour}:00"
     while tick <= local_now:
-        pos = round((tick - local_cut).total_seconds() / BUCKET.total_seconds())
-        lab = f"{tick.hour}:00"
-        start = min(pos, NUM_BUCKETS - len(lab))
+        pos = round((tick - local_cut).total_seconds() / span)
+        lab = fmt_lab(tick)
+        start = min(pos, nb - len(lab))
         for i, ch in enumerate(lab):
-            if 0 <= start + i < NUM_BUCKETS:
+            if 0 <= start + i < nb:
                 axis[start + i] = ch
-        tick += timedelta(hours=1)
+        tick += step
     lines.append(rgb(DIM, "0".rjust(MARGIN - 1)) + " "
-                 + rgb(DIM2, "└" + "─" * (NUM_BUCKETS - 1)))
+                 + rgb(DIM2, "└" + "─" * (nb - 1)))
     if not compact:              # compact folds labels into the header instead
         lines.append(" " * MARGIN + rgb(DIM, "".join(axis)))
     return lines
@@ -721,13 +777,15 @@ def summary_title(summary_tab):
     return styled, off, segs
 
 
-def summary_rows(buckets, inner, win_label, lean=False, compact_nums=False):
+def summary_rows(buckets, inner, win_label, lean=False, compact_nums=False,
+                 show_cost=False):
     """Summary figures over `buckets` (the active tab's window slice).
     `win_label` names the window in labels. The effective-token figure is for
     that window only — the 1h/full split is gone now that the tabs select the
     window. `lean` drops the cache-mix breakdown to save rows on short
     terminals; `compact_nums` renders input/output as 55m rather than 55,123,456
-    to narrow the panel."""
+    to narrow the panel. `show_cost` adds a $ estimate (effective tokens ×
+    PRICE_PER_MTOK) and a cache-hit% line — used by the history view."""
     bignum = fmt_compact if compact_nums else fmt
     agg = empty_bucket()
     for b in buckets:
@@ -751,6 +809,12 @@ def summary_rows(buckets, inner, win_label, lean=False, compact_nums=False):
         kv(rgb(DIM, f"effective"), rgb(TEXT, fmt_compact(round(eff)),
            bold=True)),
     ]
+    if show_cost:
+        cost = eff * PRICE_PER_MTOK / 1_000_000
+        cost_str = f"${cost/1000:.1f}k" if cost >= 1000 else f"${cost:,.2f}"
+        rows.append(kv(rgb(DIM, "$ est"), rgb(OK_C, cost_str, bold=True)))
+        rows.append(kv(rgb(DIM, "cache hit"),
+                       rgb(TEXT, pct(agg["read"], total_input))))
     if not lean:
         rows += [
             rgb(DIM2, "─" * inner),
@@ -928,10 +992,11 @@ def render_bucket_popup(idx, sessions, now, cols, rows):
     if not (0 <= idx < NUM_BUCKETS):
         return None
     inner = 92
-    cutoff = now - WINDOW
-    start = (cutoff + idx * BUCKET).astimezone()
-    end = (cutoff + (idx + 1) * BUCKET).astimezone()
-    span = f"{start:%H:%M}–{end:%H:%M}"
+    cutoff = now - VIEW_WINDOW
+    start = (cutoff + idx * VIEW_BUCKET).astimezone()
+    end = (cutoff + (idx + 1) * VIEW_BUCKET).astimezone()
+    span = (f"{start:%a %H:%M}–{end:%H:%M}" if VIEW_DAILY
+            else f"{start:%H:%M}–{end:%H:%M}")
 
     agg = empty_bucket()
     entries = []                         # (label, bucket, eff, model)
@@ -948,7 +1013,7 @@ def render_bucket_popup(idx, sessions, now, cols, rows):
     entries.sort(key=lambda e: e[2], reverse=True)
 
     head = (rgb(TEXT, f"bucket {span}", bold=True)
-            + rgb(DIM, f"   ·   {fmt_window(BUCKET)} slice   ·   "
+            + rgb(DIM, f"   ·   {fmt_window(VIEW_BUCKET)} slice   ·   "
                        f"{len(entries)} session{'' if len(entries) == 1 else 's'}"))
 
     # session(26) in/5m/1h/hit/miss/out(9 each) eff -> ~92 inner.
@@ -1106,9 +1171,17 @@ def render_help(now, cols, rows):
               "On a narrow/short terminal press s / e / w to open the SUMMARY / "
               "active-sessions / allowance panels as popups."),
         ("G", None),
+        ("H", "HISTORY"),
+        ("T", f"Press H (or click \"H history\" in the footer) for a longer-span "
+              f"view — default last {fmt_window(HIST_WINDOW)}, configurable via "
+              "--history-hours. Same charts with a coarser auto-scaled bucket and "
+              "a day-by-day axis, plus a SUMMARY with a $ cost estimate and cache-"
+              "hit rate. Click a bar to break the slice down by session. H or q "
+              "returns to live."),
+        ("G", None),
         ("H", "KEYS"),
-        ("T", "? help · s/e/w panels · click bar/session/tab · up/down PgUp/PgDn "
-              "j/k scroll · q / esc step back · ^C quit."),
+        ("T", "? help · H history · s/e/w panels · click bar/session/tab · "
+              "up/down PgUp/PgDn j/k scroll · q / esc step back · ^C quit."),
     ]
 
     # Flatten to coloured lines. Headings/legends/gaps -> one line; prose ->
@@ -1444,11 +1517,18 @@ def summary_panel(buckets, summary_tab, inner, lean=False, compact_nums=False):
 
 
 def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
-                 cols=None, rows=None):
+                 cols=None, rows=None, mode="live"):
     """Return (frame_str, hits). hits maps clickable regions to TOKENS:
     [(term_row, x_lo, x_hi, token), ...] in 1-based terminal coordinates. A token
-    is a session sid, a SUMMARY tab (TAB_WIN/TAB_AW), "__chart__", or
-    "__usage__". `layout` is a plan_layout() dict; None means the full layout."""
+    is a session sid, a SUMMARY tab (TAB_WIN/TAB_AW), "__chart__", "__usage__",
+    "__history__" (toggle history view), or "__exit__" (quit). `layout` is a
+    plan_layout() dict; None means the full layout. `mode` is "live" or
+    "history" — history uses a longer span, day-axis, and a single summary."""
+    global VIEW_WINDOW, VIEW_BUCKET, VIEW_DAILY
+    if mode == "history":
+        VIEW_WINDOW, VIEW_BUCKET, VIEW_DAILY = HIST_WINDOW, HIST_BUCKET, True
+    else:
+        VIEW_WINDOW, VIEW_BUCKET, VIEW_DAILY = WINDOW, BUCKET, False
     if layout is None:
         layout = {"page_title": True, "footer": True, "compact": False,
                   "axes": True, "chart_blanks": True, "panels_lean": False,
@@ -1464,7 +1544,8 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
 
     if layout["page_title"]:
         local = now.astimezone()
-        title = "CLAUDE CODE · CACHE TELEMETRY"
+        title = ("CLAUDE CODE · HISTORY · last " + fmt_window(HIST_WINDOW)
+                 if mode == "history" else "CLAUDE CODE · CACHE TELEMETRY")
         clock = f"{local:%a %d %b · %H:%M:%S %Z}"
         pad = max(TOTAL_WIDTH - _visible_len(title) - len(clock) - 4, 1)
         out += [
@@ -1483,7 +1564,16 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
     hits += [(base + ri + 1, MARGIN + 1, MARGIN + NUM_BUCKETS, "__chart__")
              for ri in bar_idx]
 
-    if layout["panels_inline"]:
+    if mode == "history":
+        # History: one SUMMARY panel (input/output/responses/effective + $ cost +
+        # cache-hit + cache-mix), scoped to the week. No sessions/allowance.
+        if layout.get("history_summary"):
+            inner = layout["panel_cfg"]["summ_inner"]
+            srows = summary_rows(buckets, inner, fmt_window(HIST_WINDOW),
+                                 lean=layout["panels_lean"], show_cost=True)
+            out.append("")
+            out += panel("SUMMARY · last " + fmt_window(HIST_WINDOW), srows, inner)
+    elif layout["panels_inline"]:
         lean = layout["panels_lean"]
         cfg = layout["panel_cfg"]
         sess_cols = cfg["sess_cols"]
@@ -1527,19 +1617,34 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
                       "__usage__") for k in range(len(allow))]
 
     if layout["footer"]:
-        plan = " · ".join(p for p in (_usage.get("sub"), _usage.get("tier")) if p)
-        stamp = _usage["at"].astimezone().strftime("%H:%M:%S") if _usage.get("at") else "—"
-        if not layout["panels_inline"]:
-            extra = "   ·   s/e/w panels"
-        elif layout.get("sess_cols") is None:
-            extra = "   ·   e sessions"
+        if mode == "history":
+            foot = (f"history · {fmt_window(HIST_BUCKET)} buckets   ·   "
+                    f"click a bar   ·   H live   ·   ? help   ·   ⌃C to exit")
+            hist_tok = "H live"
         else:
-            extra = ""
-        foot = (f"plan {plan or '?'}   ·   allowance live, updated {stamp}   ·   "
-                f"charts every {max(1, INTERVAL_SECONDS // 60)}m{extra}   ·   "
-                f"? help   ·   ⌃C to exit")
+            plan = " · ".join(p for p in (_usage.get("sub"), _usage.get("tier")) if p)
+            stamp = _usage["at"].astimezone().strftime("%H:%M:%S") if _usage.get("at") else "—"
+            if not layout["panels_inline"]:
+                extra = "   ·   s/e/w panels"
+            elif layout.get("sess_cols") is None:
+                extra = "   ·   e sessions"
+            else:
+                extra = ""
+            foot = (f"plan {plan or '?'}   ·   allowance live, updated {stamp}   ·   "
+                    f"charts every {max(1, INTERVAL_SECONDS // 60)}m{extra}   ·   "
+                    f"H history   ·   ? help   ·   ⌃C to exit")
+            hist_tok = "H history"
         foot = foot[:TOTAL_WIDTH - 2]          # clip so it never wraps/overflows
         out += ["", "  " + rgb(DIM, foot)]
+        # Clickable footer spans: the H phrase toggles the view, "⌃C to exit"
+        # quits. Coords are 1-based; the line has a 2-col indent, so a substring
+        # at plain index i sits at terminal column i+3. Skip any clipped off.
+        foot_row = len(out)
+        for sub, tok in ((hist_tok, "__history__"), ("⌃C to exit", "__exit__")):
+            i = foot.find(sub)
+            if i >= 0:
+                lo = i + 3
+                hits.append((foot_row, lo, lo + _visible_len(sub) - 1, tok))
     return "\n".join(out), hits
 
 
@@ -1552,6 +1657,23 @@ def term_cols():
         return MARGIN + 144
 
 
+def compute_history_dims():
+    """Resolve HIST_WINDOW / HIST_BUCKET / HIST_NUM_BUCKETS from HISTORY_HOURS /
+    HISTORY_BUCKET_MIN and the current chart width (NUM_BUCKETS). History shares
+    the live chart width; with --history-bucket-minutes unset the window is fixed
+    at HISTORY_HOURS and the bucket = window/width (a week stays a week while the
+    bucket scales to the terminal); set, the bucket is fixed and the window =
+    bucket × width. Recomputed on resize (the width changed)."""
+    global HIST_WINDOW, HIST_BUCKET, HIST_NUM_BUCKETS
+    HIST_NUM_BUCKETS = NUM_BUCKETS
+    if HISTORY_BUCKET_MIN:
+        HIST_BUCKET = timedelta(minutes=HISTORY_BUCKET_MIN)
+        HIST_WINDOW = HIST_BUCKET * NUM_BUCKETS
+    else:
+        HIST_WINDOW = timedelta(hours=HISTORY_HOURS)
+        HIST_BUCKET = HIST_WINDOW / NUM_BUCKETS
+
+
 def configure_dimensions(args, cols, fail):
     """Resolve BUCKET / WINDOW / NUM_BUCKETS / ACTIVE_WINDOW / TOTAL_WIDTH /
     INTERVAL_SECONDS from the CLI args and terminal width; `fail(msg)` reports a
@@ -1560,7 +1682,7 @@ def configure_dimensions(args, cols, fail):
     width. --window-hours unset => fill the available width (wider terminal =
     more history); given => fixed and validated to fit."""
     global BUCKET, WINDOW, NUM_BUCKETS, ACTIVE_WINDOW, TOTAL_WIDTH, INTERVAL_SECONDS
-    global AUTOFIT
+    global AUTOFIT, HISTORY_HOURS, HISTORY_BUCKET_MIN, PRICE_PER_MTOK
 
     bucket_min, aw_hours = args.bucket_minutes, args.active_window_hours
     if bucket_min < 1:
@@ -1603,7 +1725,19 @@ def configure_dimensions(args, cols, fail):
     TOTAL_WIDTH = MARGIN + NUM_BUCKETS
     ACTIVE_WINDOW = max(timedelta(hours=aw_hours), BUCKET)
     INTERVAL_SECONDS = args.interval if args.interval else bucket_min * 60
-    args.interval = INTERVAL_SECONDS        # the run loop reads args.interval
+    args.interval = INTERVAL_SECONDS
+
+    # History view config (validated; dims derived in compute_history_dims).
+    if args.history_hours <= 0:
+        fail("--history-hours must be > 0")
+    if args.history_bucket_minutes is not None and args.history_bucket_minutes < 1:
+        fail("--history-bucket-minutes must be >= 1")
+    if args.price_per_mtok < 0:
+        fail("--price-per-mtok must be >= 0")
+    HISTORY_HOURS = args.history_hours
+    HISTORY_BUCKET_MIN = args.history_bucket_minutes
+    PRICE_PER_MTOK = args.price_per_mtok
+    compute_history_dims()        # the run loop reads args.interval
 
 
 def refit_width(cols):
@@ -1617,6 +1751,7 @@ def refit_width(cols):
     if nb == NUM_BUCKETS:
         return False
     NUM_BUCKETS, WINDOW, TOTAL_WIDTH = nb, BUCKET * nb, MARGIN + nb
+    compute_history_dims()          # history shares the chart width — re-derive
     return True
 
 
@@ -1638,6 +1773,18 @@ def main():
                     help="how far back a session (and, in the detail popup, its "
                          "subagents, and the SUMMARY active-window tab) counts "
                          "as active (default 1)")
+    ap.add_argument("--history-hours", type=float, default=168.0, metavar="HOURS",
+                    help="span of the history view (H key / footer). Default 168 "
+                         "(1 week). The bucket auto-scales to fill the width "
+                         "unless --history-bucket-minutes is given.")
+    ap.add_argument("--history-bucket-minutes", type=int, default=None,
+                    metavar="MINUTES",
+                    help="fix the history bucket width instead of auto-scaling; "
+                         "the history span then becomes bucket × chart-width")
+    ap.add_argument("--price-per-mtok", type=float, default=5.0, metavar="USD",
+                    help="base input $/million-tokens for the history $ estimate "
+                         "(default 5.0 = Opus 4.8 input); effective tokens are "
+                         "priced at this rate")
     args = ap.parse_args()
 
     cols = term_cols()
@@ -1712,9 +1859,10 @@ def fit_panels(cols, lean):
     return None
 
 
-def plan_layout(rows, cols, sessions, now):
+def plan_layout(rows, cols, sessions, now, history=False):
     """Decide which elements render inline, degrading as the terminal shrinks,
-    and pick the chart bar height to fill what's left.
+    and pick the chart bar height to fill what's left. `history` plans the
+    history view (one SUMMARY panel, no sessions/allowance).
 
     Height ladder: <39 fold each chart title+legend onto one line and drop the
     tick row; <34 drop the page title; <31 drop the footer; <29 lean the panels
@@ -1743,6 +1891,20 @@ def plan_layout(rows, cols, sessions, now):
         base += 3
     if L["footer"]:
         base += 2
+
+    if history:
+        # One SUMMARY panel (with $ cost + cache-hit), no sessions/allowance.
+        summ = (6 if lean else 11)          # summary_rows length incl. cost lines
+        panel_body = 1 + 2 + summ           # blank + borders + body
+        if (rows - base - panel_body) // 3 < MIN_BAR_H:
+            panel_body = 0                  # no room — drop the panel, charts grow
+        L["panels_inline"] = panel_body > 0
+        L["history_summary"] = panel_body > 0
+        L["panel_cfg"] = {"summ_inner": SUMM_FULL}
+        L["sess_cols"] = None
+        L["height"] = max(MIN_BAR_H,
+                          min(CHART_HEIGHT, (rows - base - panel_body) // 3))
+        return L
 
     # Panels go inline only if they fit the width AND still leave the charts at
     # the minimum bar height; otherwise they move to the s/e/w popups and the
@@ -1798,6 +1960,11 @@ def run_live(args):
 
     buckets, sessions = [empty_bucket() for _ in range(NUM_BUCKETS)], {}
     last_collect = last_usage = None
+    # History view: a separate, on-demand scan over the longer HIST_WINDOW,
+    # cached and refreshed on --interval (and on resize). Only run while the
+    # history view is open — a week-wide transcript scan is heavy.
+    hist_buckets, hist_sessions, last_hist_collect = [], {}, None
+    show_history = False
     anim = 0
     hits = []
     focus_sid = None
@@ -1826,7 +1993,7 @@ def run_live(args):
             # to NUM_BUCKETS). Shrinking the terminal now just shows less history
             # instead of tripping the too-small notice.
             if refit_width(cols):
-                last_collect = None
+                last_collect = last_hist_collect = None   # width -> re-bucket both
             # Heavy transcript scan only every --interval; allowance more often.
             if last_collect is None or (now - last_collect).total_seconds() >= args.interval:
                 buckets, sessions = collect(now)
@@ -1843,12 +2010,25 @@ def run_live(args):
                 kick_usage()        # fetch_usage owns retry_at (sets/clears it)
                 last_usage = now
 
-            layout = (plan_layout(rows, cols, sessions, now) if alt
-                      else None)
+            # History view: collect its (longer, coarser) buckets on demand —
+            # on entry, on --interval, and after a resize. Select which dataset
+            # and mode this tick renders.
+            if show_history:
+                if (last_hist_collect is None
+                        or (now - last_hist_collect).total_seconds() >= args.interval):
+                    hist_buckets, hist_sessions = collect(
+                        now, HIST_WINDOW, HIST_BUCKET, HIST_NUM_BUCKETS)
+                    last_hist_collect = now
+                cur_buckets, cur_sessions, cur_mode = hist_buckets, hist_sessions, "history"
+            else:
+                cur_buckets, cur_sessions, cur_mode = buckets, sessions, "live"
+            layout = (plan_layout(rows, cols, cur_sessions, now,
+                                  history=show_history) if alt else None)
             # Fast repaint every tick: animates loading, keeps the clock live,
             # and surfaces the background usage fetch within ~1s of completion.
-            frame, hits = render_frame(now, buckets, sessions, anim, layout,
-                                       summary_tab, cols=cols, rows=rows)
+            frame, hits = render_frame(now, cur_buckets, cur_sessions, anim, layout,
+                                       summary_tab, cols=cols, rows=rows,
+                                       mode=cur_mode)
             # Too small to fit? The frame would overflow and scroll, desyncing the
             # click hit-regions onto the wrong rows. Show a notice and drop hits so
             # clicks can't misfire; close any overlay until there's room again.
@@ -1874,20 +2054,20 @@ def run_live(args):
                     else:
                         okey = "uerr"
                 elif focus_sid is not None:
-                    overlay = render_popup(focus_sid, sessions, now, cols, rows, anim)
+                    overlay = render_popup(focus_sid, cur_sessions, now, cols, rows, anim)
                     if overlay is None:
                         focus_sid = None
                     else:
                         okey = ("popup", focus_sid)
                 elif focus_bucket is not None:
-                    overlay = render_bucket_popup(focus_bucket, sessions, now, cols, rows)
+                    overlay = render_bucket_popup(focus_bucket, cur_sessions, now, cols, rows)
                     if overlay is None:
                         focus_bucket = None
                     else:
                         okey = ("bucket", focus_bucket)
                 elif panel_view is not None:
                     overlay, overlay_regions = render_panel_popup(
-                        panel_view, buckets, sessions, now, rows, summary_tab)
+                        panel_view, cur_buckets, cur_sessions, now, rows, summary_tab)
                     if overlay is None:
                         panel_view = None
                     else:
@@ -1945,9 +2125,11 @@ def run_live(args):
                     except OSError:
                         data = ""
                     (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
-                     show_uerr, scroll_delta) = process_input(
+                     show_uerr, show_history, quit_flag, scroll_delta) = process_input(
                         data, mouse_re, hits, focus_sid, focus_bucket,
-                        panel_view, summary_tab, show_help, show_uerr)
+                        panel_view, summary_tab, show_help, show_uerr, show_history)
+                    if quit_flag:              # footer "⌃C to exit" was clicked
+                        break
                     # Any open overlay scrolls; the delta is clamped to the
                     # overlay's range each render (and reset when it changes).
                     overlay_scroll += scroll_delta
@@ -1971,7 +2153,7 @@ def run_live(args):
 
 
 def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
-                  summary_tab, show_help, show_uerr):
+                  summary_tab, show_help, show_uerr, show_history):
     """Update the overlay/selection state from a chunk of terminal input and
     return a scroll delta for the (only scrollable) help overlay.
 
@@ -1984,9 +2166,13 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     q/bare-esc steps back one overlay level. Mouse wheel and arrow/PgUp/PgDn/j/k
     scroll the help overlay.
 
+    'H' (or a click on the footer "H history"/"H live" span) toggles the history
+    view; a click on the footer "⌃C to exit" span requests quit.
+
     Returns (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
-    show_uerr, scroll_delta)."""
+    show_uerr, show_history, quit_flag, scroll_delta)."""
     delta = 0
+    quit_flag = False
     for m in mouse_re.finditer(data):
         button, x, y, final = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
         # Bit 6 (64) flags scroll-wheel events, which also satisfy &0b11==0;
@@ -2010,6 +2196,12 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             elif hit == "__usage__":
                 show_uerr = True
                 focus_sid = focus_bucket = None   # one overlay at a time
+            elif hit == "__history__":     # footer H span: toggle history view
+                show_history = not show_history
+                focus_sid = focus_bucket = panel_view = None
+                show_uerr = show_help = False
+            elif hit == "__exit__":        # footer ⌃C span: quit
+                quit_flag = True
             elif hit is not None:          # session row (incl. from a popup)
                 focus_sid = hit
                 focus_bucket = None
@@ -2032,14 +2224,22 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     delta += rest.count("j") - rest.count("k")           # vim-style scroll
     if "?" in rest:
         show_help = not show_help
+    # H (either case) toggles the history view; closes any open overlay/popup.
+    if "H" in rest or "h" in rest:
+        show_history = not show_history
+        focus_sid = focus_bucket = panel_view = None
+        show_uerr = False
     # s/e/w toggle the panel popups (summary / sessions [e]ntries / [w]allowance).
-    # Opening a panel closes any session/bucket drill-down underneath it.
-    for key, view in (("s", "summary"), ("e", "sessions"), ("w", "allow")):
-        if key in rest:
-            panel_view = None if panel_view == view else view
-            focus_sid = focus_bucket = None
+    # Opening a panel closes any session/bucket drill-down underneath it. Disabled
+    # in history view (those panels are live-only).
+    if not show_history:
+        for key, view in (("s", "summary"), ("e", "sessions"), ("w", "allow")):
+            if key in rest:
+                panel_view = None if panel_view == view else view
+                focus_sid = focus_bucket = None
     # q or a BARE esc steps back ONE overlay level (a "\x1b[" here is an unhandled
-    # CSI sequence, not a close; a lone "\x1b" is a real ESC press).
+    # CSI sequence, not a close; a lone "\x1b" is a real ESC press). With nothing
+    # else open it exits the history view back to live.
     bare_esc = any(rest[i] == "\x1b" and (i + 1 >= len(rest) or rest[i + 1] != "[")
                    for i in range(len(rest)))
     if "q" in rest or bare_esc:
@@ -2053,8 +2253,10 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             focus_bucket = None
         elif panel_view is not None:
             panel_view = None
+        elif show_history:
+            show_history = False
     return (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
-            show_uerr, delta)
+            show_uerr, show_history, quit_flag, delta)
 
 
 if __name__ == "__main__":
