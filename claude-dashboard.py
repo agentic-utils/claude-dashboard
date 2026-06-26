@@ -302,6 +302,21 @@ def _err_text(rec):
     return _clean(e) if isinstance(e, str) else ""
 
 
+def model_color(name):
+    """A stable colour for a model id (the history model-mix chart), matched by
+    family substring. Unknown models fall back to neutral grey."""
+    m = (name or "").lower()
+    if "opus" in m:
+        return (84, 160, 255)       # blue
+    if "sonnet" in m:
+        return (52, 224, 150)       # green
+    if "haiku" in m:
+        return (255, 138, 56)       # amber
+    if "fable" in m or "mythos" in m:
+        return (170, 120, 255)      # purple
+    return (150, 150, 170)          # grey / unknown
+
+
 def short_model(m):
     """Compact model id for display: 'claude-opus-4-8' -> 'opus-4-8'."""
     if not m or m == "<synthetic>":
@@ -328,11 +343,15 @@ def new_session(sid, ts, rec, num_buckets=None):
     }
 
 
-def collect(now: datetime, window=None, bucket=None, num_buckets=None):
+def collect(now: datetime, window=None, bucket=None, num_buckets=None,
+            track_models=False):
     """Return (buckets, sessions): time buckets oldest->newest plus per-session
     cache stats, all from de-duplicated usage records. `window`/`bucket`/
     `num_buckets` default to the live globals; the history view passes its own
-    (longer) span and coarser bucket so the same scan feeds both views."""
+    (longer) span and coarser bucket so the same scan feeds both views.
+    `track_models` adds a per-bucket {model: effective-tokens} map under the
+    extra "models" key (ignored by the fixed-key aggregation loops) for the
+    history model-mix chart."""
     window = WINDOW if window is None else window
     bucket = BUCKET if bucket is None else bucket
     num_buckets = NUM_BUCKETS if num_buckets is None else num_buckets
@@ -340,6 +359,9 @@ def collect(now: datetime, window=None, bucket=None, num_buckets=None):
     last_hour = now - timedelta(hours=1)
     mtime_floor = cutoff.timestamp() - 1
     buckets = [empty_bucket() for _ in range(num_buckets)]
+    if track_models:
+        for b in buckets:
+            b["models"] = {}        # model id -> effective tokens (extra key)
     sessions: dict[str, dict] = {}
     seen: set[str] = set()
     titles: dict[str, str] = {}   # sid -> custom session title (latest /rename)
@@ -420,6 +442,9 @@ def collect(now: datetime, window=None, bucket=None, num_buckets=None):
 
                     # Charts 1 & 2 + output/responses for the global bucket.
                     add_usage(b, inp, f5, f1, read, fresh, out)
+                    if track_models:        # history model-mix: eff tokens by model
+                        mk = short_model(model)
+                        b["models"][mk] = b["models"].get(mk, 0) + eff
 
                     # Per-session drill-down: split fresh tokens (new work) by
                     # main thread vs subagent (sidechain). Fresh, not total
@@ -641,20 +666,35 @@ def build_column(vc, total, maxt, height):
 
 
 def render_chart(title, keys, buckets, height, now, anim=0,
-                 short_title=None, legend_items=None, compact=False, axes=True):
+                 short_title=None, legend_items=None, compact=False, axes=True,
+                 series_of=None, legend_str=None):
     """Render one bar chart as a list of lines. Compact mode folds the title and
     legend onto a single header line (using `short_title`) and drops the hourly
     tick row, saving 2 rows. axes=False also drops the baseline rule. Non-compact
-    behaviour (title line only; legend drawn externally) is unchanged."""
-    totals = [sum(b[k] for k in keys) for b in buckets]
-    maxt = max(totals) if totals else 0
-    columns = [build_column([(CO[k], b[k]) for k in keys], tot, maxt, height)
-               for b, tot in zip(buckets, totals)]
+    behaviour (title line only; legend drawn externally) is unchanged.
+
+    Normally each bar is stacked from `keys` against the fixed CO palette. Pass
+    `series_of(b) -> [(rgb_tuple, value), ...]` (with a pre-built `legend_str`)
+    to stack arbitrary, already-coloured series instead — used by the history
+    model-mix chart, whose series (one per model) aren't in CO."""
+    if series_of is not None:
+        series = [series_of(b) for b in buckets]
+        totals = [sum(v for _, v in s) for s in series]
+        maxt = max(totals) if totals else 0
+        columns = [build_column(s, tot, maxt, height)
+                   for s, tot in zip(series, totals)]
+    else:
+        totals = [sum(b[k] for k in keys) for b in buckets]
+        maxt = max(totals) if totals else 0
+        columns = [build_column([(CO[k], b[k]) for k in keys], tot, maxt, height)
+                   for b, tot in zip(buckets, totals)]
 
     if compact:
         head = ("  " + rgb(ACCENT, "▸ ", bold=True)
                 + rgb(TEXT, short_title or title, bold=True))
-        if legend_items:
+        if legend_str is not None:
+            head += "   " + legend_str
+        elif legend_items:
             head += "   " + legend(legend_items)
         lines = [head]
     else:
@@ -1476,12 +1516,15 @@ CHARTS = [
 ]
 
 
-def chart_block(buckets, height, compact, axes, blanks, now, anim=0):
+def chart_block(buckets, height, compact, axes, blanks, now, anim=0,
+                model_chart=False):
     """Render the three stacked charts with shared compaction so the main view
     and the session popup degrade identically: `compact` folds each chart's
     title+legend onto one line and drops the tick row, `axes` keeps the baseline,
     `blanks` keeps the blank line between charts. Returns (lines, bar_idx) where
-    bar_idx are 0-based indices into `lines` that sit over the bars (clickable)."""
+    bar_idx are 0-based indices into `lines` that sit over the bars (clickable).
+    `model_chart` appends a 4th chart stacking effective tokens by model (history
+    view; requires buckets carrying the "models" key from collect(track_models))."""
     out, bar_idx = [], []
     for i, (title, short, keys, leg) in enumerate(CHARTS):
         if i and blanks:
@@ -1493,6 +1536,32 @@ def chart_block(buckets, height, compact, axes, blanks, now, anim=0):
                                 short_title=short, legend_items=leg,
                                 compact=compact, axes=axes))
         bar_idx.extend(range(start + 1, start + 1 + height))   # bars follow header
+
+    if model_chart:
+        totals = {}
+        for b in buckets:
+            for mdl, v in b.get("models", {}).items():
+                totals[mdl] = totals.get(mdl, 0) + v
+        order = sorted(totals, key=lambda mdl: totals[mdl], reverse=True)
+        cmap = {mdl: model_color(mdl) for mdl in order}
+
+        def series_of(b):
+            mm = b.get("models", {})
+            return [(cmap[mdl], mm.get(mdl, 0)) for mdl in order]
+
+        leg_str = ("   ".join(rgb(cmap[mdl], CHIP) + " " + rgb(DIM, mdl)
+                              for mdl in order[:6])
+                   or rgb(DIM, "no model data"))
+        if blanks:
+            out.append("")
+        if not compact:
+            out.append("  " + leg_str)
+        start = len(out)
+        out.extend(render_chart("Model mix · effective tokens", [], buckets,
+                                height, now, anim, short_title="Models",
+                                compact=compact, axes=axes,
+                                series_of=series_of, legend_str=leg_str))
+        bar_idx.extend(range(start + 1, start + 1 + height))
     return out, bar_idx
 
 
@@ -1559,7 +1628,8 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
     # bucket from the click x). Shared with the popup via chart_block.
     base = len(out)
     block, bar_idx = chart_block(buckets, height, compact, axes,
-                                 layout["chart_blanks"], now, anim)
+                                 layout["chart_blanks"], now, anim,
+                                 model_chart=(mode == "history"))
     out += block
     hits += [(base + ri + 1, MARGIN + 1, MARGIN + NUM_BUCKETS, "__chart__")
              for ri in bar_idx]
@@ -1893,17 +1963,24 @@ def plan_layout(rows, cols, sessions, now, history=False):
         base += 2
 
     if history:
-        # One SUMMARY panel (with $ cost + cache-hit), no sessions/allowance.
+        # 4 charts (3 standard + model-mix) and one SUMMARY panel (with $ cost +
+        # cache-hit); no sessions/allowance. Recompute the chart base for 4.
+        ncharts = 4
+        hbase = ncharts * per_chart + ((ncharts - 1) if L["chart_blanks"] else 0)
+        if L["page_title"]:
+            hbase += 3
+        if L["footer"]:
+            hbase += 2
         summ = (6 if lean else 11)          # summary_rows length incl. cost lines
         panel_body = 1 + 2 + summ           # blank + borders + body
-        if (rows - base - panel_body) // 3 < MIN_BAR_H:
+        if (rows - hbase - panel_body) // ncharts < MIN_BAR_H:
             panel_body = 0                  # no room — drop the panel, charts grow
         L["panels_inline"] = panel_body > 0
         L["history_summary"] = panel_body > 0
         L["panel_cfg"] = {"summ_inner": SUMM_FULL}
         L["sess_cols"] = None
         L["height"] = max(MIN_BAR_H,
-                          min(CHART_HEIGHT, (rows - base - panel_body) // 3))
+                          min(CHART_HEIGHT, (rows - hbase - panel_body) // ncharts))
         return L
 
     # Panels go inline only if they fit the width AND still leave the charts at
@@ -2017,7 +2094,8 @@ def run_live(args):
                 if (last_hist_collect is None
                         or (now - last_hist_collect).total_seconds() >= args.interval):
                     hist_buckets, hist_sessions = collect(
-                        now, HIST_WINDOW, HIST_BUCKET, HIST_NUM_BUCKETS)
+                        now, HIST_WINDOW, HIST_BUCKET, HIST_NUM_BUCKETS,
+                        track_models=True)
                     last_hist_collect = now
                 cur_buckets, cur_sessions, cur_mode = hist_buckets, hist_sessions, "history"
             else:
