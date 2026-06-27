@@ -36,16 +36,29 @@ shows): 5-hour session + weekly gauges with reset times.
 effective tokens, the model in use, and the named subagents that ran in the last
 hour (each with peak context + effective tokens). Press **`?`** for in-app help.
 
+**LIVE / HISTORY tabs** — a Win3.1-style menu bar at the top with the
+accelerator letter underlined: press **`L`** for **Live**, **`H`** for
+**History** (or click the tabs). The **HISTORY** view shows the same three charts
+over the **last 168 hours (1 week)** by default, with a coarser auto-scaled
+bucket and a day-by-day X-axis. It drops the active-sessions and allowance panels
+and shows a **SUMMARY** scoped to the window with a **`$` cost estimate**
+(effective tokens × base-input price) and a **cache-hit rate**, plus a 4th chart
+(model mix) and an **ACTIVITY heatmap** (weekday × hour). Click a bar to break
+that slice down by session. `L` or `q` returns to Live. Configure with
+`--history-hours` / `--history-bucket-minutes` / `--price-per-mtok`.
+
 ## Run
 
 ```bash
-./claude-cache-monitor.py            # live dashboard (alt-screen)
-./claude-cache-monitor.py --once     # render a single frame and exit
-./claude-cache-monitor.py --interval 60   # override the 5-min data scan
+./claude-dashboard.py                  # live dashboard (alt-screen)
+./claude-dashboard.py --once           # render a single frame and exit
+./claude-dashboard.py --interval 60    # override the 5-min data scan
+./claude-dashboard.py --history-hours 336   # 2-week history span (press H)
 ```
 
-Keys: `?` help · `↑/↓` `PgUp/PgDn` `j/k` scroll help · `q`/`esc` close overlay ·
-click a session for detail · `Ctrl-C` to quit.
+Keys: `?` help · `L` live / `H` history tabs · `S`/`M` history popups · `↑/↓`
+`PgUp/PgDn` `j/k` scroll help · `q`/`esc` close overlay / leave history · click a
+tab/session/bar for detail · `Ctrl-C` (or click *"⌃C to exit"*) to quit.
 
 ## How it works / requirements
 
@@ -61,5 +74,5 @@ click a session for detail · `Ctrl-C` to quit.
 
 - Empirically, Claude Code's **5-minute** ephemeral cache holds subagent/sidechain
   context and the **1-hour** cache holds the main thread.
-- The script writes a local `claude-cache-monitor.log` (diagnostics only, no secrets);
+- The script writes a local `claude-dashboard.log` (diagnostics only, no secrets);
   it's gitignored.
