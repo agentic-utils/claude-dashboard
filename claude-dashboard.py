@@ -56,6 +56,7 @@ import math
 import os
 import re
 import select
+import subprocess
 import sys
 import termios
 import threading
@@ -1355,7 +1356,10 @@ def render_usage_error(now, cols, rows):
     # Cap so the whole panel (2 borders + footer block of 2 + these head lines)
     # fits `rows`. Reserve the head lines already in `lines`, the footer, and
     # one row for a possible truncation note.
-    footer = ["", rgb(DIM, "click outside · q · esc to close")]
+    actions = rgb(WARN_C, "[R]") + rgb(DIM, " retry now")
+    if _token_stale():
+        actions += rgb(DIM, "   ·   ") + rgb(WARN_C, "[L]") + rgb(DIM, " login")
+    footer = ["", actions, rgb(DIM, "click outside · q · esc to close")]
     overhead = 2 + len(lines) + len(footer)     # 2 panel borders
     room = max(rows - overhead, 1)
     truncated = False
@@ -1369,9 +1373,41 @@ def render_usage_error(now, cols, rows):
     return panel("USAGE CALL ERROR", lines, inner)
 
 
+def render_login_confirm(now, cols, rows):
+    """Confirmation modal shown before the (disruptive) interactive login. The
+    login suspends the whole dashboard to run `claude auth login`, so we ask
+    first rather than fire on a stray 'g' or a misclick on the account string."""
+    inner = min(58, max(cols - 4, 36))
+    acct = _usage.get("account")
+    lines = [
+        rgb(TEXT, "Re-login / switch account?", bold=True),
+        "",
+        rgb(DIM, "Runs `claude auth login` — this suspends the"),
+        rgb(DIM, "dashboard for an interactive sign-in."),
+        "",
+        # This is the shared OAuth store (~/.claude/.credentials.json) — the same
+        # login Claude Code itself reads. Verified: `claude auth status` reports
+        # the account this file holds. So a switch here is global, not local.
+        rgb(WARN_C, "⚠ This is the shared Claude Code login.", bold=True),
+        rgb(DIM, "Switching it here changes the account your"),
+        rgb(DIM, "Claude Code sessions use too — not just this"),
+        rgb(DIM, "dashboard."),
+    ]
+    if acct:
+        lines += ["", rgb(DIM, "Currently: ") + rgb(ACCENT, acct, bold=True)]
+    lines += [
+        "",
+        rgb(WARN_C, "[Y]") + rgb(DIM, " yes, login     ")
+        + rgb(WARN_C, "[N]") + rgb(DIM, " cancel"),
+        rgb(DIM, "esc / click outside to cancel"),
+    ]
+    return panel("SWITCH ACCOUNT", lines, inner)
+
+
 # ── live bundled-allowance usage (GET /api/oauth/usage, same as `/usage`) ─────
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 # Shared by the context light (ctx_grade) and allowance gauge (gauge_grade) —
 # the actual thresholds live in those functions, not here.
@@ -1382,7 +1418,7 @@ ORANGE_C = (255, 138, 56)   # amber
 
 # Shared with the render thread; the network call must never block a frame.
 _usage = {"data": None, "err": "loading…", "at": None, "sub": None, "tier": None,
-          "retry_at": None, "err_body": None}
+          "retry_at": None, "err_body": None, "account": None}
 _usage_inflight = threading.Lock()
 
 
@@ -1409,6 +1445,29 @@ def _retry_after_secs(e):
     return USAGE_BACKOFF
 
 
+def _oauth_headers(tok):
+    """Shared headers for the OAuth-scoped GETs (usage + profile)."""
+    return {
+        "Authorization": f"Bearer {tok}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "anthropic-version": "2023-06-01",
+        "User-Agent": "claude-cli/cache-monitor",
+    }
+
+
+def _fetch_account(tok, timeout):
+    """Best-effort: the signed-in account's email for the top-right corner. Run
+    after a successful usage fetch; a failure here must NOT fail the usage call,
+    so it's swallowed (the last-known account stays on screen)."""
+    try:
+        req = urllib.request.Request(PROFILE_URL, headers=_oauth_headers(tok))
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            acct = (json.load(r).get("account") or {})
+        _usage_set(account=acct.get("email") or acct.get("display_name"))
+    except Exception:
+        log.info("fetch_usage: profile fetch failed (non-fatal)", exc_info=True)
+
+
 def fetch_usage(timeout=15):
     """Read the current OAuth token from the creds file (so token refreshes by
     Claude Code are picked up) and GET the live utilisation. Last-good wins.
@@ -1425,18 +1484,14 @@ def fetch_usage(timeout=15):
             _usage_set(err="no oauth token", err_body=None, retry_at=back(USAGE_BACKOFF))
             log.warning("fetch_usage: no oauth token in %s", CREDS_PATH)
             return
-        req = urllib.request.Request(USAGE_URL, headers={
-            "Authorization": f"Bearer {tok}",
-            "anthropic-beta": "oauth-2025-04-20",
-            "anthropic-version": "2023-06-01",
-            "User-Agent": "claude-cli/cache-monitor",
-        })
+        req = urllib.request.Request(USAGE_URL, headers=_oauth_headers(tok))
         with urllib.request.urlopen(req, timeout=timeout) as r:
             status = r.status
             data = json.load(r)
         _usage_set(data=data, err=None, retry_at=None, at=datetime.now(timezone.utc),
                    sub=oa.get("subscriptionType"), tier=oa.get("rateLimitTier"),
                    err_body=None)
+        _fetch_account(tok, timeout)
         log.info("fetch_usage: ok HTTP %s in %.2fs, limits=%d spend=%s",
                  status, time.monotonic() - t0,
                  len(data.get("limits", [])), bool(data.get("spend")))
@@ -1466,6 +1521,48 @@ def kick_usage():
         threading.Thread(target=run, daemon=True).start()
     else:
         log.info("kick_usage: skipped, refresh already in flight")
+
+
+def _token_stale():
+    """True when the last usage fetch failed because the OAuth token is missing
+    or rejected (401) — the only error `claude auth login` can fix."""
+    err = _usage.get("err") or ""
+    return err == "no oauth token" or err.startswith("HTTP 401")
+
+
+def run_login(fd, old_term):
+    """Suspend the TUI, run interactive `claude auth login`, then resume.
+
+    Mirrors main()'s terminal enter/exit (alt-screen, SGR mouse, cbreak) so the
+    login flow gets a normal cooked tty and the dashboard comes back exactly as
+    it was. Resume is in a `finally` so a crash in login can't strand the
+    terminal in raw/alt-screen state. fetch_usage reads the creds file fresh on
+    every call, so the new token is picked up with no restart."""
+    try:
+        # --- suspend: undo main()'s terminal setup ---
+        if old_term is not None:
+            sys.stdout.write("\033[?1000l\033[?1006l")          # mouse off
+        sys.stdout.write("\033[?7h\033[?25h\033[?1049l")         # wrap+cursor on, leave alt
+        sys.stdout.flush()
+        if old_term is not None:
+            try:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_term)   # cooked mode
+            except (termios.error, ValueError, OSError):
+                pass
+        try:
+            subprocess.run(["claude", "auth", "login"])
+        except (OSError, subprocess.SubprocessError) as e:
+            log.warning("run_login: claude auth login failed: %s", e)
+    finally:
+        # --- resume: redo main()'s terminal setup ---
+        sys.stdout.write("\033[?1049h\033[?25l\033[?7l")         # alt, hide cursor, no wrap
+        if old_term is not None:
+            try:
+                sys.stdout.write("\033[?1000h\033[?1006h")       # mouse on
+                tty.setcbreak(fd)
+            except (termios.error, ValueError, OSError):
+                pass
+        sys.stdout.flush()
 
 
 def endstr(iso, now):
@@ -1713,7 +1810,8 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
     """Return (frame_str, hits). hits maps clickable regions to TOKENS:
     [(term_row, x_lo, x_hi, token), ...] in 1-based terminal coordinates. A token
     is a session sid, a SUMMARY tab (TAB_WIN/TAB_AW), "__chart__", "__usage__",
-    "__history__"/"__live__" (select that view), or "__exit__" (quit). `layout` is a
+    "__login__" (run the login flow), "__history__"/"__live__" (select that view),
+    or "__exit__" (quit). `layout` is a
     plan_layout() dict; None means the full layout. `mode` is "live" or
     "history" — history uses a longer span, day-axis, and a single summary."""
     global VIEW_WINDOW, VIEW_BUCKET, VIEW_DAILY
@@ -1742,8 +1840,16 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
         ctx = ("HISTORY · last " + fmt_window(HIST_WINDOW)
                if mode == "history" else "live")
         clock = f"{local:%a %d %b · %H:%M:%S %Z}"
-        right = rgb(DIM, ctx + "   " + clock)
-        right_len = _visible_len(right)
+        # Signed-in account, far right and clickable (→ login, for switching
+        # accounts). Re-read every refresh cycle by fetch_usage, so a login from
+        # another terminal shows up here within one cycle. "⬢ " marks it.
+        acct = _usage.get("account")
+        acct_disp = ("⬢ " + acct) if acct else ""
+        right_dim = ctx + "   " + clock
+        right = rgb(DIM, right_dim)
+        if acct_disp:
+            right += rgb(DIM, "   ") + rgb(ACCENT, acct_disp, bold=True)
+        right_len = _visible_len(right_dim) + (3 + _visible_len(acct_disp) if acct_disp else 0)
         BRAND_GAP = 4
         pad = max(TOTAL_WIDTH - brand_len - BRAND_GAP - tabs_len - right_len - 2, 1)
         out += [
@@ -1757,6 +1863,11 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
         title_row = len(out) - 2
         for tok, lo, hi in segs:
             hits.append((title_row, tab_x0 + lo + 1, tab_x0 + hi + 1, tok))
+        # The account string ends the line; map its columns to a login click.
+        if acct_disp:
+            line_end = 1 + brand_len + BRAND_GAP + tabs_len + pad + right_len
+            acct_w = _visible_len(acct_disp)
+            hits.append((title_row, line_end - acct_w + 1, line_end, "__login__"))
 
     # Charts. Bar rows carry the "__chart__" hit token (process_input derives the
     # bucket from the click x). Shared with the popup via chart_block.
@@ -1828,13 +1939,15 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
         if mode == "history":
             if layout.get("history_panels") == "inline":
                 foot = (f"history · {fmt_window(HIST_BUCKET)} buckets   ·   "
-                        f"click a bar   ·   L live   ·   ? help   ·   ⌃C to exit")
-                spans = [("L live", "__live__"), ("⌃C to exit", "__exit__")]
+                        f"click a bar   ·   L live   ·   G login   ·   ? help   ·   ⌃C to exit")
+                spans = [("L live", "__live__"), ("G login", "__login__"),
+                         ("⌃C to exit", "__exit__")]
             else:                          # panels didn't fit — offer the popups
                 foot = (f"history · {fmt_window(HIST_BUCKET)} buckets   ·   "
-                        f"S summary   ·   M heatmap   ·   L live   ·   ⌃C to exit")
+                        f"S summary   ·   M heatmap   ·   L live   ·   G login   ·   ⌃C to exit")
                 spans = [("S summary", "__hsummary__"), ("M heatmap", "__heatmap__"),
-                         ("L live", "__live__"), ("⌃C to exit", "__exit__")]
+                         ("L live", "__live__"), ("G login", "__login__"),
+                         ("⌃C to exit", "__exit__")]
         else:
             plan = " · ".join(p for p in (_usage.get("sub"), _usage.get("tier")) if p)
             stamp = _usage["at"].astimezone().strftime("%H:%M:%S") if _usage.get("at") else "—"
@@ -1846,8 +1959,9 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
                 extra = ""
             foot = (f"plan {plan or '?'}   ·   allowance live, updated {stamp}   ·   "
                     f"charts every {max(1, INTERVAL_SECONDS // 60)}m{extra}   ·   "
-                    f"H history   ·   ? help   ·   ⌃C to exit")
-            spans = [("H history", "__history__"), ("⌃C to exit", "__exit__")]
+                    f"H history   ·   G login   ·   ? help   ·   ⌃C to exit")
+            spans = [("H history", "__history__"), ("G login", "__login__"),
+                     ("⌃C to exit", "__exit__")]
         foot = foot[:TOTAL_WIDTH - 2]          # clip so it never wraps/overflows
         out += ["", "  " + rgb(DIM, foot)]
         # Clickable footer spans (H toggles history, M toggles the heatmap,
@@ -2201,6 +2315,7 @@ def run_live(args):
     summary_tab = "win"
     show_help = False
     show_uerr = False
+    show_login = False           # login confirmation modal
     overlay_scroll = 0
     prev_okey = None
     mouse_re = re.compile(r"\033\[<(\d+);(\d+);(\d+)([Mm])")
@@ -2268,18 +2383,21 @@ def run_live(args):
             if alt and (cols < TOTAL_WIDTH or rows < 9
                         or frame.count("\n") + 1 > rows):
                 hits = []
-                show_help = show_uerr = False
+                show_help = show_uerr = show_login = False
                 panel_view = None
                 focus_sid = focus_bucket = None
                 frame = render_too_small(cols, rows, 9)
             if alt:
-                # One overlay at a time: help > usage-error > session > bucket >
-                # panel popup. overlay_regions carries a modal popup's clickable
-                # spans (relative to the box); translated to screen hits below.
+                # One overlay at a time: help > login-confirm > usage-error >
+                # session > bucket > panel popup. overlay_regions carries a modal
+                # popup's clickable spans (relative to the box); translated below.
                 overlay, okey, overlay_regions = None, None, []
                 if show_help:
                     overlay = render_help(now, cols, rows)
                     okey = "help"
+                elif show_login:
+                    overlay = render_login_confirm(now, cols, rows)
+                    okey = "login"
                 elif show_uerr:
                     overlay = render_usage_error(now, cols, rows)
                     if overlay is None:
@@ -2358,13 +2476,20 @@ def run_live(args):
                     except OSError:
                         data = ""
                     (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
-                     show_uerr, show_history, quit_flag,
-                     scroll_delta) = process_input(
+                     show_uerr, show_login, show_history, quit_flag,
+                     scroll_delta, do_login, do_retry) = process_input(
                         data, mouse_re, hits, focus_sid, focus_bucket,
-                        panel_view, summary_tab, show_help, show_uerr,
+                        panel_view, summary_tab, show_help, show_uerr, show_login,
                         show_history)
                     if quit_flag:              # footer "⌃C to exit" was clicked
                         break
+                    # Manual retry/login bypass the retry_at backoff gate above.
+                    if do_retry:
+                        kick_usage()
+                    if do_login:
+                        run_login(fd, old_term)   # suspends + resumes the TUI
+                        kick_usage()              # pick up the fresh token now
+                        prev_okey = None          # force a full repaint on resume
                     # Any open overlay scrolls; the delta is clamped to the
                     # overlay's range each render (and reset when it changes).
                     overlay_scroll += scroll_delta
@@ -2388,7 +2513,7 @@ def run_live(args):
 
 
 def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
-                  summary_tab, show_help, show_uerr, show_history):
+                  summary_tab, show_help, show_uerr, show_login, show_history):
     """Update the overlay/selection state from a chunk of terminal input and
     return a scroll delta for the (only scrollable) help overlay.
 
@@ -2407,10 +2532,18 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     panel_view ("hsummary"/"heatmap"); a click on the footer "⌃C to exit" span
     requests quit.
 
+    'g'/'G', a click on the account string / footer "G login", or [L] in the
+    usage-error overlay open the login CONFIRMATION modal (show_login); 'Y' there
+    confirms (sets do_login), anything else cancels — login is disruptive
+    (suspends the whole TUI) so it's never fired without a confirm.
+
     Returns (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
-    show_uerr, show_history, quit_flag, scroll_delta)."""
+    show_uerr, show_login, show_history, quit_flag, scroll_delta, do_login,
+    do_retry). do_login/do_retry ask the main loop to run the (interactive)
+    login flow or force an immediate usage refetch — both bypass retry_at."""
     delta = 0
     quit_flag = False
+    do_login = do_retry = False
     for m in mouse_re.finditer(data):
         button, x, y, final = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
         # Bit 6 (64) flags scroll-wheel events, which also satisfy &0b11==0;
@@ -2434,6 +2567,10 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             elif hit == "__usage__":
                 show_uerr = True
                 focus_sid = focus_bucket = None   # one overlay at a time
+            elif hit == "__login__":       # account string / footer "G login"
+                show_login = True          # confirm before the disruptive login
+                focus_sid = focus_bucket = panel_view = None
+                show_uerr = False
             elif hit in ("__history__", "__live__"):   # Live/History tab or span
                 show_history = (hit == "__history__")
                 focus_sid = focus_bucket = panel_view = None
@@ -2467,32 +2604,58 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     delta += rest.count("j") - rest.count("k")           # vim-style scroll
     if "?" in rest:
         show_help = not show_help
-    # Menu accelerators: H selects the History tab, L the Live tab (each closes
-    # any open overlay/popup). Deterministic, mirroring the menu-bar tabs.
-    if "H" in rest or "h" in rest:
-        show_history = True
+    # Key priority chain (one owner per pass):
+    #  · login-confirm modal owns the keyboard: Y confirms, N cancels.
+    #  · else 'g'/'G' opens that modal — the standing switch-account accelerator
+    #    (also the footer "G login" and the clickable account string top-right).
+    #  · else the usage-error overlay takes R (retry) / L (login), short-circuiting
+    #    the menu accelerators so 'L' doesn't fall through to 'L' = Live.
+    #  · else the global menu accelerators.
+    if show_login:
+        if "y" in rest or "Y" in rest:
+            do_login = True
+            show_login = False
+        elif "n" in rest or "N" in rest:
+            show_login = False
+    elif "g" in rest or "G" in rest:
+        show_login = True
         focus_sid = focus_bucket = panel_view = None
-        show_uerr = False
-    if "L" in rest or "l" in rest:
-        show_history = False
-        focus_sid = focus_bucket = panel_view = None
-        show_uerr = False
-    # Panel popup toggles. In history: S = window SUMMARY, M = activity heatmap
-    # (the inline-fallback popups). In live: s/e/w = summary / sessions /
-    # allowance. Opening a popup closes any session/bucket drill-down underneath.
-    keymap = ((("s", "hsummary"), ("m", "heatmap")) if show_history
-              else (("s", "summary"), ("e", "sessions"), ("w", "allow")))
-    for key, view in keymap:
-        if key in rest or key.upper() in rest:
-            panel_view = None if panel_view == view else view
-            focus_sid = focus_bucket = None
+        show_uerr = show_help = False
+    elif show_uerr:
+        if "r" in rest or "R" in rest:
+            do_retry = True
+        if ("l" in rest or "L" in rest) and _token_stale():
+            show_login = True         # confirm, then login → refetch
+            show_uerr = False
+    else:
+        # Menu accelerators: H selects the History tab, L the Live tab (each
+        # closes any open overlay/popup). Deterministic, mirroring the menu tabs.
+        if "H" in rest or "h" in rest:
+            show_history = True
+            focus_sid = focus_bucket = panel_view = None
+            show_uerr = False
+        if "L" in rest or "l" in rest:
+            show_history = False
+            focus_sid = focus_bucket = panel_view = None
+            show_uerr = False
+        # Panel popup toggles. In history: S = window SUMMARY, M = activity
+        # heatmap (inline-fallback popups). In live: s/e/w = summary / sessions /
+        # allowance. Opening a popup closes any session/bucket drill-down under it.
+        keymap = ((("s", "hsummary"), ("m", "heatmap")) if show_history
+                  else (("s", "summary"), ("e", "sessions"), ("w", "allow")))
+        for key, view in keymap:
+            if key in rest or key.upper() in rest:
+                panel_view = None if panel_view == view else view
+                focus_sid = focus_bucket = None
     # q or a BARE esc steps back ONE overlay level (a "\x1b[" here is an unhandled
     # CSI sequence, not a close; a lone "\x1b" is a real ESC press). With nothing
     # else open it exits the history view back to live.
     bare_esc = any(rest[i] == "\x1b" and (i + 1 >= len(rest) or rest[i + 1] != "[")
                    for i in range(len(rest)))
     if "q" in rest or bare_esc:
-        if show_help:
+        if show_login:
+            show_login = False
+        elif show_help:
             show_help = False
         elif show_uerr:
             show_uerr = False
@@ -2505,7 +2668,8 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
         elif show_history:
             show_history = False
     return (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
-            show_uerr, show_history, quit_flag, delta)
+            show_uerr, show_login, show_history, quit_flag, delta,
+            do_login, do_retry)
 
 
 if __name__ == "__main__":
