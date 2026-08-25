@@ -67,6 +67,97 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 TRANSCRIPT_GLOB = os.path.expanduser("~/.claude/projects/**/*.jsonl")
+# Full or partial cwd paths to leave out of every chart/panel entirely - e.g.
+# a background/automated job (cron-style `claude -p` run against a fixed
+# working directory), not interactive use. No default: empty unless the user
+# passes --exclude. Matched case-insensitively as a substring of the cwd (a
+# partial path spans multiple path components, e.g. "OneDrive/AI/qmd-memory",
+# so this can't be reduced to single-component equality), after normalising
+# backslashes to forward slashes - works regardless of which host or path
+# style (Windows "C:\...", WSL "/mnt/c/...") wrote the record.
+EXCLUDE_PATTERNS = []
+
+
+def _cwd_excluded(cwd):
+    if not cwd or not EXCLUDE_PATTERNS:
+        return False
+    norm = str(cwd).replace("\\", "/").lower()
+    return any(p in norm for p in EXCLUDE_PATTERNS)
+
+
+WIN_GLOBS_TTL = 60          # seconds between re-checks of logged-in Windows users
+_win_roots_cache = {"ts": 0.0, "roots": []}
+
+
+def is_wsl():
+    """True when running under WSL (checked once, cached)."""
+    if is_wsl._cached is None:
+        try:
+            with open("/proc/version", encoding="utf-8") as f:
+                is_wsl._cached = "microsoft" in f.read().lower()
+        except OSError:
+            is_wsl._cached = False
+    return is_wsl._cached
+
+
+is_wsl._cached = None
+
+
+def _account_uuid(claude_json_path):
+    try:
+        with open(claude_json_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    return (data.get("oauthAccount") or {}).get("accountUuid")
+
+
+def _logged_in_windows_users():
+    """Windows usernames with an active session, via `query user` through
+    cmd.exe (WSL interop). Falls back to every /mnt/c/Users/* profile dir if
+    interop is unavailable (e.g. disabled, or query user missing)."""
+    try:
+        out = subprocess.run(["cmd.exe", "/c", "query user"],
+                             capture_output=True, text=True, timeout=5)
+        users = []
+        for line in out.stdout.splitlines()[1:]:
+            line = line.lstrip(">").strip()
+            if line:
+                users.append(line.split()[0])
+        if users:
+            return users
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        return [os.path.basename(p) for p in glob.glob("/mnt/c/Users/*")
+                if os.path.isdir(p)]
+    except OSError:
+        return []
+
+
+def windows_transcript_roots():
+    """Extra `.claude/projects` roots for Claude Code run on the Windows host
+    (e.g. via PowerShell), reached from WSL under /mnt/c. Only included for a
+    Windows user that is currently logged in AND signed into the SAME Claude
+    account as this WSL session (matched via accountUuid in ~/.claude.json) -
+    otherwise an unrelated account's transcripts on a shared machine would
+    leak into the dashboard. Cached for WIN_GLOBS_TTL seconds since collect()
+    runs on a timer and `query user` is a subprocess spawn (slow: WSL
+    interop into a Windows process)."""
+    now = time.time()
+    if now - _win_roots_cache["ts"] < WIN_GLOBS_TTL:
+        return _win_roots_cache["roots"]
+    roots = []
+    if is_wsl() and os.path.isdir("/mnt/c/Users"):
+        own_uuid = _account_uuid(os.path.expanduser("~/.claude.json"))
+        if own_uuid:
+            for uname in _logged_in_windows_users():
+                base = f"/mnt/c/Users/{uname}"
+                if _account_uuid(f"{base}/.claude.json") == own_uuid:
+                    roots.append(f"{base}/.claude/projects")
+    _win_roots_cache["ts"] = now
+    _win_roots_cache["roots"] = roots
+    return roots
 # These window/bucket dimensions are RESOLVED at startup in configure_dimensions()
 # from the CLI args and the terminal width; the values here are fallback defaults
 # for non-interactive use (import, piped --once when the size is unknown).
@@ -139,6 +230,7 @@ PARTIAL = " ▁▂▃▄▅▆▇█"               # 0..8 sub-cell fill levels
 CHIP = "▆"
 
 TICK_SECONDS = 0.2                  # repaint cadence (shimmer animation @5fps)
+PROGRESS_INTERVAL = 0.15            # collect()'s in-scan progress_cb cadence
 USAGE_REFRESH = 300                 # seconds between live-usage refetches
 USAGE_BACKOFF = 900                 # after a 429, wait this long before retrying
 
@@ -363,15 +455,60 @@ def new_session(sid, ts, rec, num_buckets=None):
     }
 
 
+def _slugged_patterns():
+    """EXCLUDE_PATTERNS, with path separators folded to '-' to match a
+    project's on-disk directory name - which is a slug of its cwd with every
+    '/' or '\\' replaced by '-' (e.g. cwd "C:\\Users\\doug\\OneDrive\\AI\\
+    qmd-memory" -> dir "C--Users-doug-OneDrive-AI-qmd-memory"), so a
+    multi-component pattern like "OneDrive/AI/qmd-memory" has to be folded
+    the same way before it can be matched against that slug."""
+    return [p.replace("\\", "-").replace("/", "-") for p in EXCLUDE_PATTERNS]
+
+
+def _walk_jsonl_paths(root):
+    """Yield every *.jsonl under `root`, pruning whole subtrees whose on-disk
+    project directory name (a slug of its cwd) contains an excluded pattern.
+    Pruning during the walk (rather than globbing everything and filtering
+    paths after) avoids listing/stat-ing an excluded tree at all - the
+    dominant cost on a slow filesystem (e.g. WSL's /mnt/c DrvFs mount) when
+    that tree is large, as e.g. the QMD dream job's chunk/subagent files are."""
+    if not os.path.isdir(root):
+        return
+    patterns = _slugged_patterns()
+    for dirpath, dirnames, filenames in os.walk(root):
+        if patterns:
+            dirnames[:] = [d for d in dirnames
+                           if not any(p in d.lower() for p in patterns)]
+        for fn in filenames:
+            if fn.endswith(".jsonl"):
+                yield os.path.join(dirpath, fn)
+
+
+def _all_transcript_paths():
+    yield from _walk_jsonl_paths(os.path.expanduser("~/.claude/projects"))
+    for root in windows_transcript_roots():
+        yield from _walk_jsonl_paths(root)
+
+
 def collect(now: datetime, window=None, bucket=None, num_buckets=None,
-            track_models=False, track_heatmap=False):
+            track_models=False, track_heatmap=False, progress_cb=None):
     """Return (buckets, sessions): time buckets oldest->newest plus per-session
     cache stats, all from de-duplicated usage records. `window`/`bucket`/
     `num_buckets` default to the live globals; the history view passes its own
     (longer) span and coarser bucket so the same scan feeds both views.
     `track_models` adds a per-bucket {model: effective-tokens} map under the
     extra "models" key (ignored by the fixed-key aggregation loops) for the
-    history model-mix chart."""
+    history model-mix chart.
+
+    `progress_cb(buckets, sessions)`, if given, is called once immediately
+    (before any file is read - so a caller can paint a first frame right
+    away) and then again every PROGRESS_INTERVAL seconds while the scan is
+    still running, with the in-progress `buckets`/`sessions` - the same
+    objects this call will go on to return, mutated in place, so a slow scan
+    (many transcripts, or a slow filesystem) shows sessions appearing
+    incrementally instead of one long blank wait. Single-threaded: the
+    callback runs on this thread between files, never concurrently with the
+    mutation, so there's no partial-write tearing to guard against."""
     window = WINDOW if window is None else window
     bucket = BUCKET if bucket is None else bucket
     num_buckets = NUM_BUCKETS if num_buckets is None else num_buckets
@@ -387,7 +524,16 @@ def collect(now: datetime, window=None, bucket=None, num_buckets=None,
     seen: set[str] = set()
     titles: dict[str, str] = {}   # sid -> custom session title (latest /rename)
 
-    for path in glob.glob(TRANSCRIPT_GLOB, recursive=True):
+    if progress_cb is not None:
+        progress_cb(buckets, sessions)
+    last_progress = time.monotonic()
+
+    for path in _all_transcript_paths():
+        if progress_cb is not None:
+            t = time.monotonic()
+            if t - last_progress >= PROGRESS_INTERVAL:
+                progress_cb(buckets, sessions)
+                last_progress = t
         try:
             if os.path.getmtime(path) < mtime_floor:
                 continue
@@ -420,6 +566,8 @@ def collect(now: datetime, window=None, bucket=None, num_buckets=None,
                     if ts is None or ts < cutoff:
                         continue
                     sid = rec.get("sessionId") or os.path.basename(path)[:-6]
+                    if _cwd_excluded(rec.get("cwd")):
+                        continue
 
                     # Surfaced API failures (synthetic assistant records) carry
                     # no usage, so they'd be skipped by the usage check below.
@@ -2044,9 +2192,6 @@ def configure_dimensions(args, cols, fail):
     if bucket_min > aw_hours * 60:
         fail(f"--bucket-minutes ({bucket_min}) must be <= "
              f"--active-window-hours*60 ({aw_hours * 60:g})")
-    if aw_hours >= win_min / 60:
-        fail(f"--active-window-hours ({aw_hours:g}) must be < the window "
-             f"({win_min / 60:g}h)")
 
     BUCKET = timedelta(minutes=bucket_min)
     WINDOW = timedelta(minutes=win_min)
@@ -2114,7 +2259,19 @@ def main():
                     help="base input $/million-tokens for the history $ estimate "
                          "(default 5.0 = Opus 4.8 input); effective tokens are "
                          "priced at this rate")
+    ap.add_argument("--exclude", default=None, metavar="PATH" + os.pathsep + "PATH",
+                    help="full or partial cwd path(s) to leave out of every "
+                         "chart/panel entirely, e.g. a background job's fixed "
+                         "working directory. Case-insensitive substring match. "
+                         f"{os.pathsep!r}-delimited (Python's os.pathsep on this "
+                         "host: ';' on Windows, ':' on POSIX). No default - "
+                         "nothing is excluded unless given.")
     args = ap.parse_args()
+
+    if args.exclude:
+        EXCLUDE_PATTERNS.extend(
+            p.strip().lower().replace("\\", "/")
+            for p in args.exclude.split(os.pathsep) if p.strip())
 
     cols = term_cols()
     configure_dimensions(args, cols, ap.error)
@@ -2273,6 +2430,22 @@ def plan_layout(rows, cols, sessions, now, history=False):
     return L
 
 
+def _paint_partial(now, buckets, sessions, cols, rows, alt, mode):
+    """Repaint the base frame mid-scan, from collect()'s progress_cb - no
+    overlay/mouse handling (a scan-in-progress frame is never the one a click
+    lands on), just enough to turn "blank for N seconds" into "fills in live"."""
+    if not alt:
+        return
+    try:
+        layout = plan_layout(rows, cols, sessions, now, history=(mode == "history"))
+        frame, _ = render_frame(now, buckets, sessions, cols=cols, rows=rows,
+                                layout=layout, mode=mode)
+    except Exception:
+        return   # a mid-scan render glitch must not abort the scan itself
+    sys.stdout.write("\033[H" + frame.replace("\n", "\033[K\n") + "\033[K\033[J")
+    sys.stdout.flush()
+
+
 def run_live(args):
     log.info("dashboard start: interval=%ss tick=%ss", args.interval, TICK_SECONDS)
     alt = sys.stdout.isatty()
@@ -2339,7 +2512,9 @@ def run_live(args):
                 last_collect = last_hist_collect = None   # width -> re-bucket both
             # Heavy transcript scan only every --interval; allowance more often.
             if last_collect is None or (now - last_collect).total_seconds() >= args.interval:
-                buckets, sessions = collect(now)
+                buckets, sessions = collect(
+                    now, progress_cb=lambda b, s: _paint_partial(
+                        now, b, s, cols, rows, alt, "live"))
                 last_collect = now
             # Refresh allowance every USAGE_REFRESH; a failed fetch sets a
             # retry_at (USAGE_BACKOFF out), so a non-2xx makes us wait instead of
@@ -2363,7 +2538,9 @@ def run_live(args):
                         or (now - last_hist_collect).total_seconds() >= args.interval):
                     hist_buckets, hist_sessions = collect(
                         now, HIST_WINDOW, HIST_BUCKET, HIST_NUM_BUCKETS,
-                        track_models=True, track_heatmap=True)
+                        track_models=True, track_heatmap=True,
+                        progress_cb=lambda b, s: _paint_partial(
+                            now, b, s, cols, rows, alt, "history"))
                     last_hist_collect = now
                 cur_buckets, cur_sessions = hist_buckets, hist_sessions
                 layout = (plan_layout(rows, cols, hist_sessions, now,
