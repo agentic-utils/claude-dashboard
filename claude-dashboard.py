@@ -1546,6 +1546,21 @@ def render_login_confirm(now, cols, rows):
     inner = aw + ew + sw + cw
     saved = list_saved_accounts()
     cur_slug = current_account_slug()
+    if cur_slug is None:
+        # The live account hasn't landed on disk yet (save_account_snapshot
+        # runs opportunistically off the periodic profile fetch) — show it
+        # anyway from what's already fetched, so the table is never wrongly
+        # empty just because nothing's been snapshotted yet. Slug "" (not a
+        # real file) marks it: [Select] never renders for it (is_cur below),
+        # and [Re-login] on it is do_login with no do_switch (there's
+        # nothing on disk to switch to).
+        live_label = _usage.get("account")
+        if live_label:
+            try:
+                live_exp = _expiry_label(json.load(open(CREDS_PATH)))
+            except (OSError, ValueError):
+                live_exp = ""
+            saved = [("", live_label, live_exp)] + saved
 
     content = [rgb(DIM, "ACCOUNT".ljust(aw) + "EXPIRY".ljust(ew)
                    + "STATUS".ljust(sw) + "ACTION".ljust(cw))]
@@ -1553,7 +1568,7 @@ def render_login_confirm(now, cols, rows):
     if not saved:
         content.append(rgb(DIM, "No saved accounts yet."))
     for slug, label, exp in saved:
-        is_cur = slug == cur_slug
+        is_cur = slug == cur_slug or slug == ""
         status_plain = "Current" if is_cur else "[Select]"
         action_plain = "[Re-login]"
         row = (rgb(TEXT, _clip(label, aw - 1).ljust(aw))
@@ -1637,9 +1652,18 @@ def _fetch_account(tok, timeout):
         req = urllib.request.Request(PROFILE_URL, headers=_oauth_headers(tok))
         with urllib.request.urlopen(req, timeout=timeout) as r:
             acct = (json.load(r).get("account") or {})
-        _usage_set(account=acct.get("email") or acct.get("display_name"))
+        label = acct.get("email") or acct.get("display_name")
+        _usage_set(account=label)
     except Exception:
         log.info("fetch_usage: profile fetch failed (non-fatal)", exc_info=True)
+        return
+    try:
+        # Opportunistic: the SWITCH ACCOUNT table needs the current account on
+        # disk to list it. No extra network call — reuses the label just
+        # fetched above; save_account_snapshot dedupes if already saved.
+        save_account_snapshot(label=label)
+    except Exception:
+        log.info("fetch_usage: account snapshot failed (non-fatal)", exc_info=True)
 
 
 def fetch_usage(timeout=15):
@@ -2930,9 +2954,9 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
                 focus_sid = hit
                 focus_bucket = None
                 show_uerr = False
-            elif (show_uerr or focus_sid is not None or focus_bucket is not None
-                  or panel_view is not None):
-                show_uerr = False
+            elif (show_login or show_uerr or focus_sid is not None
+                  or focus_bucket is not None or panel_view is not None):
+                show_login = show_uerr = False
                 focus_sid = focus_bucket = None
                 panel_view = None
     # Strip mouse sequences, then handle keys. Arrow/PgUp/PgDn are multi-byte
