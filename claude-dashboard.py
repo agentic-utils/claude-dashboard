@@ -331,16 +331,18 @@ def model_max_window(model):
     # Max context a model CAN do. FINDING (2026-06): the 1M context is a per-
     # request beta header, NOT a model property — it's stripped from the logged
     # model id, absent from every usage/beta field, and not queryable via any
-    # API after the fact. So we grade against the model's *capability*: Opus and
-    # Sonnet 4.x support the 1M beta -> grade at 1M (a real 1M session then never
-    # false-flashes at 175k); Haiku / older / unknown cap at 200k. Trade-off: an
-    # Opus/Sonnet run in plain 200k mode under-warns (won't alarm near its 200k
-    # wall) — acceptable, since the 1M beta is opt-in and the alarm is for big
-    # contexts.
+    # API after the fact. So we grade against the model's *capability*: any
+    # Opus or Sonnet generation supports the 1M beta -> grade at 1M (a real 1M
+    # session then never false-flashes at 175k); Haiku caps at 200k. Trade-off:
+    # an Opus/Sonnet run in plain 200k mode under-warns (won't alarm near its
+    # 200k wall) — acceptable, since the 1M beta is opt-in and the alarm is for
+    # big contexts.
     if not model:
         return 200_000
     m = model.lower()
-    if ("opus" in m or "sonnet" in m) and "-4" in m:
+    if "haiku" in m:
+        return 200_000
+    if "opus" in m or "sonnet" in m:
         return 1_000_000
     return 200_000
 
@@ -1521,35 +1523,97 @@ def render_usage_error(now, cols, rows):
     return panel("USAGE CALL ERROR", lines, inner)
 
 
+ACCT_COL_W = (20, 13, 8, 10)   # account, expiry, status, action — text widths
+ACCT_PAD = 1                   # spaces between a column's text and its gridlines
+
+
+def _acct_col_starts():
+    """Absolute char offsets (within the table row string) where each
+    column's TEXT begins — i.e. past its leading pad space and any grid
+    lines/padding of the columns before it."""
+    starts, pos = [], 0
+    for w in ACCT_COL_W:
+        pos += ACCT_PAD
+        starts.append(pos)
+        pos += w + ACCT_PAD + 1     # text + trailing pad + gridline
+    return starts
+
+
+def _acct_row(cells):
+    """cells: [(text, w, color, bold), ...] — one per column, already sized to
+    ACCT_COL_W. Joins them with 1-space-padded gridlines."""
+    sep = rgb(DIM2, "│")
+    return sep.join(rgb(color, " " + text.ljust(w) + " ", bold=bold)
+                     for text, w, color, bold in cells)
+
+
 def render_login_confirm(now, cols, rows):
-    """Confirmation modal shown before the (disruptive) interactive login. The
-    login suspends the whole dashboard to run `claude auth login`, so we ask
-    first rather than fire on a stray 'g' or a misclick on the account string."""
-    inner = min(58, max(cols - 4, 36))
-    acct = _usage.get("account")
-    lines = [
-        rgb(TEXT, "Re-login / switch account?", bold=True),
-        "",
-        rgb(DIM, "Runs `claude auth login` — this suspends the"),
-        rgb(DIM, "dashboard for an interactive sign-in."),
-        "",
-        # This is the shared OAuth store (~/.claude/.credentials.json) — the same
-        # login Claude Code itself reads. Verified: `claude auth status` reports
-        # the account this file holds. So a switch here is global, not local.
-        rgb(WARN_C, "⚠ This is the shared Claude Code login.", bold=True),
-        rgb(DIM, "Switching it here changes the account your"),
-        rgb(DIM, "Claude Code sessions use too — not just this"),
-        rgb(DIM, "dashboard."),
-    ]
-    if acct:
-        lines += ["", rgb(DIM, "Currently: ") + rgb(ACCENT, acct, bold=True)]
-    lines += [
-        "",
-        rgb(WARN_C, "[Y]") + rgb(DIM, " yes, login     ")
-        + rgb(WARN_C, "[N]") + rgb(DIM, " cancel"),
-        rgb(DIM, "esc / click outside to cancel"),
-    ]
-    return panel("SWITCH ACCOUNT", lines, inner)
+    """Account-switch modal: a table of saved accounts, one row each. Status
+    is 'Current' (that row's account is the live one) or a '[Select]' link
+    (instant switch, no TUI suspend — a file swap); '[Re-login]' switches
+    that row live THEN runs interactive `claude auth login` (suspends the
+    TUI), so it also works to refresh an expired non-current account. '[+]
+    add account' logs in immediately with no extra confirm; the result
+    becomes live (it's what `claude auth login` just wrote) and gets
+    snapshotted into the table on return. Returns (lines, regions) —
+    regions = [(overlay_line, lo, hi, token)] in the same convention as
+    render_panel_popup.
+
+    This is the shared OAuth store (~/.claude/.credentials.json) — the same
+    login Claude Code itself reads — so a switch here is global, not local;
+    other running Claude Code sessions pick it up silently on their next
+    prompt, no restart needed."""
+    aw, ew, sw, cw = ACCT_COL_W
+    starts = _acct_col_starts()
+    inner = starts[-1] + cw + ACCT_PAD - 0   # last column's text-end + trailing pad
+    saved = list_saved_accounts()
+    cur_slug = current_account_slug()
+    if cur_slug is None:
+        # The live account hasn't landed on disk yet (save_account_snapshot
+        # runs opportunistically off the periodic profile fetch) — show it
+        # anyway from what's already fetched, so the table is never wrongly
+        # empty just because nothing's been snapshotted yet. Slug "" (not a
+        # real file) marks it: [Select] never renders for it (is_cur below),
+        # and [Re-login] on it is do_login with no do_switch (there's
+        # nothing on disk to switch to).
+        live_label = _usage.get("account")
+        if live_label:
+            try:
+                live_exp = _expiry_label(json.load(open(CREDS_PATH)))
+            except (OSError, ValueError):
+                live_exp = ""
+            saved = [("", live_label, live_exp)] + saved
+
+    content = [_acct_row([("ACCOUNT", aw, TEXT, True), ("EXPIRY", ew, TEXT, True),
+                          ("STATUS", sw, TEXT, True), ("ACTION", cw, TEXT, True)]),
+               rgb(DIM2, "─" * (aw + 2 * ACCT_PAD) + "┼" + "─" * (ew + 2 * ACCT_PAD)
+                   + "┼" + "─" * (sw + 2 * ACCT_PAD) + "┼" + "─" * (cw + 2 * ACCT_PAD))]
+    regions = []
+    if not saved:
+        content.append(rgb(DIM, "No saved accounts yet."))
+    for slug, label, exp in saved:
+        is_cur = slug == cur_slug or slug == ""
+        status_plain = "Current" if is_cur else "[Select]"
+        action_plain = "[Re-login]"
+        content.append(_acct_row([
+            (_clip(label, aw), aw, TEXT, False),
+            (exp or "-", ew, DIM, False),
+            (status_plain, sw, ACCENT if is_cur else WARN_C, is_cur),
+            (action_plain, cw, WARN_C, False),
+        ]))
+        li = len(content)
+        status_start, action_start = starts[2], starts[3]
+        if not is_cur:
+            regions.append((li, status_start + 1, status_start + len(status_plain),
+                             f"__acctsel__{slug}"))
+        regions.append((li, action_start + 1, action_start + len(action_plain),
+                         f"__acctrelogin__{slug}"))
+    content.append("")
+    content.append(rgb(WARN_C, "[+] add account", bold=True))
+    regions.append((len(content), 1, inner, "__acctadd__"))
+    content.append("")
+    content.append(rgb(DIM, "esc / click outside to cancel"))
+    return panel("SWITCH ACCOUNT", content, inner), regions
 
 
 # ── live bundled-allowance usage (GET /api/oauth/usage, same as `/usage`) ─────
@@ -1557,6 +1621,7 @@ def render_login_confirm(now, cols, rows):
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
+ACCOUNTS_DIR = os.path.expanduser("~/.claude/dashboard-accounts")
 # Shared by the context light (ctx_grade) and allowance gauge (gauge_grade) —
 # the actual thresholds live in those functions, not here.
 OK_C = (52, 224, 150)       # green
@@ -1611,9 +1676,18 @@ def _fetch_account(tok, timeout):
         req = urllib.request.Request(PROFILE_URL, headers=_oauth_headers(tok))
         with urllib.request.urlopen(req, timeout=timeout) as r:
             acct = (json.load(r).get("account") or {})
-        _usage_set(account=acct.get("email") or acct.get("display_name"))
+        label = acct.get("email") or acct.get("display_name")
+        _usage_set(account=label)
     except Exception:
         log.info("fetch_usage: profile fetch failed (non-fatal)", exc_info=True)
+        return
+    try:
+        # Opportunistic: the SWITCH ACCOUNT table needs the current account on
+        # disk to list it. No extra network call — reuses the label just
+        # fetched above; save_account_snapshot dedupes if already saved.
+        save_account_snapshot(label=label)
+    except Exception:
+        log.info("fetch_usage: account snapshot failed (non-fatal)", exc_info=True)
 
 
 def fetch_usage(timeout=15):
@@ -1676,6 +1750,126 @@ def _token_stale():
     or rejected (401) — the only error `claude auth login` can fix."""
     err = _usage.get("err") or ""
     return err == "no oauth token" or err.startswith("HTTP 401")
+
+
+# ── multi-account store (~/.claude/dashboard-accounts/<slug>.json) ───────────
+# Each file snapshots the FULL ~/.claude/.credentials.json content (not just
+# claudeAiOauth) so MCP-server tokens travel with the account too, plus a
+# "label" (account email) for display. Switching just swaps this whole file
+# into CREDS_PATH — Claude Code and this dashboard both re-read it fresh.
+
+def _slugify(label):
+    return re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "account"
+
+
+def _expiry_label(creds, now=None):
+    """'expired' or 'expires HH:MM' (local time) from a credentials dict's
+    claudeAiOauth.expiresAt (epoch ms). '' if the field is missing/invalid —
+    Claude Code refreshes this token itself, so a saved snapshot's expiry is
+    just informational, not a sign the account needs re-login."""
+    ms = (creds.get("claudeAiOauth") or {}).get("expiresAt")
+    if not isinstance(ms, (int, float)):
+        return ""
+    now = now or datetime.now(timezone.utc)
+    exp = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    if exp <= now:
+        return "expired"
+    return "expires " + exp.astimezone().strftime("%H:%M")
+
+
+def list_saved_accounts():
+    """Return [(slug, label, expiry_label), ...] sorted by label. Corrupt
+    files are skipped."""
+    out = []
+    for path in sorted(glob.glob(os.path.join(ACCOUNTS_DIR, "*.json"))):
+        try:
+            data = json.load(open(path))
+            slug = os.path.splitext(os.path.basename(path))[0]
+            out.append((slug, data.get("label") or slug,
+                        _expiry_label(data.get("creds") or {})))
+        except (OSError, ValueError):
+            continue
+    return sorted(out, key=lambda t: t[1].lower())
+
+
+def _same_account(creds_a, creds_b):
+    """True if two full-credentials-file dicts are the same account. Compares
+    refreshToken (stable across accessToken rotation) when both have one,
+    else falls back to exact equality."""
+    ra = (creds_a.get("claudeAiOauth") or {}).get("refreshToken")
+    rb = (creds_b.get("claudeAiOauth") or {}).get("refreshToken")
+    if ra and rb:
+        return ra == rb
+    return creds_a == creds_b
+
+
+def current_account_slug():
+    """Slug of the saved account matching the live creds file, or None if the
+    live account was never snapshotted."""
+    try:
+        live = json.load(open(CREDS_PATH))
+    except (OSError, ValueError):
+        return None
+    for path in sorted(glob.glob(os.path.join(ACCOUNTS_DIR, "*.json"))):
+        try:
+            creds = json.load(open(path)).get("creds") or {}
+        except (OSError, ValueError):
+            continue
+        if _same_account(live, creds):
+            return os.path.splitext(os.path.basename(path))[0]
+    return None
+
+
+def save_account_snapshot(label=None):
+    """Snapshot the CURRENT live creds file into the accounts dir, keyed by
+    account email (fetched fresh if not given). Skips the write if a saved
+    account already holds byte-identical creds. Best-effort: returns the
+    label used, or None on any failure (missing creds file, dead token,
+    unreachable profile endpoint)."""
+    try:
+        raw = open(CREDS_PATH).read()
+        creds = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if label is None:
+        tok = (creds.get("claudeAiOauth") or {}).get("accessToken")
+        if not tok:
+            return None
+        try:
+            req = urllib.request.Request(PROFILE_URL, headers=_oauth_headers(tok))
+            with urllib.request.urlopen(req, timeout=10) as r:
+                acct = (json.load(r).get("account") or {})
+            label = acct.get("email") or acct.get("display_name")
+        except Exception:
+            return None
+    if not label:
+        return None
+    os.makedirs(ACCOUNTS_DIR, exist_ok=True)
+    path = os.path.join(ACCOUNTS_DIR, _slugify(label) + ".json")
+    if os.path.exists(path):
+        try:
+            existing = json.load(open(path))
+            if existing.get("creds") == creds:
+                return label          # already saved, byte-identical
+        except (OSError, ValueError):
+            pass
+    json.dump({"label": label, "creds": creds}, open(path, "w"))
+    return label
+
+
+def switch_account(slug):
+    """Snapshot the current account (so it isn't lost), then overwrite the
+    live creds file with the saved account's. Non-disruptive: Claude Code and
+    this dashboard both re-read CREDS_PATH fresh, so other running sessions
+    pick up the new account on their next call, no restart needed."""
+    path = os.path.join(ACCOUNTS_DIR, slug + ".json")
+    try:
+        creds = json.load(open(path))["creds"]
+    except (OSError, ValueError, KeyError):
+        return False
+    save_account_snapshot()          # best-effort; swallows its own failures
+    json.dump(creds, open(CREDS_PATH, "w"))
+    return True
 
 
 def run_login(fd, old_term):
@@ -2573,7 +2767,7 @@ def run_live(args):
                     overlay = render_help(now, cols, rows)
                     okey = "help"
                 elif show_login:
-                    overlay = render_login_confirm(now, cols, rows)
+                    overlay, overlay_regions = render_login_confirm(now, cols, rows)
                     okey = "login"
                 elif show_uerr:
                     overlay = render_usage_error(now, cols, rows)
@@ -2654,7 +2848,7 @@ def run_live(args):
                         data = ""
                     (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
                      show_uerr, show_login, show_history, quit_flag,
-                     scroll_delta, do_login, do_retry) = process_input(
+                     scroll_delta, do_login, do_retry, do_switch) = process_input(
                         data, mouse_re, hits, focus_sid, focus_bucket,
                         panel_view, summary_tab, show_help, show_uerr, show_login,
                         show_history)
@@ -2663,8 +2857,12 @@ def run_live(args):
                     # Manual retry/login bypass the retry_at backoff gate above.
                     if do_retry:
                         kick_usage()
+                    if do_switch:              # picked a saved account: just a
+                        switch_account(do_switch)   # file swap, no TUI suspend
+                        kick_usage()
                     if do_login:
                         run_login(fd, old_term)   # suspends + resumes the TUI
+                        save_account_snapshot()  # persist the newly added account
                         kick_usage()              # pick up the fresh token now
                         prev_okey = None          # force a full repaint on resume
                     # Any open overlay scrolls; the delta is clamped to the
@@ -2710,17 +2908,24 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     requests quit.
 
     'g'/'G', a click on the account string / footer "G login", or [L] in the
-    usage-error overlay open the login CONFIRMATION modal (show_login); 'Y' there
-    confirms (sets do_login), anything else cancels — login is disruptive
-    (suspends the whole TUI) so it's never fired without a confirm.
+    usage-error overlay open the SWITCH ACCOUNT modal (show_login) — a table
+    of saved accounts. There, a digit / a row's [Select] click picks a saved
+    account (sets do_switch, instant — no TUI suspend needed, it's just a
+    file swap); a row's [Re-login] click (or 'R' for the current account)
+    sets do_switch + do_login; '+' / a row's [+] add account also sets
+    do_login alone — both do_login paths are disruptive, suspending the TUI
+    for interactive `claude auth login`; anything else cancels.
 
     Returns (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
     show_uerr, show_login, show_history, quit_flag, scroll_delta, do_login,
-    do_retry). do_login/do_retry ask the main loop to run the (interactive)
-    login flow or force an immediate usage refetch — both bypass retry_at."""
+    do_retry, do_switch). do_login/do_retry ask the main loop to run the
+    (interactive) login flow or force an immediate usage refetch — both
+    bypass retry_at. do_switch is None or the slug of the saved account to
+    switch to."""
     delta = 0
     quit_flag = False
     do_login = do_retry = False
+    do_switch = None
     for m in mouse_re.finditer(data):
         button, x, y, final = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
         # Bit 6 (64) flags scroll-wheel events, which also satisfy &0b11==0;
@@ -2748,6 +2953,16 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
                 show_login = True          # confirm before the disruptive login
                 focus_sid = focus_bucket = panel_view = None
                 show_uerr = False
+            elif hit and hit.startswith("__acctsel__"):   # SWITCH ACCOUNT [Select]
+                do_switch = hit[len("__acctsel__"):]
+                show_login = False
+            elif hit and hit.startswith("__acctrelogin__"):  # SWITCH ACCOUNT [Re-login]
+                do_switch = hit[len("__acctrelogin__"):]
+                do_login = True
+                show_login = False
+            elif hit == "__acctadd__":     # SWITCH ACCOUNT [+] add account
+                do_login = True
+                show_login = False
             elif hit in ("__history__", "__live__"):   # Live/History tab or span
                 show_history = (hit == "__history__")
                 focus_sid = focus_bucket = panel_view = None
@@ -2763,9 +2978,9 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
                 focus_sid = hit
                 focus_bucket = None
                 show_uerr = False
-            elif (show_uerr or focus_sid is not None or focus_bucket is not None
-                  or panel_view is not None):
-                show_uerr = False
+            elif (show_login or show_uerr or focus_sid is not None
+                  or focus_bucket is not None or panel_view is not None):
+                show_login = show_uerr = False
                 focus_sid = focus_bucket = None
                 panel_view = None
     # Strip mouse sequences, then handle keys. Arrow/PgUp/PgDn are multi-byte
@@ -2782,14 +2997,25 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     if "?" in rest:
         show_help = not show_help
     # Key priority chain (one owner per pass):
-    #  · login-confirm modal owns the keyboard: Y confirms, N cancels.
+    #  · switch-account modal owns the keyboard: digit picks a saved account,
+    #    R re-logs in the current account, + adds a new one, anything else
+    #    (N handled by the q/esc block below) cancels.
     #  · else 'g'/'G' opens that modal — the standing switch-account accelerator
     #    (also the footer "G login" and the clickable account string top-right).
     #  · else the usage-error overlay takes R (retry) / L (login), short-circuiting
     #    the menu accelerators so 'L' doesn't fall through to 'L' = Live.
     #  · else the global menu accelerators.
     if show_login:
-        if "y" in rest or "Y" in rest:
+        saved = list_saved_accounts()
+        digit = next((c for c in rest if c.isdigit() and c != "0"), None)
+        if digit and int(digit) <= len(saved):
+            do_switch = saved[int(digit) - 1][0]
+            show_login = False
+        elif "+" in rest:               # [+] add account
+            do_login = True
+            show_login = False
+        elif "r" in rest or "R" in rest:   # re-login current account, if saved
+            do_switch = current_account_slug()
             do_login = True
             show_login = False
         elif "n" in rest or "N" in rest:
@@ -2846,7 +3072,7 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             show_history = False
     return (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
             show_uerr, show_login, show_history, quit_flag, delta,
-            do_login, do_retry)
+            do_login, do_retry, do_switch)
 
 
 if __name__ == "__main__":
