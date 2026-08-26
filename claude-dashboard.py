@@ -1523,7 +1523,28 @@ def render_usage_error(now, cols, rows):
     return panel("USAGE CALL ERROR", lines, inner)
 
 
-ACCT_COL_W = (20, 13, 11, 12)   # account, expiry, status, action
+ACCT_COL_W = (20, 13, 8, 10)   # account, expiry, status, action — text widths
+ACCT_PAD = 1                   # spaces between a column's text and its gridlines
+
+
+def _acct_col_starts():
+    """Absolute char offsets (within the table row string) where each
+    column's TEXT begins — i.e. past its leading pad space and any grid
+    lines/padding of the columns before it."""
+    starts, pos = [], 0
+    for w in ACCT_COL_W:
+        pos += ACCT_PAD
+        starts.append(pos)
+        pos += w + ACCT_PAD + 1     # text + trailing pad + gridline
+    return starts
+
+
+def _acct_row(cells):
+    """cells: [(text, w, color, bold), ...] — one per column, already sized to
+    ACCT_COL_W. Joins them with 1-space-padded gridlines."""
+    sep = rgb(DIM2, "│")
+    return sep.join(rgb(color, " " + text.ljust(w) + " ", bold=bold)
+                     for text, w, color, bold in cells)
 
 
 def render_login_confirm(now, cols, rows):
@@ -1543,7 +1564,8 @@ def render_login_confirm(now, cols, rows):
     other running Claude Code sessions pick it up silently on their next
     prompt, no restart needed."""
     aw, ew, sw, cw = ACCT_COL_W
-    inner = aw + ew + sw + cw
+    starts = _acct_col_starts()
+    inner = starts[-1] + cw + ACCT_PAD - 0   # last column's text-end + trailing pad
     saved = list_saved_accounts()
     cur_slug = current_account_slug()
     if cur_slug is None:
@@ -1562,8 +1584,10 @@ def render_login_confirm(now, cols, rows):
                 live_exp = ""
             saved = [("", live_label, live_exp)] + saved
 
-    content = [rgb(DIM, "ACCOUNT".ljust(aw) + "EXPIRY".ljust(ew)
-                   + "STATUS".ljust(sw) + "ACTION".ljust(cw))]
+    content = [_acct_row([("ACCOUNT", aw, TEXT, True), ("EXPIRY", ew, TEXT, True),
+                          ("STATUS", sw, TEXT, True), ("ACTION", cw, TEXT, True)]),
+               rgb(DIM2, "─" * (aw + 2 * ACCT_PAD) + "┼" + "─" * (ew + 2 * ACCT_PAD)
+                   + "┼" + "─" * (sw + 2 * ACCT_PAD) + "┼" + "─" * (cw + 2 * ACCT_PAD))]
     regions = []
     if not saved:
         content.append(rgb(DIM, "No saved accounts yet."))
@@ -1571,14 +1595,14 @@ def render_login_confirm(now, cols, rows):
         is_cur = slug == cur_slug or slug == ""
         status_plain = "Current" if is_cur else "[Select]"
         action_plain = "[Re-login]"
-        row = (rgb(TEXT, _clip(label, aw - 1).ljust(aw))
-               + rgb(DIM, (exp or "-").ljust(ew))
-               + (rgb(ACCENT, status_plain.ljust(sw), bold=True) if is_cur
-                  else rgb(WARN_C, status_plain.ljust(sw)))
-               + rgb(WARN_C, action_plain.ljust(cw)))
-        content.append(row)
+        content.append(_acct_row([
+            (_clip(label, aw), aw, TEXT, False),
+            (exp or "-", ew, DIM, False),
+            (status_plain, sw, ACCENT if is_cur else WARN_C, is_cur),
+            (action_plain, cw, WARN_C, False),
+        ]))
         li = len(content)
-        status_start, action_start = aw + ew, aw + ew + sw
+        status_start, action_start = starts[2], starts[3]
         if not is_cur:
             regions.append((li, status_start + 1, status_start + len(status_plain),
                              f"__acctsel__{slug}"))
