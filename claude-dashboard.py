@@ -493,7 +493,8 @@ def _all_transcript_paths():
 
 
 def collect(now: datetime, window=None, bucket=None, num_buckets=None,
-            track_models=False, track_heatmap=False, progress_cb=None):
+            track_models=False, track_heatmap=False, progress_cb=None,
+            seed_sessions=None):
     """Return (buckets, sessions): time buckets oldest->newest plus per-session
     cache stats, all from de-duplicated usage records. `window`/`bucket`/
     `num_buckets` default to the live globals; the history view passes its own
@@ -501,6 +502,21 @@ def collect(now: datetime, window=None, bucket=None, num_buckets=None,
     `track_models` adds a per-bucket {model: effective-tokens} map under the
     extra "models" key (ignored by the fixed-key aggregation loops) for the
     history model-mix chart.
+
+    `seed_sessions`, if given, is the caller's PREVIOUS `sessions` dict,
+    mutated and returned in place instead of starting from empty. A session
+    already in it stays visible (with its stale, previous-scan numbers)
+    until this scan re-touches it — the whole point being a refresh never
+    drops the visible list back to nothing while it re-populates. A session
+    is re-touched by discarding its carried-over entry and rebuilding it
+    fresh (via new_session) on FIRST touch this call, so its numbers are a
+    clean re-aggregation, not stale-plus-incremental double counting;
+    further touches this call accumulate into that fresh entry as normal.
+    At the end, any carried-over session this call never touched is dropped
+    if it's aged out of `window` — mtime_floor already means "never touched"
+    only happens when a session's file was entirely skipped as older than
+    the window, so this is nearly always true; the last_act check is the
+    correctness guard for the rare other case.
 
     `progress_cb(buckets, sessions)`, if given, is called once immediately
     (before any file is read - so a caller can paint a first frame right
@@ -522,9 +538,20 @@ def collect(now: datetime, window=None, bucket=None, num_buckets=None,
         for b in buckets:
             b["models"] = {}        # model id -> effective tokens (extra key)
     heat = [[0.0] * 24 for _ in range(7)] if track_heatmap else None
-    sessions: dict[str, dict] = {}
+    sessions: dict[str, dict] = {} if seed_sessions is None else seed_sessions
+    touched_sids: set[str] = set()   # sids (re)touched THIS call
     seen: set[str] = set()
     titles: dict[str, str] = {}   # sid -> custom session title (latest /rename)
+
+    def touch(sid, ts, rec):
+        """Session dict for `sid`, rebuilt fresh on this call's first touch
+        (discarding any carried-over seed entry) so a re-scan's numbers are
+        never stale-plus-incremental double counted; later touches this call
+        reuse that fresh entry."""
+        if sid not in touched_sids:
+            sessions[sid] = new_session(sid, ts, rec, num_buckets)
+            touched_sids.add(sid)
+        return sessions[sid]
 
     if progress_cb is not None:
         progress_cb(buckets, sessions)
@@ -575,7 +602,7 @@ def collect(now: datetime, window=None, bucket=None, num_buckets=None,
                     # no usage, so they'd be skipped by the usage check below.
                     # Handle them first: record the latest error per session.
                     if msg.get("isApiErrorMessage"):
-                        s = sessions.get(sid) or sessions.setdefault(sid, new_session(sid, ts, rec, num_buckets))
+                        s = touch(sid, ts, rec)
                         status = rec.get("apiErrorStatus")
                         text = _err_text(rec)
                         if s["err"] is None or ts >= s["err"]["ts"]:
@@ -625,9 +652,7 @@ def collect(now: datetime, window=None, bucket=None, num_buckets=None,
                     # input, so the main thread's huge cheap cache reads don't
                     # drown the subagent signal.
                     side = "sub" if rec.get("isSidechain") else "main"
-                    s = sessions.get(sid)
-                    if s is None:
-                        s = sessions[sid] = new_session(sid, ts, rec, num_buckets)
+                    s = touch(sid, ts, rec)
                     # `last` = last SUCCESSFUL turn (the "last prompt" baseline and
                     # the success cutoff for errored_last); `last_act` = any activity.
                     if s["last"] is None or ts > s["last"]:
@@ -687,6 +712,17 @@ def collect(now: datetime, window=None, bucket=None, num_buckets=None,
                     add_usage(s["buckets"][idx], inp, f5, f1, read, fresh, out)
         except OSError:
             continue
+
+    # A carried-over (seed_sessions) session this call never touched has aged
+    # out of `window` — drop it. (In practice this is the ONLY way a session
+    # goes untouched: its file's mtime already failed mtime_floor above, since
+    # any activity within window would have updated the file's mtime too.
+    # The last_act check is belt-and-braces, not the primary mechanism.)
+    for sid in list(sessions):
+        if sid not in touched_sids:
+            s = sessions[sid]
+            if s.get("last_act") is None or s["last_act"] < cutoff:
+                del sessions[sid]
 
     # Attach custom /rename titles to their sessions (titles may be seen before
     # the session has any usage record, so this is done after the full scan).
@@ -2704,11 +2740,18 @@ def run_live(args):
             # instead of tripping the too-small notice.
             if refit_width(cols):
                 last_collect = last_hist_collect = None   # width -> re-bucket both
+                # Existing sessions' per-session bucket arrays are sized to the
+                # OLD NUM_BUCKETS; seeding the re-collect with them would carry
+                # forward mismatched-size arrays until each is re-touched. A
+                # resize is rare and already a visible discontinuity, so just
+                # drop them rather than add bucket-resizing logic for it.
+                sessions, hist_sessions = {}, {}
             # Heavy transcript scan only every --interval; allowance more often.
             if last_collect is None or (now - last_collect).total_seconds() >= args.interval:
                 buckets, sessions = collect(
                     now, progress_cb=lambda b, s: _paint_partial(
-                        now, b, s, cols, rows, alt, "live"))
+                        now, b, s, cols, rows, alt, "live"),
+                    seed_sessions=sessions)
                 last_collect = now
             # Refresh allowance every USAGE_REFRESH; a failed fetch sets a
             # retry_at (USAGE_BACKOFF out), so a non-2xx makes us wait instead of
@@ -2734,7 +2777,8 @@ def run_live(args):
                         now, HIST_WINDOW, HIST_BUCKET, HIST_NUM_BUCKETS,
                         track_models=True, track_heatmap=True,
                         progress_cb=lambda b, s: _paint_partial(
-                            now, b, s, cols, rows, alt, "history"))
+                            now, b, s, cols, rows, alt, "history"),
+                        seed_sessions=hist_sessions)
                     last_hist_collect = now
                 cur_buckets, cur_sessions = hist_buckets, hist_sessions
                 layout = (plan_layout(rows, cols, hist_sessions, now,
