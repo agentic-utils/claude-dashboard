@@ -1524,27 +1524,36 @@ def render_usage_error(now, cols, rows):
 
 
 def render_login_confirm(now, cols, rows):
-    """Account-switch modal: pick a saved account (instant, no TUI suspend) or
-    add a new one via interactive `claude auth login` (which does suspend).
-    This is the shared OAuth store (~/.claude/.credentials.json) — the same
-    login Claude Code itself reads — so any switch here is global, not local;
-    other running Claude Code sessions pick it up silently on their next
-    prompt, no restart needed."""
+    """Account-switch modal: pick a saved account (instant, no TUI suspend), or
+    run interactive `claude auth login` (which does suspend) to either add a
+    new account or re-auth the current one. This is the shared OAuth store
+    (~/.claude/.credentials.json) — the same login Claude Code itself reads —
+    so any switch here is global, not local; other running Claude Code
+    sessions pick it up silently on their next prompt, no restart needed."""
     inner = min(58, max(cols - 4, 36))
     acct = _usage.get("account")
     saved = list_saved_accounts()
     lines = [rgb(TEXT, "Switch account", bold=True), ""]
     if acct:
-        lines += [rgb(DIM, "Currently: ") + rgb(ACCENT, acct, bold=True), ""]
+        cur = rgb(DIM, "Currently: ") + rgb(ACCENT, acct, bold=True)
+        cur_exp = current_account_expiry()
+        if cur_exp:
+            cur += rgb(DIM, "  (" + cur_exp + ")")
+        lines += [cur, ""]
     if saved:
-        for i, (_, label) in enumerate(saved[:9], start=1):
-            lines.append(rgb(WARN_C, f"[{i}] ") + rgb(TEXT, label))
+        for i, (_, label, exp) in enumerate(saved[:9], start=1):
+            line = rgb(WARN_C, f"[{i}] ") + rgb(TEXT, label)
+            if exp:
+                line += rgb(DIM, "  (" + exp + ")")
+            lines.append(line)
         lines.append("")
     else:
         lines += [rgb(DIM, "No saved accounts yet."), ""]
     lines += [
-        rgb(WARN_C, "[A]") + rgb(DIM, " add account (runs `claude auth login`,"),
-        rgb(DIM, "    suspends the dashboard for an interactive sign-in)"),
+        rgb(WARN_C, "[R]") + rgb(DIM, " re-login current account       ")
+        + rgb(WARN_C, "[A]") + rgb(DIM, " add account"),
+        rgb(DIM, "(both run `claude auth login`, suspending the dashboard"),
+        rgb(DIM, "for an interactive sign-in)"),
         "",
         rgb(DIM, "esc / click outside to cancel"),
     ]
@@ -1688,17 +1697,42 @@ def _slugify(label):
     return re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-") or "account"
 
 
+def _expiry_label(creds, now=None):
+    """'expired' or 'expires HH:MM' (local time) from a credentials dict's
+    claudeAiOauth.expiresAt (epoch ms). '' if the field is missing/invalid —
+    Claude Code refreshes this token itself, so a saved snapshot's expiry is
+    just informational, not a sign the account needs re-login."""
+    ms = (creds.get("claudeAiOauth") or {}).get("expiresAt")
+    if not isinstance(ms, (int, float)):
+        return ""
+    now = now or datetime.now(timezone.utc)
+    exp = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    if exp <= now:
+        return "expired"
+    return "expires " + exp.astimezone().strftime("%H:%M")
+
+
 def list_saved_accounts():
-    """Return [(slug, label), ...] sorted by label. Corrupt files are skipped."""
+    """Return [(slug, label, expiry_label), ...] sorted by label. Corrupt
+    files are skipped."""
     out = []
     for path in sorted(glob.glob(os.path.join(ACCOUNTS_DIR, "*.json"))):
         try:
             data = json.load(open(path))
             slug = os.path.splitext(os.path.basename(path))[0]
-            out.append((slug, data.get("label") or slug))
+            out.append((slug, data.get("label") or slug,
+                        _expiry_label(data.get("creds") or {})))
         except (OSError, ValueError):
             continue
     return sorted(out, key=lambda t: t[1].lower())
+
+
+def current_account_expiry():
+    """Expiry label for the live creds file, or '' if unreadable."""
+    try:
+        return _expiry_label(json.load(open(CREDS_PATH)))
+    except (OSError, ValueError):
+        return ""
 
 
 def save_account_snapshot(label=None):
@@ -2791,9 +2825,9 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     'g'/'G', a click on the account string / footer "G login", or [L] in the
     usage-error overlay open the SWITCH ACCOUNT modal (show_login). There, a
     digit 1-9 picks a saved account (sets do_switch, instant — no TUI suspend
-    needed since it's just a file swap); 'A' adds a new account (sets
-    do_login, disruptive — suspends the TUI for interactive `claude auth
-    login`); anything else cancels.
+    needed since it's just a file swap); 'R'/'A' re-login current / add new
+    account (both set do_login, disruptive — suspend the TUI for interactive
+    `claude auth login`); anything else cancels.
 
     Returns (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
     show_uerr, show_login, show_history, quit_flag, scroll_delta, do_login,
@@ -2867,8 +2901,8 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
         show_help = not show_help
     # Key priority chain (one owner per pass):
     #  · switch-account modal owns the keyboard: digit picks a saved account,
-    #    A adds a new one, anything else (N handled by the q/esc block below)
-    #    cancels.
+    #    R/A re-login current / add new, anything else (N handled by the
+    #    q/esc block below) cancels.
     #  · else 'g'/'G' opens that modal — the standing switch-account accelerator
     #    (also the footer "G login" and the clickable account string top-right).
     #  · else the usage-error overlay takes R (retry) / L (login), short-circuiting
@@ -2880,8 +2914,8 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
         if digit and int(digit) <= len(saved):
             do_switch = saved[int(digit) - 1][0]
             show_login = False
-        elif "a" in rest or "A" in rest:
-            do_login = True
+        elif "a" in rest or "A" in rest or "r" in rest or "R" in rest:
+            do_login = True          # re-login current or add new — same flow
             show_login = False
         elif "n" in rest or "N" in rest:
             show_login = False
