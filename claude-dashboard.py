@@ -1523,41 +1523,58 @@ def render_usage_error(now, cols, rows):
     return panel("USAGE CALL ERROR", lines, inner)
 
 
+ACCT_COL_W = (20, 13, 11, 12)   # account, expiry, status, action
+
+
 def render_login_confirm(now, cols, rows):
-    """Account-switch modal: pick a saved account (instant, no TUI suspend), or
-    run interactive `claude auth login` (which does suspend) to either add a
-    new account or re-auth the current one. This is the shared OAuth store
-    (~/.claude/.credentials.json) — the same login Claude Code itself reads —
-    so any switch here is global, not local; other running Claude Code
-    sessions pick it up silently on their next prompt, no restart needed."""
-    inner = min(58, max(cols - 4, 36))
-    acct = _usage.get("account")
+    """Account-switch modal: a table of saved accounts, one row each. Status
+    is 'Current' (that row's account is the live one) or a '[Select]' link
+    (instant switch, no TUI suspend — a file swap); '[Re-login]' switches
+    that row live THEN runs interactive `claude auth login` (suspends the
+    TUI), so it also works to refresh an expired non-current account. '[+]
+    add account' logs in immediately with no extra confirm; the result
+    becomes live (it's what `claude auth login` just wrote) and gets
+    snapshotted into the table on return. Returns (lines, regions) —
+    regions = [(overlay_line, lo, hi, token)] in the same convention as
+    render_panel_popup.
+
+    This is the shared OAuth store (~/.claude/.credentials.json) — the same
+    login Claude Code itself reads — so a switch here is global, not local;
+    other running Claude Code sessions pick it up silently on their next
+    prompt, no restart needed."""
+    aw, ew, sw, cw = ACCT_COL_W
+    inner = aw + ew + sw + cw
     saved = list_saved_accounts()
-    lines = [rgb(TEXT, "Switch account", bold=True), ""]
-    if acct:
-        cur = rgb(DIM, "Currently: ") + rgb(ACCENT, acct, bold=True)
-        cur_exp = current_account_expiry()
-        if cur_exp:
-            cur += rgb(DIM, "  (" + cur_exp + ")")
-        lines += [cur, ""]
-    if saved:
-        for i, (_, label, exp) in enumerate(saved[:9], start=1):
-            line = rgb(WARN_C, f"[{i}] ") + rgb(TEXT, label)
-            if exp:
-                line += rgb(DIM, "  (" + exp + ")")
-            lines.append(line)
-        lines.append("")
-    else:
-        lines += [rgb(DIM, "No saved accounts yet."), ""]
-    lines += [
-        rgb(WARN_C, "[R]") + rgb(DIM, " re-login current account       ")
-        + rgb(WARN_C, "[A]") + rgb(DIM, " add account"),
-        rgb(DIM, "(both run `claude auth login`, suspending the dashboard"),
-        rgb(DIM, "for an interactive sign-in)"),
-        "",
-        rgb(DIM, "esc / click outside to cancel"),
-    ]
-    return panel("SWITCH ACCOUNT", lines, inner)
+    cur_slug = current_account_slug()
+
+    content = [rgb(DIM, "ACCOUNT".ljust(aw) + "EXPIRY".ljust(ew)
+                   + "STATUS".ljust(sw) + "ACTION".ljust(cw))]
+    regions = []
+    if not saved:
+        content.append(rgb(DIM, "No saved accounts yet."))
+    for slug, label, exp in saved:
+        is_cur = slug == cur_slug
+        status_plain = "Current" if is_cur else "[Select]"
+        action_plain = "[Re-login]"
+        row = (rgb(TEXT, _clip(label, aw - 1).ljust(aw))
+               + rgb(DIM, (exp or "-").ljust(ew))
+               + (rgb(ACCENT, status_plain.ljust(sw), bold=True) if is_cur
+                  else rgb(WARN_C, status_plain.ljust(sw)))
+               + rgb(WARN_C, action_plain.ljust(cw)))
+        content.append(row)
+        li = len(content)
+        status_start, action_start = aw + ew, aw + ew + sw
+        if not is_cur:
+            regions.append((li, status_start + 1, status_start + len(status_plain),
+                             f"__acctsel__{slug}"))
+        regions.append((li, action_start + 1, action_start + len(action_plain),
+                         f"__acctrelogin__{slug}"))
+    content.append("")
+    content.append(rgb(WARN_C, "[+] add account", bold=True))
+    regions.append((len(content), 1, inner, "__acctadd__"))
+    content.append("")
+    content.append(rgb(DIM, "esc / click outside to cancel"))
+    return panel("SWITCH ACCOUNT", content, inner), regions
 
 
 # ── live bundled-allowance usage (GET /api/oauth/usage, same as `/usage`) ─────
@@ -1727,12 +1744,32 @@ def list_saved_accounts():
     return sorted(out, key=lambda t: t[1].lower())
 
 
-def current_account_expiry():
-    """Expiry label for the live creds file, or '' if unreadable."""
+def _same_account(creds_a, creds_b):
+    """True if two full-credentials-file dicts are the same account. Compares
+    refreshToken (stable across accessToken rotation) when both have one,
+    else falls back to exact equality."""
+    ra = (creds_a.get("claudeAiOauth") or {}).get("refreshToken")
+    rb = (creds_b.get("claudeAiOauth") or {}).get("refreshToken")
+    if ra and rb:
+        return ra == rb
+    return creds_a == creds_b
+
+
+def current_account_slug():
+    """Slug of the saved account matching the live creds file, or None if the
+    live account was never snapshotted."""
     try:
-        return _expiry_label(json.load(open(CREDS_PATH)))
+        live = json.load(open(CREDS_PATH))
     except (OSError, ValueError):
-        return ""
+        return None
+    for path in sorted(glob.glob(os.path.join(ACCOUNTS_DIR, "*.json"))):
+        try:
+            creds = json.load(open(path)).get("creds") or {}
+        except (OSError, ValueError):
+            continue
+        if _same_account(live, creds):
+            return os.path.splitext(os.path.basename(path))[0]
+    return None
 
 
 def save_account_snapshot(label=None):
@@ -2682,7 +2719,7 @@ def run_live(args):
                     overlay = render_help(now, cols, rows)
                     okey = "help"
                 elif show_login:
-                    overlay = render_login_confirm(now, cols, rows)
+                    overlay, overlay_regions = render_login_confirm(now, cols, rows)
                     okey = "login"
                 elif show_uerr:
                     overlay = render_usage_error(now, cols, rows)
@@ -2823,11 +2860,13 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     requests quit.
 
     'g'/'G', a click on the account string / footer "G login", or [L] in the
-    usage-error overlay open the SWITCH ACCOUNT modal (show_login). There, a
-    digit 1-9 picks a saved account (sets do_switch, instant — no TUI suspend
-    needed since it's just a file swap); 'R'/'A' re-login current / add new
-    account (both set do_login, disruptive — suspend the TUI for interactive
-    `claude auth login`); anything else cancels.
+    usage-error overlay open the SWITCH ACCOUNT modal (show_login) — a table
+    of saved accounts. There, a digit / a row's [Select] click picks a saved
+    account (sets do_switch, instant — no TUI suspend needed, it's just a
+    file swap); a row's [Re-login] click (or 'R' for the current account)
+    sets do_switch + do_login; '+' / a row's [+] add account also sets
+    do_login alone — both do_login paths are disruptive, suspending the TUI
+    for interactive `claude auth login`; anything else cancels.
 
     Returns (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
     show_uerr, show_login, show_history, quit_flag, scroll_delta, do_login,
@@ -2866,6 +2905,16 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
                 show_login = True          # confirm before the disruptive login
                 focus_sid = focus_bucket = panel_view = None
                 show_uerr = False
+            elif hit and hit.startswith("__acctsel__"):   # SWITCH ACCOUNT [Select]
+                do_switch = hit[len("__acctsel__"):]
+                show_login = False
+            elif hit and hit.startswith("__acctrelogin__"):  # SWITCH ACCOUNT [Re-login]
+                do_switch = hit[len("__acctrelogin__"):]
+                do_login = True
+                show_login = False
+            elif hit == "__acctadd__":     # SWITCH ACCOUNT [+] add account
+                do_login = True
+                show_login = False
             elif hit in ("__history__", "__live__"):   # Live/History tab or span
                 show_history = (hit == "__history__")
                 focus_sid = focus_bucket = panel_view = None
@@ -2901,8 +2950,8 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
         show_help = not show_help
     # Key priority chain (one owner per pass):
     #  · switch-account modal owns the keyboard: digit picks a saved account,
-    #    R/A re-login current / add new, anything else (N handled by the
-    #    q/esc block below) cancels.
+    #    R re-logs in the current account, + adds a new one, anything else
+    #    (N handled by the q/esc block below) cancels.
     #  · else 'g'/'G' opens that modal — the standing switch-account accelerator
     #    (also the footer "G login" and the clickable account string top-right).
     #  · else the usage-error overlay takes R (retry) / L (login), short-circuiting
@@ -2914,8 +2963,12 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
         if digit and int(digit) <= len(saved):
             do_switch = saved[int(digit) - 1][0]
             show_login = False
-        elif "a" in rest or "A" in rest or "r" in rest or "R" in rest:
-            do_login = True          # re-login current or add new — same flow
+        elif "+" in rest:               # [+] add account
+            do_login = True
+            show_login = False
+        elif "r" in rest or "R" in rest:   # re-login current account, if saved
+            do_switch = current_account_slug()
+            do_login = True
             show_login = False
         elif "n" in rest or "N" in rest:
             show_login = False
