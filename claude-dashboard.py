@@ -331,16 +331,18 @@ def model_max_window(model):
     # Max context a model CAN do. FINDING (2026-06): the 1M context is a per-
     # request beta header, NOT a model property — it's stripped from the logged
     # model id, absent from every usage/beta field, and not queryable via any
-    # API after the fact. So we grade against the model's *capability*: Opus and
-    # Sonnet 4.x support the 1M beta -> grade at 1M (a real 1M session then never
-    # false-flashes at 175k); Haiku / older / unknown cap at 200k. Trade-off: an
-    # Opus/Sonnet run in plain 200k mode under-warns (won't alarm near its 200k
-    # wall) — acceptable, since the 1M beta is opt-in and the alarm is for big
-    # contexts.
+    # API after the fact. So we grade against the model's *capability*: any
+    # Opus or Sonnet generation supports the 1M beta -> grade at 1M (a real 1M
+    # session then never false-flashes at 175k); Haiku caps at 200k. Trade-off:
+    # an Opus/Sonnet run in plain 200k mode under-warns (won't alarm near its
+    # 200k wall) — acceptable, since the 1M beta is opt-in and the alarm is for
+    # big contexts.
     if not model:
         return 200_000
     m = model.lower()
-    if ("opus" in m or "sonnet" in m) and "-4" in m:
+    if "haiku" in m:
+        return 200_000
+    if "opus" in m or "sonnet" in m:
         return 1_000_000
     return 200_000
 
