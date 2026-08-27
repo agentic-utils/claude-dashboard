@@ -1908,6 +1908,33 @@ def switch_account(slug):
     return True
 
 
+def _cylon_wait(proc, interval=0.08, width=20):
+    """Scan a Cylon-style bar on the terminal's last row while proc runs.
+
+    `claude auth login` prints its own prompt once, then goes quiet during the
+    browser/OAuth round trip — this bar is the only sign the click did
+    anything during that gap."""
+    try:
+        rows = os.get_terminal_size().lines
+    except OSError:
+        proc.wait()
+        return
+    pos, step = 0, 1
+    try:
+        while proc.poll() is None:
+            bar = "░" * pos + "█" + "░" * (width - pos - 1)
+            sys.stdout.write(f"\0337\033[{rows};1H\033[K{bar} logging in...\0338")
+            sys.stdout.flush()
+            time.sleep(interval)
+            pos += step
+            if pos <= 0 or pos >= width - 1:
+                step = -step
+    finally:
+        proc.wait()
+        sys.stdout.write(f"\0337\033[{rows};1H\033[K\0338")
+        sys.stdout.flush()
+
+
 def run_login(fd, old_term):
     """Suspend the TUI, run interactive `claude auth login`, then resume.
 
@@ -1928,7 +1955,8 @@ def run_login(fd, old_term):
             except (termios.error, ValueError, OSError):
                 pass
         try:
-            subprocess.run(["claude", "auth", "login"])
+            proc = subprocess.Popen(["claude", "auth", "login"])
+            _cylon_wait(proc)
         except (OSError, subprocess.SubprocessError) as e:
             log.warning("run_login: claude auth login failed: %s", e)
     finally:
