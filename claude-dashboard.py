@@ -1615,7 +1615,7 @@ def render_login_confirm(now, cols, rows, login_elapsed=None):
     starts = _acct_col_starts()
     inner = starts[-1] + cw + ACCT_PAD - 0   # last column's text-end + trailing pad
     if login_elapsed is not None:
-        bar_w = min(inner - 4, 40)
+        bar_w = min(inner - 4, 20)
         bar = _cylon_bar(login_elapsed, bar_w)
         bar_pad = max(0, (inner - bar_w) // 2)
         cancel = "[Cancel]"
@@ -1806,6 +1806,41 @@ def kick_usage():
         log.info("kick_usage: skipped, refresh already in flight")
 
 
+# collect() is a synchronous filesystem scan (can run seconds on a slow disk
+# or many transcripts) — run it on a background thread so the render loop's
+# input-polling select() never blocks on it, for the first load same as every
+# periodic refresh. One in-flight scan per mode ("live"/"history"); the render
+# thread only ever reads _collect_result[mode], a (buckets, sessions) tuple
+# swapped in whole by an assignment (atomic under the GIL) — never the dict
+# collect() is still mutating, so no torn/resizing-during-iteration reads.
+_collect_inflight = {"live": threading.Lock(), "history": threading.Lock()}
+_collect_result = {}   # mode -> (buckets, sessions), last snapshot published
+
+
+def kick_collect(mode, now, window=None, bucket=None, num_buckets=None,
+                 track_models=False, track_heatmap=False):
+    """Fire a non-blocking background collect() for `mode` if one isn't
+    already running; no-op otherwise (the running scan will publish soon)."""
+    lock = _collect_inflight[mode]
+    if not lock.acquire(blocking=False):
+        return
+    prev = _collect_result.get(mode)
+    seed = dict(prev[1]) if prev else None   # thread's own copy to mutate
+
+    def publish(b, s):
+        _collect_result[mode] = (list(b), dict(s))
+
+    def run():
+        try:
+            collect(now, window, bucket, num_buckets, track_models,
+                    track_heatmap, progress_cb=publish, seed_sessions=seed)
+        except Exception:
+            log.exception("kick_collect(%s): scan failed", mode)
+        finally:
+            lock.release()
+    threading.Thread(target=run, daemon=True).start()
+
+
 def _token_stale():
     """True when the last usage fetch failed because the OAuth token is missing
     or rejected (401) — the only error `claude auth login` can fix."""
@@ -1935,7 +1970,9 @@ def switch_account(slug):
 
 CYLON_RED = (255, 30, 30)
 CYLON_TAIL = 4                 # fading trail length behind the eye
-CYLON_PERIOD = 1.6             # seconds for one full sweep (both directions equal speed)
+CYLON_PERIOD = 2.0             # seconds for one full sweep (both directions equal speed)
+CYLON_FPS = 30                 # target redraw rate while any Cylon bar is on screen
+CYLON_TICK = 1.0 / CYLON_FPS
 
 
 def _cylon_bar(elapsed, width, tail=CYLON_TAIL, period=CYLON_PERIOD):
@@ -1963,7 +2000,7 @@ def _cylon_bar(elapsed, width, tail=CYLON_TAIL, period=CYLON_PERIOD):
     return "".join(cells)
 
 
-def _cylon_wait(proc, interval=0.08, width=20):
+def _cylon_wait(proc, interval=CYLON_TICK, width=20):
     """Draw the Cylon bar on the terminal's last row while proc runs (used
     only by the suspended-terminal fallback, which has no TUI panel to draw
     into). `claude auth login` prints its own prompt once, then goes quiet
@@ -2295,19 +2332,29 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
         brand = rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, "CLAUDE CODE", bold=True)
         brand_len = 2 + len("CLAUDE CODE")
         tabs_str, tabs_len, segs = view_tabs(mode)
-        ctx = ("HISTORY · last " + fmt_window(HIST_WINDOW)
-               if mode == "history" else "live")
+        # A background scan (kick_collect) for this mode replaces "live"/
+        # "HISTORY..." with the Cylon bar — the only sign a first load or
+        # refresh is still assembling data, since it can no longer block the
+        # render loop to show that (that was the whole point of backgrounding
+        # it). Styled separately from clock/account since its per-cell ANSI
+        # resets would otherwise cut the single rgb(DIM, ...) wrap short.
+        if _collect_inflight[mode].locked():
+            ctx_styled, ctx_len = _cylon_bar(now.timestamp(), 8) + rgb(DIM, " loading"), 16
+        else:
+            ctx = ("HISTORY · last " + fmt_window(HIST_WINDOW)
+                   if mode == "history" else "live")
+            ctx_styled, ctx_len = rgb(DIM, ctx), len(ctx)
         clock = f"{local:%a %d %b · %H:%M:%S %Z}"
         # Signed-in account, far right and clickable (→ login, for switching
         # accounts). Re-read every refresh cycle by fetch_usage, so a login from
         # another terminal shows up here within one cycle. "⬢ " marks it.
         acct = _usage.get("account")
         acct_disp = ("⬢ " + acct) if acct else ""
-        right_dim = ctx + "   " + clock
-        right = rgb(DIM, right_dim)
+        right = ctx_styled + rgb(DIM, "   " + clock)
         if acct_disp:
             right += rgb(DIM, "   ") + rgb(ACCENT, acct_disp, bold=True)
-        right_len = _visible_len(right_dim) + (3 + _visible_len(acct_disp) if acct_disp else 0)
+        right_len = (ctx_len + 3 + len(clock)
+                     + (3 + _visible_len(acct_disp) if acct_disp else 0))
         BRAND_GAP = 4
         pad = max(TOTAL_WIDTH - brand_len - BRAND_GAP - tabs_len - right_len - 2, 1)
         out += [
@@ -2752,22 +2799,6 @@ def plan_layout(rows, cols, sessions, now, history=False):
     return L
 
 
-def _paint_partial(now, buckets, sessions, cols, rows, alt, mode):
-    """Repaint the base frame mid-scan, from collect()'s progress_cb - no
-    overlay/mouse handling (a scan-in-progress frame is never the one a click
-    lands on), just enough to turn "blank for N seconds" into "fills in live"."""
-    if not alt:
-        return
-    try:
-        layout = plan_layout(rows, cols, sessions, now, history=(mode == "history"))
-        frame, _ = render_frame(now, buckets, sessions, cols=cols, rows=rows,
-                                layout=layout, mode=mode)
-    except Exception:
-        return   # a mid-scan render glitch must not abort the scan itself
-    sys.stdout.write("\033[H" + frame.replace("\n", "\033[K\n") + "\033[K\033[J")
-    sys.stdout.flush()
-
-
 def run_live(args):
     log.info("dashboard start: interval=%ss tick=%ss", args.interval, TICK_SECONDS)
     alt = sys.stdout.isatty()
@@ -2862,15 +2893,20 @@ def run_live(args):
                 # OLD NUM_BUCKETS; seeding the re-collect with them would carry
                 # forward mismatched-size arrays until each is re-touched. A
                 # resize is rare and already a visible discontinuity, so just
-                # drop them rather than add bucket-resizing logic for it.
+                # drop them (and any in-flight scan's stale-sized publish, on
+                # the rare chance one lands before the fresh kick below)
+                # rather than add bucket-resizing logic for it.
                 sessions, hist_sessions = {}, {}
-            # Heavy transcript scan only every --interval; allowance more often.
+                buckets, hist_buckets = [empty_bucket() for _ in range(NUM_BUCKETS)], []
+                _collect_result.pop("live", None)
+                _collect_result.pop("history", None)
+            # Heavy transcript scan only every --interval; runs in the
+            # background (kick_collect) so this loop's input-polling select()
+            # below is never blocked by a slow scan — first load included.
             if last_collect is None or (now - last_collect).total_seconds() >= args.interval:
-                buckets, sessions = collect(
-                    now, progress_cb=lambda b, s: _paint_partial(
-                        now, b, s, cols, rows, alt, "live"),
-                    seed_sessions=sessions)
+                kick_collect("live", now)
                 last_collect = now
+            buckets, sessions = _collect_result.get("live", (buckets, sessions))
             # Refresh allowance every USAGE_REFRESH; a failed fetch sets a
             # retry_at (USAGE_BACKOFF out), so a non-2xx makes us wait instead of
             # hammering. Honour that countdown before the normal cadence.
@@ -2891,13 +2927,12 @@ def run_live(args):
             if show_history:
                 if (last_hist_collect is None
                         or (now - last_hist_collect).total_seconds() >= args.interval):
-                    hist_buckets, hist_sessions = collect(
-                        now, HIST_WINDOW, HIST_BUCKET, HIST_NUM_BUCKETS,
-                        track_models=True, track_heatmap=True,
-                        progress_cb=lambda b, s: _paint_partial(
-                            now, b, s, cols, rows, alt, "history"),
-                        seed_sessions=hist_sessions)
+                    kick_collect("history", now, HIST_WINDOW, HIST_BUCKET,
+                                 HIST_NUM_BUCKETS, track_models=True,
+                                 track_heatmap=True)
                     last_hist_collect = now
+                hist_buckets, hist_sessions = _collect_result.get(
+                    "history", (hist_buckets, hist_sessions))
                 cur_buckets, cur_sessions = hist_buckets, hist_sessions
                 layout = (plan_layout(rows, cols, hist_sessions, now,
                                       history=True) if alt else None)
@@ -3004,8 +3039,15 @@ def run_live(args):
             anim += 1
 
             # Input-aware wait: wake early on a click/keypress for ≤1-tick latency.
+            # A Cylon bar is on screen (login popup, or the header's scanning
+            # indicator) needs a reliable 30fps redraw, well above the normal
+            # 5fps shimmer cadence — narrow the wait just for that window.
+            cylon_active = (login_proc is not None
+                            or _collect_inflight["history" if show_history
+                                                 else "live"].locked())
             if alt and old_term is not None:
-                r, _, _ = select.select([sys.stdin], [], [], TICK_SECONDS)
+                r, _, _ = select.select([sys.stdin], [], [],
+                                        CYLON_TICK if cylon_active else TICK_SECONDS)
                 if r:
                     try:
                         data = os.read(fd, 4096).decode("utf-8", "ignore")
