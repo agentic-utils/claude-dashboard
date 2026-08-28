@@ -1592,6 +1592,42 @@ def _acct_row(cells):
                      for text, w, color, bold in cells)
 
 
+def _progress_content(inner, elapsed, label, cancel_token=None):
+    """Shared 'still working' body: centered label, centered Cylon bar, and
+    (if cancel_token given) a clickable [Cancel] link plus a dismiss hint.
+    Returns (content_lines, regions) for panel(...)."""
+    bar_w = min(inner - 4, 20)
+    bar = _cylon_bar(elapsed, bar_w)
+    bar_pad = max(0, (inner - bar_w) // 2)
+    content = [
+        "",
+        rgb(TEXT, label.center(inner), bold=True),
+        "", " " * bar_pad + bar, "",
+    ]
+    regions = []
+    if cancel_token is not None:
+        cancel = "[Cancel]"
+        cancel_pad = max(0, (inner - len(cancel)) // 2)
+        content.append(" " * cancel_pad + rgb(WARN_C, cancel, bold=True))
+        regions.append((len(content), cancel_pad + 1, cancel_pad + len(cancel),
+                        cancel_token))
+        content += ["", rgb(DIM, "esc / click outside also cancels".center(inner))]
+    return content, regions
+
+
+def render_loading(now, cols, rows, elapsed):
+    """Full-screen-modal 'assembling data' popup for the very first transcript
+    scan (kick_collect("live", ...)) — the only time there's nothing else on
+    screen to show progress. Never shown again after that first scan finishes;
+    later refreshes run in the background with no popup (they don't block
+    input any more, so there's nothing to explain)."""
+    starts = _acct_col_starts()
+    inner = starts[-1] + ACCT_COL_W[-1] + ACCT_PAD
+    content, regions = _progress_content(
+        inner, elapsed, "Assembling data from your Claude Code history…")
+    return panel("LOADING", content, inner), regions
+
+
 def render_login_confirm(now, cols, rows, login_elapsed=None):
     """Account-switch modal: a table of saved accounts, one row each. Status
     is 'Current' (that row's account is the live one) or a '[Select]' link
@@ -1615,17 +1651,8 @@ def render_login_confirm(now, cols, rows, login_elapsed=None):
     starts = _acct_col_starts()
     inner = starts[-1] + cw + ACCT_PAD - 0   # last column's text-end + trailing pad
     if login_elapsed is not None:
-        bar_w = min(inner - 4, 20)
-        bar = _cylon_bar(login_elapsed, bar_w)
-        bar_pad = max(0, (inner - bar_w) // 2)
-        cancel = "[Cancel]"
-        cancel_pad = max(0, (inner - len(cancel)) // 2)
-        content = ["", rgb(TEXT, "Logging in…".center(inner), bold=True),
-                   "", " " * bar_pad + bar, ""]
-        content.append(" " * cancel_pad + rgb(WARN_C, cancel, bold=True))
-        regions = [(len(content), cancel_pad + 1, cancel_pad + len(cancel),
-                    "__logincancel__")]
-        content += ["", rgb(DIM, "esc / click outside also cancels".center(inner))]
+        content, regions = _progress_content(
+            inner, login_elapsed, "Logging in…", cancel_token="__logincancel__")
         return panel("SWITCH ACCOUNT", content, inner), regions
     saved = list_saved_accounts()
     cur_slug = current_account_slug()
@@ -2332,29 +2359,19 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
         brand = rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, "CLAUDE CODE", bold=True)
         brand_len = 2 + len("CLAUDE CODE")
         tabs_str, tabs_len, segs = view_tabs(mode)
-        # A background scan (kick_collect) for this mode replaces "live"/
-        # "HISTORY..." with the Cylon bar — the only sign a first load or
-        # refresh is still assembling data, since it can no longer block the
-        # render loop to show that (that was the whole point of backgrounding
-        # it). Styled separately from clock/account since its per-cell ANSI
-        # resets would otherwise cut the single rgb(DIM, ...) wrap short.
-        if _collect_inflight[mode].locked():
-            ctx_styled, ctx_len = _cylon_bar(now.timestamp(), 8) + rgb(DIM, " loading"), 16
-        else:
-            ctx = ("HISTORY · last " + fmt_window(HIST_WINDOW)
-                   if mode == "history" else "live")
-            ctx_styled, ctx_len = rgb(DIM, ctx), len(ctx)
+        ctx = ("HISTORY · last " + fmt_window(HIST_WINDOW)
+               if mode == "history" else "live")
         clock = f"{local:%a %d %b · %H:%M:%S %Z}"
         # Signed-in account, far right and clickable (→ login, for switching
         # accounts). Re-read every refresh cycle by fetch_usage, so a login from
         # another terminal shows up here within one cycle. "⬢ " marks it.
         acct = _usage.get("account")
         acct_disp = ("⬢ " + acct) if acct else ""
-        right = ctx_styled + rgb(DIM, "   " + clock)
+        right_dim = ctx + "   " + clock
+        right = rgb(DIM, right_dim)
         if acct_disp:
             right += rgb(DIM, "   ") + rgb(ACCENT, acct_disp, bold=True)
-        right_len = (ctx_len + 3 + len(clock)
-                     + (3 + _visible_len(acct_disp) if acct_disp else 0))
+        right_len = _visible_len(right_dim) + (3 + _visible_len(acct_disp) if acct_disp else 0)
         BRAND_GAP = 4
         pad = max(TOTAL_WIDTH - brand_len - BRAND_GAP - tabs_len - right_len - 2, 1)
         out += [
@@ -2844,6 +2861,8 @@ def run_live(args):
     show_login = False           # login confirmation modal
     login_proc = None            # Popen of an in-progress `claude auth login`
     login_started = None         # time.monotonic() it was started
+    first_load_done = False      # gates the LOADING popup to the first-ever scan
+    loading_started = time.monotonic()
     overlay_scroll = 0
     prev_okey = None
     mouse_re = re.compile(r"\033\[<(\d+);(\d+);(\d+)([Mm])")
@@ -2907,6 +2926,8 @@ def run_live(args):
                 kick_collect("live", now)
                 last_collect = now
             buckets, sessions = _collect_result.get("live", (buckets, sessions))
+            if not first_load_done and not _collect_inflight["live"].locked():
+                first_load_done = True   # first scan ever finished: LOADING never shows again
             # Refresh allowance every USAGE_REFRESH; a failed fetch sets a
             # retry_at (USAGE_BACKOFF out), so a non-2xx makes us wait instead of
             # hammering. Honour that countdown before the normal cadence.
@@ -2956,11 +2977,16 @@ def run_live(args):
                 focus_sid = focus_bucket = None
                 frame = render_too_small(cols, rows, 9)
             if alt:
-                # One overlay at a time: help > login-confirm > usage-error >
-                # session > bucket > panel popup. overlay_regions carries a modal
-                # popup's clickable spans (relative to the box); translated below.
+                # One overlay at a time: loading > help > login-confirm >
+                # usage-error > session > bucket > panel popup. overlay_regions
+                # carries a modal popup's clickable spans (relative to the
+                # box); translated below.
                 overlay, okey, overlay_regions = None, None, []
-                if show_help:
+                if not first_load_done:
+                    overlay, overlay_regions = render_loading(
+                        now, cols, rows, time.monotonic() - loading_started)
+                    okey = "loading"
+                elif show_help:
                     overlay = render_help(now, cols, rows)
                     okey = "help"
                 elif show_login:
@@ -3039,12 +3065,10 @@ def run_live(args):
             anim += 1
 
             # Input-aware wait: wake early on a click/keypress for ≤1-tick latency.
-            # A Cylon bar is on screen (login popup, or the header's scanning
-            # indicator) needs a reliable 30fps redraw, well above the normal
-            # 5fps shimmer cadence — narrow the wait just for that window.
-            cylon_active = (login_proc is not None
-                            or _collect_inflight["history" if show_history
-                                                 else "live"].locked())
+            # A Cylon bar is on screen (LOADING or login popup) needs a
+            # reliable 30fps redraw, well above the normal 5fps shimmer
+            # cadence — narrow the wait just for that window.
+            cylon_active = login_proc is not None or not first_load_done
             if alt and old_term is not None:
                 r, _, _ = select.select([sys.stdin], [], [],
                                         CYLON_TICK if cylon_active else TICK_SECONDS)
