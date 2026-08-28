@@ -3052,8 +3052,12 @@ def run_live(args):
                     # base→overlay every frame). Freezing the base kills the
                     # flicker; the base shimmer just pauses while an overlay is up.
                     # Overlay lines are padded to a constant width so each redraw
-                    # fully overwrites the previous one without an intervening clear.
-                    if okey != prev_okey:
+                    # fully overwrites the previous one without an intervening
+                    # clear. Exception: "loading" — the whole point is watching
+                    # sessions/bars fill in live behind the popup, so it repaints
+                    # every tick despite the (accepted, matches the old pre-popup
+                    # progressive-fill look) flicker risk that guards against.
+                    if okey != prev_okey or okey == "loading":
                         body = "\033[H" + frame.replace("\n", "\033[K\n") + "\033[K\033[J"
                         sys.stdout.write(body)
                     for k, pl in enumerate(overlay):
