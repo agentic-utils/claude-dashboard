@@ -233,6 +233,9 @@ TICK_SECONDS = 0.2                  # repaint cadence (shimmer animation @5fps)
 PROGRESS_INTERVAL = 0.15            # collect()'s in-scan progress_cb cadence
 USAGE_REFRESH = 300                 # seconds between live-usage refetches
 USAGE_BACKOFF = 900                 # after a 429, wait this long before retrying
+LOGIN_INLINE_TIMEOUT = 45           # give inline (no-suspend) login this long before
+                                     # falling back to a real tty (SSO flows that need
+                                     # keyboard input would otherwise hang forever silently)
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "claude-dashboard.log")
@@ -1935,7 +1938,58 @@ def _cylon_wait(proc, interval=0.08, width=20):
         sys.stdout.flush()
 
 
+def _cylon_wait_inline(proc, timeout, interval=0.08, width=20):
+    """Draw a Cylon bar inside the dashboard's own alt-screen while proc runs,
+    without suspending the terminal. Returns True if proc finished before
+    timeout, False if it's still running (caller decides what to do then)."""
+    try:
+        rows, cols = os.get_terminal_size()
+    except OSError:
+        rows, cols = 24, 80
+    row, col0 = rows // 2, max(1, (cols - width - 14) // 2)
+    deadline = time.monotonic() + timeout
+    pos, step = 0, 1
+    while proc.poll() is None:
+        if time.monotonic() >= deadline:
+            return False
+        bar = "░" * pos + "█" + "░" * (width - pos - 1)
+        sys.stdout.write(f"\033[{row};{col0}H\033[7m LOGGING IN {bar} \033[0m")
+        sys.stdout.flush()
+        time.sleep(interval)
+        pos += step
+        if pos <= 0 or pos >= width - 1:
+            step = -step
+    return True
+
+
 def run_login(fd, old_term):
+    """Log in without leaving the dashboard view when possible.
+
+    `claude auth login` is a browser/OAuth flow that normally needs no
+    keyboard input, so it's run with stdin closed and polled inline (Cylon
+    bar drawn over the dashboard, alt-screen never left). If it hasn't
+    finished within LOGIN_INLINE_TIMEOUT — an SSO variant that does need
+    input would otherwise hang forever with stdin closed — kill it and retry
+    with a real suspended terminal so it can prompt normally."""
+    try:
+        proc = subprocess.Popen(["claude", "auth", "login"],
+                                 stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("run_login: claude auth login failed: %s", e)
+        return
+    if _cylon_wait_inline(proc, LOGIN_INLINE_TIMEOUT):
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    _run_login_suspended(fd, old_term)
+
+
+def _run_login_suspended(fd, old_term):
     """Suspend the TUI, run interactive `claude auth login`, then resume.
 
     Mirrors main()'s terminal enter/exit (alt-screen, SGR mouse, cbreak) so the
@@ -2933,7 +2987,7 @@ def run_live(args):
                         switch_account(do_switch)   # file swap, no TUI suspend
                         kick_usage()
                     if do_login:
-                        run_login(fd, old_term)   # suspends + resumes the TUI
+                        run_login(fd, old_term)   # inline, or suspends+resumes on timeout
                         save_account_snapshot()  # persist the newly added account
                         kick_usage()              # pick up the fresh token now
                         prev_okey = None          # force a full repaint on resume
