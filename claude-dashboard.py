@@ -44,6 +44,9 @@ estimate and cache-hit rate, and click-a-bar drill-down. No active-sessions or
 allowance panels there.
 
 Stdlib only. --once prints a single frame; --interval overrides the period.
+
+Flags can also be set in .claude-dashboard.rc, next to this script (one flag
+per line, '#' comments OK) - CLI flags given at the command line override it.
 """
 
 from __future__ import annotations
@@ -56,6 +59,7 @@ import math
 import os
 import re
 import select
+import shlex
 import subprocess
 import sys
 import termios
@@ -239,6 +243,8 @@ LOGIN_INLINE_TIMEOUT = 45           # give inline (no-suspend) login this long b
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "claude-dashboard.log")
+RC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        ".claude-dashboard.rc")
 logging.basicConfig(filename=LOG_PATH, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ccmon")
@@ -2533,9 +2539,20 @@ def refit_width(cols):
     return True
 
 
+class _ArgumentParser(argparse.ArgumentParser):
+    """One flag (optionally with a quoted value) per line; blank lines and
+    '#' comments ignored. Used for RC_PATH via fromfile_prefix_chars."""
+    def convert_arg_line_to_args(self, line):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            return []
+        return shlex.split(line)
+
+
 def main():
-    ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = _ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        fromfile_prefix_chars="@")
     ap.add_argument("--once", action="store_true", help="render one frame and exit")
     ap.add_argument("--interval", type=int, default=None, metavar="SECONDS",
                     help="seconds between transcript refreshes "
@@ -2570,7 +2587,8 @@ def main():
                          f"{os.pathsep!r}-delimited (Python's os.pathsep on this "
                          "host: ';' on Windows, ':' on POSIX). No default - "
                          "nothing is excluded unless given.")
-    args = ap.parse_args()
+    argv = (["@" + RC_PATH] if os.path.isfile(RC_PATH) else []) + sys.argv[1:]
+    args = ap.parse_args(argv)
 
     if args.exclude:
         EXCLUDE_PATTERNS.extend(
