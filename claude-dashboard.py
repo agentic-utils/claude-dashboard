@@ -813,6 +813,29 @@ def _clip(s, width):
     return "".join(out)
 
 
+def _slice_from(s, start):
+    """Visible chars of a (possibly ANSI-styled) string from column `start`
+    onward: skips `start` visible chars, then re-emits the last SGR code seen
+    so the remainder keeps its color instead of falling back to the
+    terminal's default. Pairs with _clip (the [0, start) prefix) to carve a
+    middle span — e.g. a modal overlay's rectangle — out of a line so a
+    repaint can skip it without touching those columns at all."""
+    if start <= 0:
+        return s
+    vis, i, active = 0, 0, ""
+    while i < len(s) and vis < start:
+        if s[i] == "\033":
+            j = i
+            while j < len(s) and s[j] != "m":
+                j += 1
+            active = s[i:j + 1]
+            i = j + 1
+        else:
+            vis += 1
+            i += 1
+    return active + s[i:]
+
+
 def fit_overlay(lines, cols, rows, scroll):
     """Fit a bordered modal into the terminal. Clips every line to the width;
     when the modal is taller than the screen, pins the top and bottom border
@@ -3046,20 +3069,30 @@ def run_live(args):
                         hits = [(row0 + li, col0 + lo, col0 + hi, tok)
                                 for li, lo, hi, tok in overlay_regions]
                     # Paint the base ONCE when the overlay opens or switches, then
-                    # only redraw the overlay box in place each tick. Repainting
-                    # the whole base every tick under the overlay — with its full-
-                    # screen clear — is what made it flicker (the region flashed
-                    # base→overlay every frame). Freezing the base kills the
-                    # flicker; the base shimmer just pauses while an overlay is up.
-                    # Overlay lines are padded to a constant width so each redraw
-                    # fully overwrites the previous one without an intervening
-                    # clear. Exception: "loading" — the whole point is watching
-                    # sessions/bars fill in live behind the popup, so it repaints
-                    # every tick despite the (accepted, matches the old pre-popup
-                    # progressive-fill look) flicker risk that guards against.
+                    # only redraw the overlay box in place each tick — repainting
+                    # the whole base every tick under the overlay used to flicker
+                    # it (a base write covering the overlay's own rows, followed
+                    # a moment later by the overlay redraw covering them again).
+                    # Exception: "loading" repaints the base every tick regardless
+                    # (the whole point is watching sessions/bars fill in live
+                    # behind the popup) — but does it via _clip/_slice_from so
+                    # the overlay's own rectangle is never in that base write at
+                    # all, just the flanking columns; only the overlay-redraw
+                    # loop below ever touches those cells, so there's nothing
+                    # left to flicker.
                     if okey != prev_okey or okey == "loading":
-                        body = "\033[H" + frame.replace("\n", "\033[K\n") + "\033[K\033[J"
-                        sys.stdout.write(body)
+                        r0, r1 = row0, row0 + oh - 1
+                        c0, c1 = col0 - 1, col0 - 1 + ow   # overlay's visible-col span
+                        parts = []
+                        for li, ln in enumerate(frame.split("\n")):
+                            r = li + 1
+                            if r0 <= r <= r1:
+                                parts.append(f"\033[{r};1H" + _clip(ln, c0)
+                                             + f"\033[{r};{c1 + 1}H"
+                                             + _slice_from(ln, c1) + "\033[K")
+                            else:
+                                parts.append(f"\033[{r};1H" + ln + "\033[K")
+                        sys.stdout.write("".join(parts) + "\033[J")
                     for k, pl in enumerate(overlay):
                         sys.stdout.write(f"\033[{row0 + k};{col0}H" + _padcol(pl, ow))
                 prev_okey = okey
