@@ -813,6 +813,29 @@ def _clip(s, width):
     return "".join(out)
 
 
+def _slice_from(s, start):
+    """Visible chars of a (possibly ANSI-styled) string from column `start`
+    onward: skips `start` visible chars, then re-emits the last SGR code seen
+    so the remainder keeps its color instead of falling back to the
+    terminal's default. Pairs with _clip (the [0, start) prefix) to carve a
+    middle span — e.g. a modal overlay's rectangle — out of a line so a
+    repaint can skip it without touching those columns at all."""
+    if start <= 0:
+        return s
+    vis, i, active = 0, 0, ""
+    while i < len(s) and vis < start:
+        if s[i] == "\033":
+            j = i
+            while j < len(s) and s[j] != "m":
+                j += 1
+            active = s[i:j + 1]
+            i = j + 1
+        else:
+            vis += 1
+            i += 1
+    return active + s[i:]
+
+
 def fit_overlay(lines, cols, rows, scroll):
     """Fit a bordered modal into the terminal. Clips every line to the width;
     when the modal is taller than the screen, pins the top and bottom border
@@ -1592,6 +1615,42 @@ def _acct_row(cells):
                      for text, w, color, bold in cells)
 
 
+def _progress_content(inner, elapsed, label, cancel_token=None):
+    """Shared 'still working' body: centered label, centered Cylon bar, and
+    (if cancel_token given) a clickable [Cancel] link plus a dismiss hint.
+    Returns (content_lines, regions) for panel(...)."""
+    bar_w = min(inner - 4, 20)
+    bar = _cylon_bar(elapsed, bar_w)
+    bar_pad = max(0, (inner - bar_w) // 2)
+    content = [
+        "",
+        rgb(TEXT, label.center(inner), bold=True),
+        "", " " * bar_pad + bar, "",
+    ]
+    regions = []
+    if cancel_token is not None:
+        cancel = "[Cancel]"
+        cancel_pad = max(0, (inner - len(cancel)) // 2)
+        content.append(" " * cancel_pad + rgb(WARN_C, cancel, bold=True))
+        regions.append((len(content), cancel_pad + 1, cancel_pad + len(cancel),
+                        cancel_token))
+        content += ["", rgb(DIM, "esc / click outside also cancels".center(inner))]
+    return content, regions
+
+
+def render_loading(now, cols, rows, elapsed):
+    """Full-screen-modal 'assembling data' popup for the very first transcript
+    scan (kick_collect("live", ...)) — the only time there's nothing else on
+    screen to show progress. Never shown again after that first scan finishes;
+    later refreshes run in the background with no popup (they don't block
+    input any more, so there's nothing to explain)."""
+    starts = _acct_col_starts()
+    inner = starts[-1] + ACCT_COL_W[-1] + ACCT_PAD
+    content, regions = _progress_content(
+        inner, elapsed, "Assembling data from your Claude Code history…")
+    return panel("LOADING", content, inner), regions
+
+
 def render_login_confirm(now, cols, rows, login_elapsed=None):
     """Account-switch modal: a table of saved accounts, one row each. Status
     is 'Current' (that row's account is the live one) or a '[Select]' link
@@ -1615,17 +1674,8 @@ def render_login_confirm(now, cols, rows, login_elapsed=None):
     starts = _acct_col_starts()
     inner = starts[-1] + cw + ACCT_PAD - 0   # last column's text-end + trailing pad
     if login_elapsed is not None:
-        bar_w = min(inner - 4, 40)
-        bar = _cylon_bar(login_elapsed, bar_w)
-        bar_pad = max(0, (inner - bar_w) // 2)
-        cancel = "[Cancel]"
-        cancel_pad = max(0, (inner - len(cancel)) // 2)
-        content = ["", rgb(TEXT, "Logging in…".center(inner), bold=True),
-                   "", " " * bar_pad + bar, ""]
-        content.append(" " * cancel_pad + rgb(WARN_C, cancel, bold=True))
-        regions = [(len(content), cancel_pad + 1, cancel_pad + len(cancel),
-                    "__logincancel__")]
-        content += ["", rgb(DIM, "esc / click outside also cancels".center(inner))]
+        content, regions = _progress_content(
+            inner, login_elapsed, "Logging in…", cancel_token="__logincancel__")
         return panel("SWITCH ACCOUNT", content, inner), regions
     saved = list_saved_accounts()
     cur_slug = current_account_slug()
@@ -1806,6 +1856,41 @@ def kick_usage():
         log.info("kick_usage: skipped, refresh already in flight")
 
 
+# collect() is a synchronous filesystem scan (can run seconds on a slow disk
+# or many transcripts) — run it on a background thread so the render loop's
+# input-polling select() never blocks on it, for the first load same as every
+# periodic refresh. One in-flight scan per mode ("live"/"history"); the render
+# thread only ever reads _collect_result[mode], a (buckets, sessions) tuple
+# swapped in whole by an assignment (atomic under the GIL) — never the dict
+# collect() is still mutating, so no torn/resizing-during-iteration reads.
+_collect_inflight = {"live": threading.Lock(), "history": threading.Lock()}
+_collect_result = {}   # mode -> (buckets, sessions), last snapshot published
+
+
+def kick_collect(mode, now, window=None, bucket=None, num_buckets=None,
+                 track_models=False, track_heatmap=False):
+    """Fire a non-blocking background collect() for `mode` if one isn't
+    already running; no-op otherwise (the running scan will publish soon)."""
+    lock = _collect_inflight[mode]
+    if not lock.acquire(blocking=False):
+        return
+    prev = _collect_result.get(mode)
+    seed = dict(prev[1]) if prev else None   # thread's own copy to mutate
+
+    def publish(b, s):
+        _collect_result[mode] = (list(b), dict(s))
+
+    def run():
+        try:
+            collect(now, window, bucket, num_buckets, track_models,
+                    track_heatmap, progress_cb=publish, seed_sessions=seed)
+        except Exception:
+            log.exception("kick_collect(%s): scan failed", mode)
+        finally:
+            lock.release()
+    threading.Thread(target=run, daemon=True).start()
+
+
 def _token_stale():
     """True when the last usage fetch failed because the OAuth token is missing
     or rejected (401) — the only error `claude auth login` can fix."""
@@ -1935,7 +2020,9 @@ def switch_account(slug):
 
 CYLON_RED = (255, 30, 30)
 CYLON_TAIL = 4                 # fading trail length behind the eye
-CYLON_PERIOD = 1.6             # seconds for one full sweep (both directions equal speed)
+CYLON_PERIOD = 2.0             # seconds for one full sweep (both directions equal speed)
+CYLON_FPS = 30                 # target redraw rate while any Cylon bar is on screen
+CYLON_TICK = 1.0 / CYLON_FPS
 
 
 def _cylon_bar(elapsed, width, tail=CYLON_TAIL, period=CYLON_PERIOD):
@@ -1963,7 +2050,7 @@ def _cylon_bar(elapsed, width, tail=CYLON_TAIL, period=CYLON_PERIOD):
     return "".join(cells)
 
 
-def _cylon_wait(proc, interval=0.08, width=20):
+def _cylon_wait(proc, interval=CYLON_TICK, width=20):
     """Draw the Cylon bar on the terminal's last row while proc runs (used
     only by the suspended-terminal fallback, which has no TUI panel to draw
     into). `claude auth login` prints its own prompt once, then goes quiet
@@ -2752,22 +2839,6 @@ def plan_layout(rows, cols, sessions, now, history=False):
     return L
 
 
-def _paint_partial(now, buckets, sessions, cols, rows, alt, mode):
-    """Repaint the base frame mid-scan, from collect()'s progress_cb - no
-    overlay/mouse handling (a scan-in-progress frame is never the one a click
-    lands on), just enough to turn "blank for N seconds" into "fills in live"."""
-    if not alt:
-        return
-    try:
-        layout = plan_layout(rows, cols, sessions, now, history=(mode == "history"))
-        frame, _ = render_frame(now, buckets, sessions, cols=cols, rows=rows,
-                                layout=layout, mode=mode)
-    except Exception:
-        return   # a mid-scan render glitch must not abort the scan itself
-    sys.stdout.write("\033[H" + frame.replace("\n", "\033[K\n") + "\033[K\033[J")
-    sys.stdout.flush()
-
-
 def run_live(args):
     log.info("dashboard start: interval=%ss tick=%ss", args.interval, TICK_SECONDS)
     alt = sys.stdout.isatty()
@@ -2813,6 +2884,8 @@ def run_live(args):
     show_login = False           # login confirmation modal
     login_proc = None            # Popen of an in-progress `claude auth login`
     login_started = None         # time.monotonic() it was started
+    first_load_done = False      # gates the LOADING popup to the first-ever scan
+    loading_started = time.monotonic()
     overlay_scroll = 0
     prev_okey = None
     mouse_re = re.compile(r"\033\[<(\d+);(\d+);(\d+)([Mm])")
@@ -2862,15 +2935,22 @@ def run_live(args):
                 # OLD NUM_BUCKETS; seeding the re-collect with them would carry
                 # forward mismatched-size arrays until each is re-touched. A
                 # resize is rare and already a visible discontinuity, so just
-                # drop them rather than add bucket-resizing logic for it.
+                # drop them (and any in-flight scan's stale-sized publish, on
+                # the rare chance one lands before the fresh kick below)
+                # rather than add bucket-resizing logic for it.
                 sessions, hist_sessions = {}, {}
-            # Heavy transcript scan only every --interval; allowance more often.
+                buckets, hist_buckets = [empty_bucket() for _ in range(NUM_BUCKETS)], []
+                _collect_result.pop("live", None)
+                _collect_result.pop("history", None)
+            # Heavy transcript scan only every --interval; runs in the
+            # background (kick_collect) so this loop's input-polling select()
+            # below is never blocked by a slow scan — first load included.
             if last_collect is None or (now - last_collect).total_seconds() >= args.interval:
-                buckets, sessions = collect(
-                    now, progress_cb=lambda b, s: _paint_partial(
-                        now, b, s, cols, rows, alt, "live"),
-                    seed_sessions=sessions)
+                kick_collect("live", now)
                 last_collect = now
+            buckets, sessions = _collect_result.get("live", (buckets, sessions))
+            if not first_load_done and not _collect_inflight["live"].locked():
+                first_load_done = True   # first scan ever finished: LOADING never shows again
             # Refresh allowance every USAGE_REFRESH; a failed fetch sets a
             # retry_at (USAGE_BACKOFF out), so a non-2xx makes us wait instead of
             # hammering. Honour that countdown before the normal cadence.
@@ -2891,13 +2971,12 @@ def run_live(args):
             if show_history:
                 if (last_hist_collect is None
                         or (now - last_hist_collect).total_seconds() >= args.interval):
-                    hist_buckets, hist_sessions = collect(
-                        now, HIST_WINDOW, HIST_BUCKET, HIST_NUM_BUCKETS,
-                        track_models=True, track_heatmap=True,
-                        progress_cb=lambda b, s: _paint_partial(
-                            now, b, s, cols, rows, alt, "history"),
-                        seed_sessions=hist_sessions)
+                    kick_collect("history", now, HIST_WINDOW, HIST_BUCKET,
+                                 HIST_NUM_BUCKETS, track_models=True,
+                                 track_heatmap=True)
                     last_hist_collect = now
+                hist_buckets, hist_sessions = _collect_result.get(
+                    "history", (hist_buckets, hist_sessions))
                 cur_buckets, cur_sessions = hist_buckets, hist_sessions
                 layout = (plan_layout(rows, cols, hist_sessions, now,
                                       history=True) if alt else None)
@@ -2921,11 +3000,16 @@ def run_live(args):
                 focus_sid = focus_bucket = None
                 frame = render_too_small(cols, rows, 9)
             if alt:
-                # One overlay at a time: help > login-confirm > usage-error >
-                # session > bucket > panel popup. overlay_regions carries a modal
-                # popup's clickable spans (relative to the box); translated below.
+                # One overlay at a time: loading > help > login-confirm >
+                # usage-error > session > bucket > panel popup. overlay_regions
+                # carries a modal popup's clickable spans (relative to the
+                # box); translated below.
                 overlay, okey, overlay_regions = None, None, []
-                if show_help:
+                if not first_load_done:
+                    overlay, overlay_regions = render_loading(
+                        now, cols, rows, time.monotonic() - loading_started)
+                    okey = "loading"
+                elif show_help:
                     overlay = render_help(now, cols, rows)
                     okey = "help"
                 elif show_login:
@@ -2985,16 +3069,30 @@ def run_live(args):
                         hits = [(row0 + li, col0 + lo, col0 + hi, tok)
                                 for li, lo, hi, tok in overlay_regions]
                     # Paint the base ONCE when the overlay opens or switches, then
-                    # only redraw the overlay box in place each tick. Repainting
-                    # the whole base every tick under the overlay — with its full-
-                    # screen clear — is what made it flicker (the region flashed
-                    # base→overlay every frame). Freezing the base kills the
-                    # flicker; the base shimmer just pauses while an overlay is up.
-                    # Overlay lines are padded to a constant width so each redraw
-                    # fully overwrites the previous one without an intervening clear.
-                    if okey != prev_okey:
-                        body = "\033[H" + frame.replace("\n", "\033[K\n") + "\033[K\033[J"
-                        sys.stdout.write(body)
+                    # only redraw the overlay box in place each tick — repainting
+                    # the whole base every tick under the overlay used to flicker
+                    # it (a base write covering the overlay's own rows, followed
+                    # a moment later by the overlay redraw covering them again).
+                    # Exception: "loading" repaints the base every tick regardless
+                    # (the whole point is watching sessions/bars fill in live
+                    # behind the popup) — but does it via _clip/_slice_from so
+                    # the overlay's own rectangle is never in that base write at
+                    # all, just the flanking columns; only the overlay-redraw
+                    # loop below ever touches those cells, so there's nothing
+                    # left to flicker.
+                    if okey != prev_okey or okey == "loading":
+                        r0, r1 = row0, row0 + oh - 1
+                        c0, c1 = col0 - 1, col0 - 1 + ow   # overlay's visible-col span
+                        parts = []
+                        for li, ln in enumerate(frame.split("\n")):
+                            r = li + 1
+                            if r0 <= r <= r1:
+                                parts.append(f"\033[{r};1H" + _clip(ln, c0)
+                                             + f"\033[{r};{c1 + 1}H"
+                                             + _slice_from(ln, c1) + "\033[K")
+                            else:
+                                parts.append(f"\033[{r};1H" + ln + "\033[K")
+                        sys.stdout.write("".join(parts) + "\033[J")
                     for k, pl in enumerate(overlay):
                         sys.stdout.write(f"\033[{row0 + k};{col0}H" + _padcol(pl, ow))
                 prev_okey = okey
@@ -3004,8 +3102,13 @@ def run_live(args):
             anim += 1
 
             # Input-aware wait: wake early on a click/keypress for ≤1-tick latency.
+            # A Cylon bar is on screen (LOADING or login popup) needs a
+            # reliable 30fps redraw, well above the normal 5fps shimmer
+            # cadence — narrow the wait just for that window.
+            cylon_active = login_proc is not None or not first_load_done
             if alt and old_term is not None:
-                r, _, _ = select.select([sys.stdin], [], [], TICK_SECONDS)
+                r, _, _ = select.select([sys.stdin], [], [],
+                                        CYLON_TICK if cylon_active else TICK_SECONDS)
                 if r:
                     try:
                         data = os.read(fd, 4096).decode("utf-8", "ignore")
