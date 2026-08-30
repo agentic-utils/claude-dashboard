@@ -233,6 +233,9 @@ TICK_SECONDS = 0.2                  # repaint cadence (shimmer animation @5fps)
 PROGRESS_INTERVAL = 0.15            # collect()'s in-scan progress_cb cadence
 USAGE_REFRESH = 300                 # seconds between live-usage refetches
 USAGE_BACKOFF = 900                 # after a 429, wait this long before retrying
+LOGIN_INLINE_TIMEOUT = 45           # give inline (no-suspend) login this long before
+                                     # falling back to a real tty (SSO flows that need
+                                     # keyboard input would otherwise hang forever silently)
 
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "claude-dashboard.log")
@@ -1583,17 +1586,20 @@ def _acct_row(cells):
                      for text, w, color, bold in cells)
 
 
-def render_login_confirm(now, cols, rows):
+def render_login_confirm(now, cols, rows, login_elapsed=None):
     """Account-switch modal: a table of saved accounts, one row each. Status
     is 'Current' (that row's account is the live one) or a '[Select]' link
     (instant switch, no TUI suspend — a file swap); '[Re-login]' switches
-    that row live THEN runs interactive `claude auth login` (suspends the
-    TUI), so it also works to refresh an expired non-current account. '[+]
-    add account' logs in immediately with no extra confirm; the result
-    becomes live (it's what `claude auth login` just wrote) and gets
-    snapshotted into the table on return. Returns (lines, regions) —
-    regions = [(overlay_line, lo, hi, token)] in the same convention as
-    render_panel_popup.
+    that row live THEN starts `claude auth login` in the background, so it
+    also works to refresh an expired non-current account. '[+] add account'
+    logs in immediately with no extra confirm; the result becomes live (it's
+    what `claude auth login` just wrote) and gets snapshotted into the table
+    on return. Returns (lines, regions) — regions = [(overlay_line, lo, hi,
+    token)] in the same convention as render_panel_popup.
+
+    While a login is running (login_elapsed is not None, seconds since it
+    started), the table is replaced with the Cylon progress bar and a
+    [Cancel] link — the caller (main loop) owns the actual subprocess.
 
     This is the shared OAuth store (~/.claude/.credentials.json) — the same
     login Claude Code itself reads — so a switch here is global, not local;
@@ -1602,6 +1608,19 @@ def render_login_confirm(now, cols, rows):
     aw, ew, sw, cw = ACCT_COL_W
     starts = _acct_col_starts()
     inner = starts[-1] + cw + ACCT_PAD - 0   # last column's text-end + trailing pad
+    if login_elapsed is not None:
+        bar_w = min(inner - 4, 40)
+        bar = _cylon_bar(login_elapsed, bar_w)
+        bar_pad = max(0, (inner - bar_w) // 2)
+        cancel = "[Cancel]"
+        cancel_pad = max(0, (inner - len(cancel)) // 2)
+        content = ["", rgb(TEXT, "Logging in…".center(inner), bold=True),
+                   "", " " * bar_pad + bar, ""]
+        content.append(" " * cancel_pad + rgb(WARN_C, cancel, bold=True))
+        regions = [(len(content), cancel_pad + 1, cancel_pad + len(cancel),
+                    "__logincancel__")]
+        content += ["", rgb(DIM, "esc / click outside also cancels".center(inner))]
+        return panel("SWITCH ACCOUNT", content, inner), regions
     saved = list_saved_accounts()
     cur_slug = current_account_slug()
     if cur_slug is None:
@@ -1908,7 +1927,61 @@ def switch_account(slug):
     return True
 
 
-def run_login(fd, old_term):
+CYLON_RED = (255, 30, 30)
+CYLON_TAIL = 4                 # fading trail length behind the eye
+CYLON_PERIOD = 1.6             # seconds for one full sweep (both directions equal speed)
+
+
+def _cylon_bar(elapsed, width, tail=CYLON_TAIL, period=CYLON_PERIOD):
+    """A Battlestar Galactica-style scanner: black background, one bright red
+    'eye' cell, a fading tail behind it (opposite its direction of travel),
+    ping-ponging across `width` cells at constant speed. Position is a pure
+    function of elapsed time, not accumulated per-tick state, so it stays
+    smooth regardless of render cadence."""
+    t = elapsed % period
+    half = period / 2
+    frac = t / half if t < half else 2 - t / half     # 0 -> 1 -> 0, constant slope
+    eye = round(frac * (width - 1))
+    direction = 1 if t < half else -1                  # +1 = moving right
+    cells = []
+    for i in range(width):
+        if i == eye:
+            cells.append(styled(" ", (255, 255, 255), bg=CYLON_RED, bold=True))
+            continue
+        behind = (eye - i) if direction == 1 else (i - eye)
+        if 0 < behind <= tail:
+            c = shade(CYLON_RED, 1 - behind / (tail + 1))
+            cells.append(styled(" ", c, bg=c))
+        else:
+            cells.append(styled(" ", (0, 0, 0), bg=(0, 0, 0)))
+    return "".join(cells)
+
+
+def _cylon_wait(proc, interval=0.08, width=20):
+    """Draw the Cylon bar on the terminal's last row while proc runs (used
+    only by the suspended-terminal fallback, which has no TUI panel to draw
+    into). `claude auth login` prints its own prompt once, then goes quiet
+    during the browser/OAuth round trip — this bar is the only sign the click
+    did anything during that gap."""
+    try:
+        rows = os.get_terminal_size().lines
+    except OSError:
+        proc.wait()
+        return
+    t0 = time.monotonic()
+    try:
+        while proc.poll() is None:
+            bar = _cylon_bar(time.monotonic() - t0, width)
+            sys.stdout.write(f"\0337\033[{rows};1H\033[K{bar} logging in...\0338")
+            sys.stdout.flush()
+            time.sleep(interval)
+    finally:
+        proc.wait()
+        sys.stdout.write(f"\0337\033[{rows};1H\033[K\0338")
+        sys.stdout.flush()
+
+
+def _run_login_suspended(fd, old_term):
     """Suspend the TUI, run interactive `claude auth login`, then resume.
 
     Mirrors main()'s terminal enter/exit (alt-screen, SGR mouse, cbreak) so the
@@ -1928,9 +2001,10 @@ def run_login(fd, old_term):
             except (termios.error, ValueError, OSError):
                 pass
         try:
-            subprocess.run(["claude", "auth", "login"])
+            proc = subprocess.Popen(["claude", "auth", "login"])
+            _cylon_wait(proc)
         except (OSError, subprocess.SubprocessError) as e:
-            log.warning("run_login: claude auth login failed: %s", e)
+            log.warning("_run_login_suspended: claude auth login failed: %s", e)
     finally:
         # --- resume: redo main()'s terminal setup ---
         sys.stdout.write("\033[?1049h\033[?25l\033[?7l")         # alt, hide cursor, no wrap
@@ -2719,6 +2793,8 @@ def run_live(args):
     show_help = False
     show_uerr = False
     show_login = False           # login confirmation modal
+    login_proc = None            # Popen of an in-progress `claude auth login`
+    login_started = None         # time.monotonic() it was started
     overlay_scroll = 0
     prev_okey = None
     mouse_re = re.compile(r"\033\[<(\d+);(\d+);(\d+)([Mm])")
@@ -2730,6 +2806,30 @@ def run_live(args):
           # still breaks to the finally that restores the terminal.
           try:
             now = datetime.now(timezone.utc)
+            # Poll a background login every tick, whether or not new input
+            # arrived, so the progress bar animates and completion is noticed
+            # promptly. On timeout (an SSO variant needing keyboard input,
+            # which hangs forever with stdin closed), fall back to a real
+            # suspended terminal — that call blocks, same as before.
+            if login_proc is not None:
+                if login_proc.poll() is not None:
+                    login_proc = None
+                    save_account_snapshot()
+                    kick_usage()
+                    show_login = False
+                    prev_okey = None
+                elif time.monotonic() - login_started > LOGIN_INLINE_TIMEOUT:
+                    login_proc.terminate()
+                    try:
+                        login_proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        login_proc.kill()
+                    login_proc = None
+                    _run_login_suspended(fd, old_term)
+                    save_account_snapshot()
+                    kick_usage()
+                    show_login = False
+                    prev_okey = None
             try:
                 cols, rows = os.get_terminal_size()
             except OSError:
@@ -2811,7 +2911,10 @@ def run_live(args):
                     overlay = render_help(now, cols, rows)
                     okey = "help"
                 elif show_login:
-                    overlay, overlay_regions = render_login_confirm(now, cols, rows)
+                    login_elapsed = (time.monotonic() - login_started
+                                      if login_proc is not None else None)
+                    overlay, overlay_regions = render_login_confirm(
+                        now, cols, rows, login_elapsed)
                     okey = "login"
                 elif show_uerr:
                     overlay = render_usage_error(now, cols, rows)
@@ -2892,10 +2995,11 @@ def run_live(args):
                         data = ""
                     (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
                      show_uerr, show_login, show_history, quit_flag,
-                     scroll_delta, do_login, do_retry, do_switch) = process_input(
+                     scroll_delta, do_login, do_retry, do_switch,
+                     do_cancel) = process_input(
                         data, mouse_re, hits, focus_sid, focus_bucket,
                         panel_view, summary_tab, show_help, show_uerr, show_login,
-                        show_history)
+                        show_history, login_proc is not None)
                     if quit_flag:              # footer "⌃C to exit" was clicked
                         break
                     # Manual retry/login bypass the retry_at backoff gate above.
@@ -2904,11 +3008,24 @@ def run_live(args):
                     if do_switch:              # picked a saved account: just a
                         switch_account(do_switch)   # file swap, no TUI suspend
                         kick_usage()
-                    if do_login:
-                        run_login(fd, old_term)   # suspends + resumes the TUI
-                        save_account_snapshot()  # persist the newly added account
-                        kick_usage()              # pick up the fresh token now
-                        prev_okey = None          # force a full repaint on resume
+                    if do_login:               # start it; the per-tick poll
+                        try:                    # above notices completion/timeout
+                            login_proc = subprocess.Popen(
+                                ["claude", "auth", "login"],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+                            login_started = time.monotonic()
+                        except (OSError, subprocess.SubprocessError) as e:
+                            log.warning("main: claude auth login failed: %s", e)
+                            login_proc = None
+                            show_login = False
+                    if do_cancel and login_proc is not None:
+                        login_proc.terminate()
+                        try:
+                            login_proc.wait(timeout=2)
+                        except subprocess.TimeoutExpired:
+                            login_proc.kill()
+                        login_proc = None
                     # Any open overlay scrolls; the delta is clamped to the
                     # overlay's range each render (and reset when it changes).
                     overlay_scroll += scroll_delta
@@ -2932,7 +3049,8 @@ def run_live(args):
 
 
 def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
-                  summary_tab, show_help, show_uerr, show_login, show_history):
+                  summary_tab, show_help, show_uerr, show_login, show_history,
+                  login_active=False):
     """Update the overlay/selection state from a chunk of terminal input and
     return a scroll delta for the (only scrollable) help overlay.
 
@@ -2957,18 +3075,21 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     account (sets do_switch, instant — no TUI suspend needed, it's just a
     file swap); a row's [Re-login] click (or 'R' for the current account)
     sets do_switch + do_login; '+' / a row's [+] add account also sets
-    do_login alone — both do_login paths are disruptive, suspending the TUI
-    for interactive `claude auth login`; anything else cancels.
+    do_login alone — both start `claude auth login` in the background (the
+    main loop owns the subprocess), and the popup switches to the progress
+    view (login_active) until it finishes. While login_active, digit/+/r/n
+    picks are ignored — only [Cancel] / esc / q / click-outside (do_cancel)
+    can dismiss it, since a login is actually running.
 
     Returns (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
     show_uerr, show_login, show_history, quit_flag, scroll_delta, do_login,
-    do_retry, do_switch). do_login/do_retry ask the main loop to run the
-    (interactive) login flow or force an immediate usage refetch — both
-    bypass retry_at. do_switch is None or the slug of the saved account to
-    switch to."""
+    do_retry, do_switch, do_cancel). do_login/do_retry ask the main loop to
+    start the login flow or force an immediate usage refetch — both bypass
+    retry_at. do_switch is None or the slug of the saved account to switch
+    to. do_cancel asks the main loop to kill an in-progress login."""
     delta = 0
     quit_flag = False
-    do_login = do_retry = False
+    do_login = do_retry = do_cancel = False
     do_switch = None
     for m in mouse_re.finditer(data):
         button, x, y, final = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
@@ -3003,9 +3124,10 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             elif hit and hit.startswith("__acctrelogin__"):  # SWITCH ACCOUNT [Re-login]
                 do_switch = hit[len("__acctrelogin__"):]
                 do_login = True
-                show_login = False
             elif hit == "__acctadd__":     # SWITCH ACCOUNT [+] add account
                 do_login = True
+            elif hit == "__logincancel__":   # progress view [Cancel]
+                do_cancel = True
                 show_login = False
             elif hit in ("__history__", "__live__"):   # Live/History tab or span
                 show_history = (hit == "__history__")
@@ -3024,6 +3146,8 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
                 show_uerr = False
             elif (show_login or show_uerr or focus_sid is not None
                   or focus_bucket is not None or panel_view is not None):
+                if show_login and login_active:
+                    do_cancel = True
                 show_login = show_uerr = False
                 focus_sid = focus_bucket = None
                 panel_view = None
@@ -3049,7 +3173,9 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     #  · else the usage-error overlay takes R (retry) / L (login), short-circuiting
     #    the menu accelerators so 'L' doesn't fall through to 'L' = Live.
     #  · else the global menu accelerators.
-    if show_login:
+    if show_login and login_active:
+        pass   # a login is running; only Cancel (click) / esc / q dismiss it
+    elif show_login:
         saved = list_saved_accounts()
         digit = next((c for c in rest if c.isdigit() and c != "0"), None)
         if digit and int(digit) <= len(saved):
@@ -3057,11 +3183,9 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             show_login = False
         elif "+" in rest:               # [+] add account
             do_login = True
-            show_login = False
         elif "r" in rest or "R" in rest:   # re-login current account, if saved
             do_switch = current_account_slug()
             do_login = True
-            show_login = False
         elif "n" in rest or "N" in rest:
             show_login = False
     elif "g" in rest or "G" in rest:
@@ -3101,6 +3225,8 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
                    for i in range(len(rest)))
     if "q" in rest or bare_esc:
         if show_login:
+            if login_active:
+                do_cancel = True
             show_login = False
         elif show_help:
             show_help = False
@@ -3116,7 +3242,7 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             show_history = False
     return (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
             show_uerr, show_login, show_history, quit_flag, delta,
-            do_login, do_retry, do_switch)
+            do_login, do_retry, do_switch, do_cancel)
 
 
 if __name__ == "__main__":
