@@ -5,6 +5,9 @@ claude-dashboard.log
 # Adversarial-review scratch
 .review/
 
+# Local flag defaults, machine-specific — never commit.
+.claude-dashboard.rc
+
 # Python
 __pycache__/
 *.pyc
