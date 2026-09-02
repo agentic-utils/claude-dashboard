@@ -2744,7 +2744,8 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
     return "\n".join(out), hits
 
 
-PR_COL_W = {"repo": 20, "what": 26, "approval": 3, "ci": 3, "commit": 30, "comment": 24}
+PR_COL_W = {"repo": 20, "number": 6, "what": 26, "approval": 3, "ci": 3, "commit": 30, "comment": 24}
+PR_COLS = ("repo", "number", "what", "approval", "ci", "commit", "comment")
 PR_GRID_SEP = rgb(DIM2, " │ ")
 PR_GRID_SEP_LEN = 3
 
@@ -2778,7 +2779,7 @@ def _pr_hrule(col_x, w, inner):
     """Horizontal gridline for the PRS table: dashes with a '┼' wherever a
     vertical PR_GRID_SEP's '│' crosses it."""
     line = ["─"] * inner
-    for k in ("repo", "what", "approval", "ci", "commit", "comment"):
+    for k in PR_COLS:
         p = col_x[k] + w[k] + 1
         if 0 <= p < inner:
             line[p] = "┼"
@@ -2822,15 +2823,20 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0):
     transcript scan — later background refreshes stay silent.
     """
     out, hits, tips = [], [], []
+    w = dict(PR_COL_W)
+    if rows:
+        # REPO expands to fit the longest name in view, capped at 20% of the
+        # terminal width (never shrinks below the default column width).
+        longest_repo = max(_visible_len(r["repo"]) for r in rows)
+        repo_cap = max(int(cols * 0.20), w["repo"])
+        w["repo"] = min(max(longest_repo, w["repo"]), repo_cap)
     brand = rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, "CLAUDE CODE", bold=True)
     brand_len = 2 + len("CLAUDE CODE")
     tabs_str, tabs_len, segs = view_tabs("prs")
     local = now.astimezone()
     right = rgb(DIM, f"{local:%a %d %b · %H:%M:%S %Z}")
     BRAND_GAP = 4
-    inner = max(cols - 2, PR_COL_W["repo"] + PR_COL_W["what"] + PR_COL_W["approval"]
-               + PR_COL_W["ci"] + PR_COL_W["commit"] + PR_COL_W["comment"]
-               + PR_GRID_SEP_LEN * 6 + 30)
+    inner = max(cols - 2, sum(w[k] for k in PR_COLS) + PR_GRID_SEP_LEN * len(PR_COLS) + 30)
     total_width = inner + 2
     pad = max(total_width - brand_len - BRAND_GAP - tabs_len - _visible_len(f"{local:%a %d %b · %H:%M:%S %Z}") - 2, 1)
     out += [" " + brand + " " * BRAND_GAP + tabs_str + " " * pad + right,
@@ -2849,8 +2855,8 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0):
     elif not rows:
         out += panel("PRS", [rgb(DIM, "no open PRs, no unopened branches you've touched")], inner)
     else:
-        w = PR_COL_W
         head = (_padcol(rgb(TEXT, "REPO", bold=True), w["repo"]) + PR_GRID_SEP
+               + _padcol(rgb(TEXT, "#", bold=True), w["number"]) + PR_GRID_SEP
                + _padcol(rgb(TEXT, "WHAT", bold=True), w["what"]) + PR_GRID_SEP
                + _padcol(rgb(TEXT, "A", bold=True), w["approval"]) + PR_GRID_SEP
                + _padcol(rgb(TEXT, "CI", bold=True), w["ci"]) + PR_GRID_SEP
@@ -2863,7 +2869,7 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0):
         # later column's offset must account for the separators before it.
         col_x = {}
         pos = 0
-        for k in ("repo", "what", "approval", "ci", "commit", "comment"):
+        for k in PR_COLS:
             col_x[k] = pos
             pos += w[k] + PR_GRID_SEP_LEN
         col_x["actions"] = pos
@@ -2871,10 +2877,12 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0):
         body = [head, hrule]
         for i, row in enumerate(rows):
             what = (("[draft] " if row["is_draft"] else "") + row["title"]) if row["kind"] == "pr" else row["branch"]
+            number = f"#{row['number']}" if row["kind"] == "pr" else "—"
             commit = f"{row['commit_sha']} {_pr_relts(row['commit_ts'], now)} {row['commit_msg']}" if row["commit_sha"] else "—"
             comment = (f"{_pr_relts(row['comment_ts'], now)} {row['comment_author']}: {row['comment_preview']}"
                       if row["comment_full"] else "—")
             line = (_padcol(rgb(TEXT, _clip_ellip(row["repo"], w["repo"] - 1)), w["repo"]) + PR_GRID_SEP
+                   + _padcol(rgb(DIM, number), w["number"]) + PR_GRID_SEP
                    + _padcol(rgb(TEXT, _clip_ellip(what, w["what"] - 1)), w["what"]) + PR_GRID_SEP
                    + _padcol(_pr_approval_cell(row["approval"]), w["approval"]) + PR_GRID_SEP
                    + _padcol(_pr_ci_cell(row["ci"]), w["ci"]) + PR_GRID_SEP
