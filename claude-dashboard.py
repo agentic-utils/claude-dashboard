@@ -2067,6 +2067,7 @@ def kick_collect_prs():
         try:
             rows, err = collect_prs()
             _pr_collect_result["prs"] = (rows, err)
+            _pr_collect_result["prs_ts"] = datetime.now(timezone.utc)
         except Exception:
             log.exception("kick_collect_prs: scan failed")
         finally:
@@ -2808,7 +2809,8 @@ def pr_row_buttons(row):
     return btns
 
 
-def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0):
+def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
+                     last_refresh=None):
     """PRS tab: your open PRs + branches you've contributed to with no open
     PR. Returns (frame_str, hits, tips) — same convention as render_frame()
     plus `tips`: [(screen_row, lo, hi, full_text)] for cells whose shown text
@@ -2916,7 +2918,8 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0):
                 bpos += len(btxt) + 2
             if i != len(rows) - 1:
                 body.append(hrule)
-        panel_lines = panel(f"PRS · {len(rows)} rows", body, inner)
+        refresh_label = f" · updated {_pr_relts(last_refresh, now)}" if last_refresh else ""
+        panel_lines = panel(f"PRS · {len(rows)} rows{refresh_label}", body, inner)
         panel_start = len(out)
         out += panel_lines
         # Translate body-relative row indices to screen coords: panel() adds one
@@ -3501,8 +3504,9 @@ def run_live(args):
                 cur_buckets, cur_sessions = buckets, sessions
                 pr_loading = "prs" not in _pr_collect_result
                 pr_elapsed = (now - last_pr_collect).total_seconds() if last_pr_collect else 0
-                frame, hits, pr_tips = render_prs_frame(now, pr_rows, pr_err, cols, rows,
-                                                        loading=pr_loading, elapsed=pr_elapsed)
+                frame, hits, pr_tips = render_prs_frame(
+                    now, pr_rows, pr_err, cols, rows, loading=pr_loading, elapsed=pr_elapsed,
+                    last_refresh=_pr_collect_result.get("prs_ts"))
             else:
                 cur_buckets, cur_sessions = buckets, sessions
                 layout = plan_layout(rows, cols, sessions, now) if alt else None
