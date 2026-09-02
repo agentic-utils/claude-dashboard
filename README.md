@@ -47,6 +47,24 @@ and shows a **SUMMARY** scoped to the window with a **`$` cost estimate**
 that slice down by session. `L` or `q` returns to Live. Configure with
 `--history-hours` / `--history-bucket-minutes` / `--price-per-mtok`.
 
+**PRS tab** — press **`P`** (or click the **PRs** tab): every open PR you've
+authored, plus every branch you've pushed commits to that has no open PR yet,
+across every repo `gh` can see for your account (no hardcoded org/owner — it's
+discovered via `gh search prs` and a commit-author search). A grid-lined
+table: approval is a dot (solid green = approved, solid red = review
+required, hollow green = no review needed), CI is a dot too (green/red/amber
+— click a red one for the failing checks), then last commit (SHA, relative
+time, headline) and last comment (relative time, author, a 20-char preview —
+click for the full text). Hover any truncated cell for a tooltip with the
+full text. Row buttons, each behind
+a **`[Y]/[N]`** confirm popup and a Cylon progress bar while it runs:
+**Merge** (squash + delete branch — shown only once approved-or-no-review-needed
+AND CI is green AND it isn't a draft), **Draft ↔ Ready** toggle, **Close**, and
+**Delete** (branch-only rows). Click anywhere else on a row to open it on
+GitHub. Needs the `gh` CLI installed and authenticated (`gh auth login`) — the
+tab shows a message instead of a table if it isn't. Refreshed every
+`--pr-refresh-seconds` (default 300).
+
 ## Run
 
 ```bash
@@ -54,21 +72,26 @@ that slice down by session. `L` or `q` returns to Live. Configure with
 ./claude-dashboard.py --once           # render a single frame and exit
 ./claude-dashboard.py --interval 60    # override the 5-min data scan
 ./claude-dashboard.py --history-hours 336   # 2-week history span (press H)
+./claude-dashboard.py --pr-refresh-seconds 120   # faster PRS-tab refresh (press P)
 ```
 
-Keys: `?` help · `L` live / `H` history tabs · `S`/`M` history popups · `↑/↓`
-`PgUp/PgDn` `j/k` scroll help · `q`/`esc` close overlay / leave history · click a
-tab/session/bar for detail · `Ctrl-C` (or click *"⌃C to exit"*) to quit.
+Keys: `?` help · `L`/`H`/`P` live/history/PRs tabs · `S`/`M` history popups ·
+`↑/↓` `PgUp/PgDn` `j/k` scroll help · `q`/`esc` close overlay / leave the current
+tab · click a tab/session/bar/PR row for detail · `Y`/`N` confirm a PRS action ·
+`Ctrl-C` (or click *"⌃C to exit"*) to quit.
 
 ## How it works / requirements
 
-- **Python 3, stdlib only** — no dependencies.
+- **Python 3, stdlib only** — no dependencies, except the optional `gh` CLI for
+  the PRS tab (the rest of the dashboard works fine without it).
 - A truecolour terminal ~152 columns wide (it adapts chart height to your terminal
   height; very narrow terminals will wrap).
 - The **ALLOWANCE** panel calls `GET https://api.anthropic.com/api/oauth/usage` using
   the OAuth token Claude Code already stores in `~/.claude/.credentials.json`. The
   token is read fresh at call time and used only for that request — it is never
   logged, displayed, or persisted by this tool.
+- The **PRS** tab shells out to `gh` for everything — no tokens are read or
+  stored by this script; `gh`'s own auth (`gh auth status`) governs access.
 
 ## Notes
 

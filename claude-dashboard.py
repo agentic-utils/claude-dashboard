@@ -43,7 +43,18 @@ the same three charts over a configurable window (--history-hours, default 168 =
 estimate and cache-hit rate, and click-a-bar drill-down. No active-sessions or
 allowance panels there.
 
-Stdlib only. --once prints a single frame; --interval overrides the period.
+Press P (or click the PRs menu tab) for a PRS view: every open PR you authored
+plus every branch you've pushed commits to that has no open PR, across every
+repo `gh` can see for your account — approval status, CI (click a red dot for
+the failing checks), last commit, last comment (click for the full text), and
+per-row action buttons (merge, once approved/no-review-needed and CI is green;
+draft/ready toggle; close; delete branch), each behind a confirm popup. Needs
+the `gh` CLI installed and authenticated (`gh auth login`); the tab degrades to
+a message instead of a table if it isn't. Refreshed on --pr-refresh-seconds
+(default 300s) — each scan is several `gh` subprocess calls.
+
+Stdlib only (except the optional `gh` CLI for the PRS tab). --once prints a
+single frame; --interval overrides the period.
 
 Flags can also be set in .claude-dashboard.rc, next to this script (one flag
 per line, '#' comments OK) - CLI flags given at the command line override it.
@@ -60,6 +71,7 @@ import os
 import re
 import select
 import shlex
+import shutil
 import subprocess
 import sys
 import termios
@@ -1041,7 +1053,7 @@ def hjoin(*blocks, gap=3):
 
 
 TAB_WIN, TAB_AW = "__tab_win__", "__tab_aw__"
-VIEW_LIVE, VIEW_HIST = "__live__", "__history__"
+VIEW_LIVE, VIEW_HIST, VIEW_PRS = "__live__", "__history__", "__prs__"
 
 
 def _menu_cell(label, ul_idx, on):
@@ -1057,11 +1069,12 @@ def _menu_cell(label, ul_idx, on):
 
 
 def view_tabs(mode):
-    """The Live / History menu-bar tabs (accelerator letters L/H underlined,
-    active tab highlighted). Returns (styled, visible_len, segs) where
-    segs = [(token, lo_off, hi_off)] are 0-based char offsets for the hit-map."""
-    tabs = [(VIEW_LIVE, "Live", 0), (VIEW_HIST, "History", 0)]   # underline char 0
-    active = VIEW_HIST if mode == "history" else VIEW_LIVE
+    """The Live / History / PRs menu-bar tabs (accelerator letters L/H/P
+    underlined, active tab highlighted). Returns (styled, visible_len, segs)
+    where segs = [(token, lo_off, hi_off)] are 0-based char offsets for the
+    hit-map."""
+    tabs = [(VIEW_LIVE, "Live", 0), (VIEW_HIST, "History", 0), (VIEW_PRS, "PRs", 0)]
+    active = {"history": VIEW_HIST, "prs": VIEW_PRS}.get(mode, VIEW_LIVE)
     sep = " "
     out, off, segs = "", 0, []
     for i, (tok, lab, ul) in enumerate(tabs):
@@ -1876,8 +1889,23 @@ def kick_collect(mode, now, window=None, bucket=None, num_buckets=None,
         return
     prev = _collect_result.get(mode)
     seed = dict(prev[1]) if prev else None   # thread's own copy to mutate
+    first_publish = True
 
     def publish(b, s):
+        # collect()'s very first progress_cb call fires before any file is
+        # read, with all-zero buckets — meant to give the true first-ever
+        # load something to animate behind the LOADING popup. On a refresh
+        # (prev already published), publishing that zero snapshot would
+        # flash the charts/SUMMARY to 0 every --interval until the rescan
+        # refills them (buckets, unlike sessions, aren't seeded — a bucket
+        # sums contributions from many session files, so there's no clean
+        # per-bucket carry-over). Skip only that one pre-scan call on a
+        # refresh; every later call has real (if still-accumulating) data.
+        nonlocal first_publish
+        skip = first_publish and prev is not None
+        first_publish = False
+        if skip:
+            return
         _collect_result[mode] = (list(b), dict(s))
 
     def run():
@@ -1889,6 +1917,200 @@ def kick_collect(mode, now, window=None, bucket=None, num_buckets=None,
         finally:
             lock.release()
     threading.Thread(target=run, daemon=True).start()
+
+
+# ── PRS tab: open PRs + unopened contributed branches, via `gh` CLI ─────────
+# Optional subsystem — degrades to a static message if `gh` isn't installed or
+# not authenticated, never touches LIVE/HISTORY. No hardcoded org/owner: PRs
+# come from `gh search prs --author=@me` (org-agnostic), and the branch scan
+# starts from `search/commits?q=author:<login>` to discover repos actually
+# touched, so it works for any GitHub account.
+_GH_BIN = shutil.which("gh")
+PR_REFRESH_SECONDS = 300
+_pr_username = None
+_pr_collect_inflight = threading.Lock()
+_pr_collect_result = {}   # "prs" -> (rows, err_str_or_None)
+_pr_action = {"running": False, "kind": None, "row_key": None,
+              "started": None, "error": None}
+
+
+def _gh_json(args, timeout=20):
+    """Run `gh` with the given args, parse stdout as JSON. None on any failure
+    (logged, never raised) — one bad call must not abort the whole scan."""
+    if not _GH_BIN:
+        return None
+    try:
+        out = subprocess.run([_GH_BIN] + args, capture_output=True, text=True,
+                             timeout=timeout)
+        if out.returncode != 0:
+            log.warning("gh %s: %s", args, out.stderr.strip()[:200])
+            return None
+        return json.loads(out.stdout) if out.stdout.strip() else None
+    except (subprocess.SubprocessError, OSError, ValueError) as e:
+        log.warning("gh %s: %s", args, e)
+        return None
+
+
+def gh_username():
+    global _pr_username
+    if _pr_username is None and _GH_BIN:
+        user_obj = _gh_json(["api", "user"], timeout=10)
+        _pr_username = user_obj.get("login") if user_obj else None
+    return _pr_username
+
+
+def _pr_ci_status(rollup):
+    """statusCheckRollup -> ("green"/"red"/"pending"/"none", [(name, conclusion)])."""
+    if not rollup:
+        return "none", []
+    checks = [(c.get("name") or c.get("context") or "?", c.get("conclusion") or c.get("state"))
+              for c in rollup]
+    concl = [c[1] for c in checks]
+    if any(c in ("FAILURE", "failure", "ERROR", "error", "CANCELLED", "cancelled") for c in concl):
+        return "red", checks
+    if any(c in (None, "PENDING", "pending", "IN_PROGRESS", "in_progress", "QUEUED") for c in concl):
+        return "pending", checks
+    return "green", checks
+
+
+def _pr_approval(review_decision):
+    return {"APPROVED": "Approved", "CHANGES_REQUESTED": "Changes requested",
+            "REVIEW_REQUIRED": "Awaiting review"}.get(review_decision, "No review needed")
+
+
+def collect_prs():
+    """Synchronous scan (background-threaded by kick_collect_prs): open PRs
+    authored by the signed-in user, plus branches with no open PR whose latest
+    commit is also theirs. Returns (rows, err) — err is a user-facing string
+    when the whole tab should show a message instead of a table."""
+    if not _GH_BIN:
+        return [], "gh CLI not found — install from https://cli.github.com"
+    user = gh_username()
+    if not user:
+        return [], "gh not authenticated — run `gh auth login`"
+
+    rows, seen = [], set()   # seen: (repo, branch) already surfaced as a PR
+    prs = _gh_json(["search", "prs", "--author=@me", "--state=open",
+                    "--json", "repository,number,title,url,updatedAt"]) or []
+    for p in prs:
+        repo = p.get("repository")
+        repo = repo.get("nameWithOwner") if isinstance(repo, dict) else repo
+        if not repo:
+            continue
+        num = p["number"]
+        detail = _gh_json(["pr", "view", str(num), "--repo", repo, "--json",
+                           "reviewDecision,statusCheckRollup,commits,comments,"
+                           "headRefName,isDraft,url,title"]) or {}
+        commits = detail.get("commits") or []
+        last_commit = commits[-1] if commits else {}
+        comments = detail.get("comments") or []
+        last_comment = comments[-1] if comments else None
+        ci_state, ci_checks = _pr_ci_status(detail.get("statusCheckRollup"))
+        rows.append({
+            "kind": "pr", "repo": repo, "number": num,
+            "branch": detail.get("headRefName", ""),
+            "title": detail.get("title") or p.get("title") or "",
+            "url": detail.get("url") or p.get("url") or "",
+            "is_draft": bool(detail.get("isDraft")),
+            "approval": _pr_approval(detail.get("reviewDecision")),
+            "ci": ci_state, "ci_checks": ci_checks,
+            "commit_ts": parse_ts(last_commit.get("committedDate")) if last_commit.get("committedDate") else None,
+            "commit_sha": (last_commit.get("oid") or "")[:7],
+            "commit_msg": (last_commit.get("messageHeadline") or ""),
+            "comment_ts": parse_ts(last_comment["createdAt"]) if last_comment else None,
+            "comment_author": (last_comment.get("author", {}) or {}).get("login", "") if last_comment else "",
+            "comment_preview": (last_comment.get("body") or "")[:20] if last_comment else "",
+            "comment_full": (last_comment.get("body") or "") if last_comment else "",
+        })
+        seen.add((repo, detail.get("headRefName", "")))
+
+    commits_hits = _gh_json(["api", "search/commits", "-f", f"q=author:{user}"], timeout=25) or {}
+    repos = sorted({(it.get("repository") or {}).get("full_name")
+                    for it in (commits_hits.get("items") or [])
+                    if (it.get("repository") or {}).get("full_name")})
+    for repo in repos:
+        repo_obj = _gh_json(["api", repo], timeout=10)
+        default_branch = repo_obj.get("default_branch") if repo_obj else None
+        branches = _gh_json(["api", f"repos/{repo}/branches", "--paginate"], timeout=20) or []
+        for b in branches:
+            name = b.get("name")
+            if not name or name == default_branch or (repo, name) in seen:
+                continue
+            sha = (b.get("commit") or {}).get("sha")
+            if not sha:
+                continue
+            commit = _gh_json(["api", f"repos/{repo}/commits/{sha}"], timeout=10) or {}
+            author_login = (commit.get("author") or {}).get("login")
+            if author_login != user:
+                continue
+            c = commit.get("commit") or {}
+            rows.append({
+                "kind": "branch", "repo": repo, "number": None, "branch": name,
+                "title": name, "url": f"https://github.com/{repo}/tree/{name}",
+                "is_draft": False, "approval": "", "ci": "none", "ci_checks": [],
+                "commit_ts": parse_ts((c.get("committer") or {}).get("date")),
+                "commit_sha": sha[:7],
+                "commit_msg": (c.get("message") or "").splitlines()[0] if c.get("message") else "",
+                "comment_ts": None, "comment_author": "", "comment_preview": "",
+                "comment_full": "",
+            })
+    return rows, None
+
+
+def kick_collect_prs():
+    """Fire a non-blocking background collect_prs() if one isn't already
+    running — same one-in-flight pattern as kick_collect()."""
+    if not _pr_collect_inflight.acquire(blocking=False):
+        return
+
+    def run():
+        try:
+            rows, err = collect_prs()
+            _pr_collect_result["prs"] = (rows, err)
+        except Exception:
+            log.exception("kick_collect_prs: scan failed")
+        finally:
+            _pr_collect_inflight.release()
+    threading.Thread(target=run, daemon=True).start()
+
+
+def kick_pr_action(kind, args, row_key):
+    """Fire a mutating `gh` command (merge/close/ready-toggle/branch-delete)
+    in the background. run_live polls _pr_action and shows the Cylon bar
+    while running is True, then re-kicks collect_prs on completion."""
+    if _pr_action["running"]:
+        return False
+    _pr_action.update(running=True, kind=kind, row_key=row_key,
+                      started=time.monotonic(), error=None)
+
+    def run():
+        try:
+            out = subprocess.run([_GH_BIN] + args, capture_output=True, text=True,
+                                 timeout=30)
+            if out.returncode != 0:
+                _pr_action["error"] = out.stderr.strip()[:300] or "gh command failed"
+        except (subprocess.SubprocessError, OSError) as e:
+            _pr_action["error"] = str(e)
+        finally:
+            _pr_action["running"] = False
+    threading.Thread(target=run, daemon=True).start()
+    return True
+
+
+def pr_action_args(kind, row):
+    """Build the `gh` argv for a confirmed action on `row`."""
+    repo, num, branch = row["repo"], row["number"], row["branch"]
+    if kind == "merge":
+        return ["pr", "merge", str(num), "--repo", repo, "--squash", "--delete-branch"]
+    if kind == "close":
+        return ["pr", "close", str(num), "--repo", repo]
+    if kind == "ready":
+        return ["pr", "ready", str(num), "--repo", repo]
+    if kind == "draft":
+        return ["pr", "ready", str(num), "--repo", repo, "--undo"]
+    if kind == "delete":
+        return ["api", "-X", "DELETE", f"repos/{repo}/git/refs/heads/{branch}"]
+    raise ValueError(kind)
 
 
 def _token_stale():
@@ -2085,7 +2307,7 @@ def _run_login_suspended(fd, old_term):
     try:
         # --- suspend: undo main()'s terminal setup ---
         if old_term is not None:
-            sys.stdout.write("\033[?1000l\033[?1006l")          # mouse off
+            sys.stdout.write("\033[?1000l\033[?1003l\033[?1006l")          # mouse off
         sys.stdout.write("\033[?7h\033[?25h\033[?1049l")         # wrap+cursor on, leave alt
         sys.stdout.flush()
         if old_term is not None:
@@ -2103,7 +2325,7 @@ def _run_login_suspended(fd, old_term):
         sys.stdout.write("\033[?1049h\033[?25l\033[?7l")         # alt, hide cursor, no wrap
         if old_term is not None:
             try:
-                sys.stdout.write("\033[?1000h\033[?1006h")       # mouse on
+                sys.stdout.write("\033[?1000h\033[?1003h\033[?1006h")       # mouse on
                 tty.setcbreak(fd)
             except (termios.error, ValueError, OSError):
                 pass
@@ -2522,6 +2744,250 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
     return "\n".join(out), hits
 
 
+PR_COL_W = {"repo": 20, "what": 26, "approval": 3, "ci": 3, "commit": 30, "comment": 24}
+PR_GRID_SEP = rgb(DIM2, " │ ")
+PR_GRID_SEP_LEN = 3
+
+
+def _pr_relts(ts, now):
+    if ts is None:
+        return "—"
+    secs = max(0, (now - ts).total_seconds())
+    if secs < 3600:
+        return f"{int(secs // 60)}m ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h ago"
+    return f"{int(secs // 86400)}d ago"
+
+
+def _pr_ci_cell(state):
+    return {"green": rgb((90, 220, 130), "●"), "red": rgb((240, 90, 90), "●"),
+           "pending": rgb(WARN_C, "●"), "none": rgb(DIM2, "·")}[state]
+
+
+def _pr_approval_cell(label):
+    """Approval column is a single dot: solid red = review required and not
+    yet given, solid green = approved, hollow green = no review required."""
+    return {"Approved": rgb((90, 220, 130), "●"),
+           "Awaiting review": rgb((240, 90, 90), "●"),
+           "Changes requested": rgb((240, 90, 90), "●"),
+           "No review needed": rgb((90, 220, 130), "○")}.get(label, rgb(DIM2, "·"))
+
+
+def _pr_hrule(col_x, w, inner):
+    """Horizontal gridline for the PRS table: dashes with a '┼' wherever a
+    vertical PR_GRID_SEP's '│' crosses it."""
+    line = ["─"] * inner
+    for k in ("repo", "what", "approval", "ci", "commit", "comment"):
+        p = col_x[k] + w[k] + 1
+        if 0 <= p < inner:
+            line[p] = "┼"
+    return rgb(DIM2, "".join(line))
+
+
+def _clip_ellip(s, width):
+    """_clip, but a truncated string ends in '…' instead of a hard cut."""
+    if _visible_len(s) <= width:
+        return s
+    return _clip(s, max(width - 1, 0)) + rgb(DIM, "…")
+
+
+def pr_row_buttons(row):
+    """(label, action_kind) pairs shown for this row, in click order."""
+    btns = []
+    if row["kind"] == "pr":
+        if (row["approval"] in ("Approved", "No review needed") and row["ci"] == "green"
+                and not row["is_draft"]):
+            btns.append(("Merge", "merge"))
+        btns.append(("Draft" if not row["is_draft"] else "Ready",
+                     "draft" if not row["is_draft"] else "ready"))
+        btns.append(("Close", "close"))
+    else:
+        btns.append(("Delete", "delete"))
+    return btns
+
+
+def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0):
+    """PRS tab: your open PRs + branches you've contributed to with no open
+    PR. Returns (frame_str, hits, tips) — same convention as render_frame()
+    plus `tips`: [(screen_row, lo, hi, full_text)] for cells whose shown text
+    is truncated, consumed by the hover-tooltip lookup in run_live. Every
+    interactive cell/button carries a token consumed by process_input:
+      "__pr_open__<i>"            click a row -> open its URL
+      "__pr_ci__<i>"              click a red CI dot -> failing-checks popup
+      "__pr_comment__<i>"         click a comment cell -> full text popup
+      "__pr_confirm__<kind>__<i>" click a button -> confirm-then-run popup
+    `loading` (true only before the first scan ever completes) swaps the
+    panel body for a Cylon progress bar, same treatment as the initial LIVE
+    transcript scan — later background refreshes stay silent.
+    """
+    out, hits, tips = [], [], []
+    brand = rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, "CLAUDE CODE", bold=True)
+    brand_len = 2 + len("CLAUDE CODE")
+    tabs_str, tabs_len, segs = view_tabs("prs")
+    local = now.astimezone()
+    right = rgb(DIM, f"{local:%a %d %b · %H:%M:%S %Z}")
+    BRAND_GAP = 4
+    inner = max(cols - 2, PR_COL_W["repo"] + PR_COL_W["what"] + PR_COL_W["approval"]
+               + PR_COL_W["ci"] + PR_COL_W["commit"] + PR_COL_W["comment"]
+               + PR_GRID_SEP_LEN * 6 + 30)
+    total_width = inner + 2
+    pad = max(total_width - brand_len - BRAND_GAP - tabs_len - _visible_len(f"{local:%a %d %b · %H:%M:%S %Z}") - 2, 1)
+    out += [" " + brand + " " * BRAND_GAP + tabs_str + " " * pad + right,
+           grad_rule(total_width, ACCENT2, ACCENT), ""]
+    tab_x0 = 1 + brand_len + BRAND_GAP
+    title_row = len(out) - 2
+    for tok, lo, hi in segs:
+        hits.append((title_row, tab_x0 + lo + 1, tab_x0 + hi + 1, tok))
+
+    if loading:
+        content, _ = _progress_content(inner, elapsed, "Fetching PRs and branches from GitHub…")
+        out += panel("PRS", content, inner)
+    elif err:
+        body = [rgb(WARN_C, err)]
+        out += panel("PRS", body, inner)
+    elif not rows:
+        out += panel("PRS", [rgb(DIM, "no open PRs, no unopened branches you've touched")], inner)
+    else:
+        w = PR_COL_W
+        head = (_padcol(rgb(TEXT, "REPO", bold=True), w["repo"]) + PR_GRID_SEP
+               + _padcol(rgb(TEXT, "WHAT", bold=True), w["what"]) + PR_GRID_SEP
+               + _padcol(rgb(TEXT, "A", bold=True), w["approval"]) + PR_GRID_SEP
+               + _padcol(rgb(TEXT, "CI", bold=True), w["ci"]) + PR_GRID_SEP
+               + _padcol(rgb(TEXT, "COMMIT", bold=True), w["commit"]) + PR_GRID_SEP
+               + _padcol(rgb(TEXT, "COMMENT", bold=True), w["comment"]) + PR_GRID_SEP
+               + rgb(TEXT, "ACTIONS", bold=True))
+        # col_x: 0-based start offset of each column's TEXT within a content row
+        # (panel() prefixes each row with "│ ", so add +2 for screen columns).
+        # Each column is followed by a PR_GRID_SEP-wide gridline, so every
+        # later column's offset must account for the separators before it.
+        col_x = {}
+        pos = 0
+        for k in ("repo", "what", "approval", "ci", "commit", "comment"):
+            col_x[k] = pos
+            pos += w[k] + PR_GRID_SEP_LEN
+        col_x["actions"] = pos
+        hrule = _pr_hrule(col_x, w, inner)
+        body = [head, hrule]
+        for i, row in enumerate(rows):
+            what = (("[draft] " if row["is_draft"] else "") + row["title"]) if row["kind"] == "pr" else row["branch"]
+            commit = f"{row['commit_sha']} {_pr_relts(row['commit_ts'], now)} {row['commit_msg']}" if row["commit_sha"] else "—"
+            comment = (f"{_pr_relts(row['comment_ts'], now)} {row['comment_author']}: {row['comment_preview']}"
+                      if row["comment_full"] else "—")
+            line = (_padcol(rgb(TEXT, _clip_ellip(row["repo"], w["repo"] - 1)), w["repo"]) + PR_GRID_SEP
+                   + _padcol(rgb(TEXT, _clip_ellip(what, w["what"] - 1)), w["what"]) + PR_GRID_SEP
+                   + _padcol(_pr_approval_cell(row["approval"]), w["approval"]) + PR_GRID_SEP
+                   + _padcol(_pr_ci_cell(row["ci"]), w["ci"]) + PR_GRID_SEP
+                   + _padcol(rgb(DIM, _clip_ellip(commit, w["commit"] - 1)), w["commit"]) + PR_GRID_SEP
+                   + _padcol(rgb(DIM, _clip_ellip(comment, w["comment"] - 1)), w["comment"]) + PR_GRID_SEP)
+            btns = pr_row_buttons(row)
+            actions = "  ".join(f"[{lab}]" for lab, _ in btns)
+            line += rgb(ACCENT, actions)
+            body.append(line)
+            row_i = len(body) - 1   # index within `body`, before panel() adds title+border
+            # panel() prefixes each content row with a "│" border, so screen
+            # column = 2 + body-string index (col1=border, col2=first content char).
+            row_w = col_x["actions"] - PR_GRID_SEP_LEN   # up to (not incl.) the last gridline
+            # More specific spans (CI dot, comment cell) must precede the
+            # whole-row "open" span in `hits` — process_input's next() takes
+            # the FIRST match, and these sit inside the row span.
+            if row["ci"] == "red":
+                hits.append((row_i, 2 + col_x["ci"], 1 + col_x["ci"] + w["ci"], f"__pr_ci__{i}"))
+            if row["comment_full"]:
+                hits.append((row_i, 2 + col_x["comment"], 1 + col_x["comment"] + w["comment"], f"__pr_comment__{i}"))
+            hits.append((row_i, 2, 1 + row_w, f"__pr_open__{i}"))
+            for key, full in (("repo", row["repo"]), ("what", what),
+                              ("commit", commit), ("comment", comment)):
+                if _visible_len(full) > w[key] - 1:   # actually got clipped
+                    hits_lo, hits_hi = 2 + col_x[key], 1 + col_x[key] + w[key]
+                    tips.append((row_i, hits_lo, hits_hi, full))
+            bpos = col_x["actions"]
+            for lab, kind in btns:
+                btxt = f"[{lab}]"
+                hits.append((row_i, 2 + bpos, 1 + bpos + len(btxt), f"__pr_confirm__{kind}__{i}"))
+                bpos += len(btxt) + 2
+            if i != len(rows) - 1:
+                body.append(hrule)
+        panel_lines = panel(f"PRS · {len(rows)} rows", body, inner)
+        panel_start = len(out)
+        out += panel_lines
+        # Translate body-relative row indices to screen coords: panel() adds one
+        # title-border line before body row 0, so body row r sits at out-line
+        # panel_start + 1 + r (0-based) -> screen row panel_start + 2 + r.
+        hits = hits[:len(segs)] + [(panel_start + 2 + r, lo, hi, tok) for r, lo, hi, tok in hits[len(segs):]]
+        tips = [(panel_start + 2 + r, lo, hi, full) for r, lo, hi, full in tips]
+
+    foot = ("click a row to open · click a red CI dot / a comment for detail · "
+           "click a button to act · L live · H history · ? help · ⌃C to exit")
+    foot = foot[:total_width - 2]
+    out += ["", "  " + rgb(DIM, foot)]
+    foot_row = len(out)
+    for sub, tok in (("L live", "__live__"), ("H history", "__history__"), ("⌃C to exit", "__exit__")):
+        j = foot.find(sub)
+        if j >= 0:
+            hits.append((foot_row, j + 3, j + 3 + _visible_len(sub) - 1, tok))
+    return "\n".join(out), hits, tips
+
+
+def render_pr_tooltip(text, max_width):
+    """Small floating box for a truncated cell's full text, drawn near the
+    mouse cursor — not a modal overlay, doesn't touch the click hit-map."""
+    inner = min(max(_visible_len(text), 4), max_width)
+    lines = _wrap(text, inner)
+    inner = max((_visible_len(l) for l in lines), default=inner)
+    top = rgb(DIM2, "╭" + "─" * (inner + 2) + "╮")
+    bot = rgb(DIM2, "╰" + "─" * (inner + 2) + "╯")
+    mid = [rgb(DIM2, "│ ") + _padcol(rgb(TEXT, l), inner) + rgb(DIM2, " │") for l in lines]
+    return [top] + mid + [bot]
+
+
+def render_pr_ci_popup(row, cols, term_rows):
+    checks = row["ci_checks"] or [("(no check detail returned)", "")]
+    inner = min(max(cols - 10, 40), 80)
+    body = [rgb(TEXT, f"{name}", bold=True) + "  " + rgb((240, 90, 90) if concl in
+           ("FAILURE", "failure", "ERROR", "error") else DIM, str(concl))
+           for name, concl in checks]
+    body += ["", rgb(DIM, "click outside / esc / q to close")]
+    return panel(f"CI checks · {row['repo']} #{row['number']}", body, inner)
+
+
+def render_pr_comment_popup(row, cols, term_rows):
+    inner = min(max(cols - 10, 40), 90)
+    lines = _wrap(row["comment_full"] or "(empty)", inner)
+    body = [rgb(TEXT, f"{row['comment_author']} · {_pr_relts(row['comment_ts'], datetime.now(timezone.utc))}", bold=True), ""]
+    body += [rgb(TEXT, l) for l in lines]
+    body += ["", rgb(DIM, "click outside / esc / q to close")]
+    return panel("Comment", body, inner)
+
+
+def render_pr_confirm_popup(kind, row, cols, term_rows):
+    verb = {"merge": "Squash-merge", "close": "Close", "ready": "Mark ready",
+           "draft": "Convert to draft", "delete": "Delete branch"}[kind]
+    what = f"#{row['number']} {row['title']}" if row["kind"] == "pr" else row["branch"]
+    inner = min(max(cols - 20, 40), 70)
+    body = ["", rgb(TEXT, f"{verb} — {row['repo']}", bold=True),
+           rgb(TEXT, what), "",
+           rgb(WARN_C, "[Y] confirm", bold=True) + "    " + rgb(DIM, "[N] / esc cancel"), ""]
+    regions = [(2, 1, len("[Y] confirm"), "__pr_do_confirm__"),
+              (2, len("[Y] confirm") + 5, len("[Y] confirm") + 5 + len("[N] / esc cancel") - 1, "__pr_do_cancel__")]
+    return panel("Confirm", body, inner), regions
+
+
+def render_pr_progress_popup(kind, elapsed, cols, term_rows):
+    verb = {"merge": "Merging…", "close": "Closing…", "ready": "Marking ready…",
+           "draft": "Converting to draft…", "delete": "Deleting branch…"}.get(kind, "Working…")
+    inner = min(max(cols - 20, 40), 60)
+    content, _ = _progress_content(inner, elapsed, verb)
+    return panel("PRS", content, inner)
+
+
+def render_pr_error_popup(err, cols, term_rows):
+    inner = min(max(cols - 20, 40), 70)
+    body = ["", rgb(WARN_C, "gh command failed", bold=True), ""] + _wrap(err, inner)
+    body += ["", rgb(DIM, "click outside / esc / q to dismiss")]
+    return panel("Error", body, inner)
+
+
 def term_cols():
     """Terminal width, or a 12h-at-5m fallback (152) when it can't be probed
     (piped --once) so non-interactive output keeps the historical default."""
@@ -2667,6 +3133,10 @@ def main():
                     help="base input $/million-tokens for the history $ estimate "
                          "(default 5.0 = Opus 4.8 input); effective tokens are "
                          "priced at this rate")
+    ap.add_argument("--pr-refresh-seconds", type=int, default=300, metavar="SECONDS",
+                    help="seconds between PRS-tab refreshes (default 300). Each "
+                         "scan is several `gh` subprocess calls, so this is "
+                         "deliberately coarser than --interval.")
     ap.add_argument("--exclude", default=None, metavar="PATH" + os.pathsep + "PATH",
                     help="full or partial cwd path(s) to leave out of every "
                          "chart/panel entirely, e.g. a background job's fixed "
@@ -2681,6 +3151,9 @@ def main():
         EXCLUDE_PATTERNS.extend(
             p.strip().lower().replace("\\", "/")
             for p in args.exclude.split(os.pathsep) if p.strip())
+
+    global PR_REFRESH_SECONDS
+    PR_REFRESH_SECONDS = args.pr_refresh_seconds
 
     cols = term_cols()
     configure_dimensions(args, cols, ap.error)
@@ -2855,7 +3328,7 @@ def run_live(args):
         # Enable SGR mouse reporting + cbreak input so clicks/keys arrive
         # immediately. cbreak (not raw) keeps ISIG, so ⌃C still raises.
         try:
-            sys.stdout.write("\033[?1000h\033[?1006h")
+            sys.stdout.write("\033[?1000h\033[?1003h\033[?1006h")   # 1003: any-motion, for PRS-tab hover tooltips
             old_term = termios.tcgetattr(fd)
             tty.setcbreak(fd)
             # NB: do NOT set stdin non-blocking. stdin/stdout share one tty file
@@ -2873,7 +3346,21 @@ def run_live(args):
     # history view is open — a week-wide transcript scan is heavy.
     hist_buckets, hist_sessions, last_hist_collect = [], {}, None
     show_history = False
+    # PRS view: open PRs + unopened contributed branches via `gh`. Own refresh
+    # cadence (PR_REFRESH_SECONDS, much slower than --interval — each scan is
+    # several `gh` subprocess calls) and its own small overlay state, since its
+    # popups (CI/comment drilldown, confirm-then-run) are independent of the
+    # session/bucket/panel popups the live/history views use.
+    show_prs = False
+    pr_rows, pr_err, last_pr_collect = [], None, None
+    pr_tips, pr_hover = [], None
+    pr_ui = {"ci_idx": None, "comment_idx": None, "confirm": None, "err": None}
+    pr_action_running_prev = False
+    pr_action_started = None
     anim = 0
+    anim_t0 = time.monotonic()   # shimmer phase is wallclock-derived, not tick-count —
+                                  # see `anim` reassignment below (tick rate varies: 5fps
+                                  # normal, 30fps while a Cylon bar is on screen)
     hits = []
     focus_sid = None
     focus_bucket = None
@@ -2897,6 +3384,12 @@ def run_live(args):
           # still breaks to the finally that restores the terminal.
           try:
             now = datetime.now(timezone.utc)
+            # Wallclock-derived, not incremented per tick: the loop's tick rate
+            # varies (TICK_SECONDS normally, CYLON_TICK — 30fps — while a Cylon
+            # bar is on screen), and a per-tick counter would make the shimmer
+            # run 6x too fast during those windows. Units match a TICK_SECONDS
+            # tick so shimmer speed at the normal cadence is unchanged.
+            anim = int((time.monotonic() - anim_t0) / TICK_SECONDS)
             # Poll a background login every tick, whether or not new input
             # arrived, so the progress bar animates and completion is noticed
             # promptly. On timeout (an SSO variant needing keyboard input,
@@ -2983,6 +3476,25 @@ def run_live(args):
                 frame, hits = render_frame(now, hist_buckets, hist_sessions,
                                            anim, layout, summary_tab,
                                            cols=cols, rows=rows, mode="history")
+            elif show_prs:
+                if (last_pr_collect is None
+                        or (now - last_pr_collect).total_seconds() >= PR_REFRESH_SECONDS):
+                    kick_collect_prs()
+                    last_pr_collect = now
+                pr_rows, pr_err = _pr_collect_result.get("prs", (pr_rows, pr_err))
+                # A just-finished action's row is stale until the next scan —
+                # force one immediately rather than waiting PR_REFRESH_SECONDS.
+                if pr_action_running_prev and not _pr_action["running"]:
+                    last_pr_collect = None
+                    if _pr_action["error"]:
+                        pr_ui["err"] = _pr_action["error"]
+                        _pr_action["error"] = None
+                pr_action_running_prev = _pr_action["running"]
+                cur_buckets, cur_sessions = buckets, sessions
+                pr_loading = "prs" not in _pr_collect_result
+                pr_elapsed = (now - last_pr_collect).total_seconds() if last_pr_collect else 0
+                frame, hits, pr_tips = render_prs_frame(now, pr_rows, pr_err, cols, rows,
+                                                        loading=pr_loading, elapsed=pr_elapsed)
             else:
                 cur_buckets, cur_sessions = buckets, sessions
                 layout = plan_layout(rows, cols, sessions, now) if alt else None
@@ -2998,6 +3510,7 @@ def run_live(args):
                 show_help = show_uerr = show_login = False
                 panel_view = None
                 focus_sid = focus_bucket = None
+                pr_ui = {"ci_idx": None, "comment_idx": None, "confirm": None, "err": None}
                 frame = render_too_small(cols, rows, 9)
             if alt:
                 # One overlay at a time: loading > help > login-confirm >
@@ -3043,6 +3556,33 @@ def run_live(args):
                         panel_view = None
                     else:
                         okey = ("panel", panel_view, summary_tab)
+                elif pr_ui["confirm"] is not None:
+                    kind, idx = pr_ui["confirm"]
+                    if idx < len(pr_rows):
+                        overlay, overlay_regions = render_pr_confirm_popup(
+                            kind, pr_rows[idx], cols, rows)
+                        okey = ("prconfirm", kind, idx)
+                    else:
+                        pr_ui["confirm"] = None
+                elif _pr_action["running"]:
+                    elapsed = time.monotonic() - (pr_action_started or time.monotonic())
+                    overlay = render_pr_progress_popup(_pr_action["kind"], elapsed, cols, rows)
+                    okey = "praction"
+                elif pr_ui["err"]:
+                    overlay = render_pr_error_popup(pr_ui["err"], cols, rows)
+                    okey = "prerr"
+                elif pr_ui["ci_idx"] is not None:
+                    if pr_ui["ci_idx"] < len(pr_rows):
+                        overlay = render_pr_ci_popup(pr_rows[pr_ui["ci_idx"]], cols, rows)
+                        okey = ("prci", pr_ui["ci_idx"])
+                    else:
+                        pr_ui["ci_idx"] = None
+                elif pr_ui["comment_idx"] is not None:
+                    if pr_ui["comment_idx"] < len(pr_rows):
+                        overlay = render_pr_comment_popup(pr_rows[pr_ui["comment_idx"]], cols, rows)
+                        okey = ("prcomment", pr_ui["comment_idx"])
+                    else:
+                        pr_ui["comment_idx"] = None
                 if overlay is not None:
                     # Reset scroll on a fresh/changed overlay, then fit it to the
                     # terminal (clip width, scroll + scrollbar when too tall).
@@ -3054,6 +3594,19 @@ def run_live(args):
                     # No overlay: full base repaint each tick (shimmer live).
                     body = "\033[H" + frame.replace("\n", "\033[K\n") + "\033[K\033[J"
                     sys.stdout.write(body)
+                    # PRS hover tooltip: floats near the cursor, doesn't touch
+                    # `hits` — clicks still work normally while it's showing.
+                    if show_prs and pr_hover is not None:
+                        hx, hy = pr_hover
+                        tip_text = next((full for (tr, lo, hi, full) in pr_tips
+                                        if tr == hy and lo <= hx <= hi), None)
+                        if tip_text is not None:
+                            box = render_pr_tooltip(tip_text, min(cols - 4, 60))
+                            bw = max((_visible_len(l) for l in box), default=0)
+                            row0 = max(1, min(hy + 1, rows - len(box)))
+                            col0 = max(1, min(hx, cols - bw + 1))
+                            for k, ln in enumerate(box):
+                                sys.stdout.write(f"\033[{row0 + k};{col0}H" + ln)
                 else:
                     oh = len(overlay)
                     ow = max((_visible_len(x) for x in overlay), default=0)
@@ -3099,13 +3652,14 @@ def run_live(args):
             else:
                 sys.stdout.write(frame + "\n")
             sys.stdout.flush()
-            anim += 1
 
             # Input-aware wait: wake early on a click/keypress for ≤1-tick latency.
             # A Cylon bar is on screen (LOADING or login popup) needs a
             # reliable 30fps redraw, well above the normal 5fps shimmer
             # cadence — narrow the wait just for that window.
-            cylon_active = login_proc is not None or not first_load_done
+            cylon_active = (login_proc is not None or not first_load_done
+                            or _pr_action["running"]
+                            or (show_prs and "prs" not in _pr_collect_result))
             if alt and old_term is not None:
                 r, _, _ = select.select([sys.stdin], [], [],
                                         CYLON_TICK if cylon_active else TICK_SECONDS)
@@ -3114,13 +3668,34 @@ def run_live(args):
                         data = os.read(fd, 4096).decode("utf-8", "ignore")
                     except OSError:
                         data = ""
-                    (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
-                     show_uerr, show_login, show_history, quit_flag,
-                     scroll_delta, do_login, do_retry, do_switch,
-                     do_cancel) = process_input(
-                        data, mouse_re, hits, focus_sid, focus_bucket,
-                        panel_view, summary_tab, show_help, show_uerr, show_login,
-                        show_history, login_proc is not None)
+                    do_prs = False
+                    if show_prs:
+                        scroll_delta = 0
+                        do_login = do_retry = do_switch = do_cancel = False
+                        (pr_ui, show_help, go_live, go_history, quit_flag,
+                         do_pr_run, pr_hover) = process_prs_input(
+                            data, mouse_re, hits, pr_ui, pr_rows, show_help,
+                            _pr_action["running"], pr_hover)
+                        if go_live or go_history:
+                            show_prs = False
+                            show_history = go_history
+                        if do_pr_run is not None:
+                            kind, row = do_pr_run
+                            if kick_pr_action(kind, pr_action_args(kind, row),
+                                              (row["repo"], row["number"] or row["branch"])):
+                                pr_action_started = time.monotonic()
+                    else:
+                        (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
+                         show_uerr, show_login, show_history, quit_flag,
+                         scroll_delta, do_login, do_retry, do_switch,
+                         do_cancel, do_prs) = process_input(
+                            data, mouse_re, hits, focus_sid, focus_bucket,
+                            panel_view, summary_tab, show_help, show_uerr, show_login,
+                            show_history, login_proc is not None)
+                        if do_prs:
+                            show_prs, show_history = True, False
+                            pr_ui = {"ci_idx": None, "comment_idx": None,
+                                    "confirm": None, "err": None}
                     if quit_flag:              # footer "⌃C to exit" was clicked
                         break
                     # Manual retry/login bypass the retry_at backoff gate above.
@@ -3161,7 +3736,7 @@ def run_live(args):
         if alt:
             if old_term is not None:
                 try:
-                    sys.stdout.write("\033[?1000l\033[?1006l")   # disable mouse
+                    sys.stdout.write("\033[?1000l\033[?1003l\033[?1006l")   # disable mouse
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
                 except (termios.error, ValueError, OSError):
                     pass
@@ -3172,6 +3747,9 @@ def run_live(args):
 def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
                   summary_tab, show_help, show_uerr, show_login, show_history,
                   login_active=False):
+    # do_prs (returned) tells run_live to switch into the PRS view — that
+    # view has its own overlay state and input handling (process_prs_input),
+    # so this function only needs to recognise the tab click / 'P' key.
     """Update the overlay/selection state from a chunk of terminal input and
     return a scroll delta for the (only scrollable) help overlay.
 
@@ -3204,12 +3782,14 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
 
     Returns (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
     show_uerr, show_login, show_history, quit_flag, scroll_delta, do_login,
-    do_retry, do_switch, do_cancel). do_login/do_retry ask the main loop to
-    start the login flow or force an immediate usage refetch — both bypass
-    retry_at. do_switch is None or the slug of the saved account to switch
-    to. do_cancel asks the main loop to kill an in-progress login."""
+    do_retry, do_switch, do_cancel, do_prs). do_login/do_retry ask the main
+    loop to start the login flow or force an immediate usage refetch — both
+    bypass retry_at. do_switch is None or the slug of the saved account to
+    switch to. do_cancel asks the main loop to kill an in-progress login.
+    do_prs asks the main loop to switch to the PRS view (its own overlay
+    state lives in run_live, handled by process_prs_input from then on)."""
     delta = 0
-    quit_flag = False
+    quit_flag = do_prs = False
     do_login = do_retry = do_cancel = False
     do_switch = None
     for m in mouse_re.finditer(data):
@@ -3252,6 +3832,10 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
                 show_login = False
             elif hit in ("__history__", "__live__"):   # Live/History tab or span
                 show_history = (hit == "__history__")
+                focus_sid = focus_bucket = panel_view = None
+                show_uerr = show_help = False
+            elif hit == VIEW_PRS:          # PRs tab
+                do_prs = True
                 focus_sid = focus_bucket = panel_view = None
                 show_uerr = show_help = False
             elif hit in ("__hsummary__", "__heatmap__"):   # footer S/M popups
@@ -3330,6 +3914,10 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             show_history = False
             focus_sid = focus_bucket = panel_view = None
             show_uerr = False
+        if "P" in rest or "p" in rest:
+            do_prs = True
+            focus_sid = focus_bucket = panel_view = None
+            show_uerr = False
         # Panel popup toggles. In history: S = window SUMMARY, M = activity
         # heatmap (inline-fallback popups). In live: s/e/w = summary / sessions /
         # allowance. Opening a popup closes any session/bucket drill-down under it.
@@ -3363,7 +3951,101 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             show_history = False
     return (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
             show_uerr, show_login, show_history, quit_flag, delta,
-            do_login, do_retry, do_switch, do_cancel)
+            do_login, do_retry, do_switch, do_cancel, do_prs)
+
+
+def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_running, pr_hover):
+    """Input handling for the PRS view — separate from process_input because
+    its overlays (CI/comment drilldown, confirm-then-run, action progress) are
+    independent of the live/history session/bucket/panel popups. Row/button
+    clicks are ignored while action_running (a `gh` mutation is in flight);
+    only the progress popup is shown then, with nothing to click.
+
+    Returns (pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run,
+    pr_hover). go_live/go_history ask run_live to leave the PRS view.
+    do_pr_run is None or (kind, row) once a confirm popup's [Y]/'y' has been
+    accepted — run_live owns actually starting the `gh` subprocess
+    (kick_pr_action). pr_hover is the latest (x, y) from a mode-1003
+    no-button motion event (for the hover tooltip), or unchanged if none
+    arrived this tick."""
+    pr_ui = dict(pr_ui)
+    go_live = go_history = quit_flag = False
+    do_pr_run = None
+    for m in mouse_re.finditer(data):
+        button, x, y, final = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
+        if button & 32 and button & 0b11 == 3:
+            pr_hover = (x, y)   # pure hover motion, no button — not a click
+            continue
+        if button in (64, 65) or not (button & 0b11 == 0 and not button & 64 and final == "M"):
+            continue   # only plain left-press is a click here; PRS has no scroll body
+        if show_help:
+            show_help = False
+            continue
+        hit = next((tok for (tr, lo, hi, tok) in hits if tr == y and lo <= x <= hi), None)
+        if action_running:
+            continue    # nothing clickable while a gh mutation runs
+        if hit == "__live__":
+            go_live = True
+        elif hit == "__history__":
+            go_history = True
+        elif hit == "__exit__":
+            quit_flag = True
+        elif hit and hit.startswith("__pr_open__"):
+            if not any(v is not None for v in pr_ui.values()):   # only a bare row-click opens
+                i = int(hit[len("__pr_open__"):])
+                if i < len(pr_rows):
+                    opener = "open" if sys.platform == "darwin" else "xdg-open"
+                    try:
+                        subprocess.Popen([opener, pr_rows[i]["url"]],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except (OSError, subprocess.SubprocessError) as e:
+                        log.warning("open %s failed: %s", pr_rows[i]["url"], e)
+        elif hit and hit.startswith("__pr_ci__"):
+            pr_ui["ci_idx"] = int(hit[len("__pr_ci__"):])
+        elif hit and hit.startswith("__pr_comment__"):
+            pr_ui["comment_idx"] = int(hit[len("__pr_comment__"):])
+        elif hit and hit.startswith("__pr_confirm__"):
+            kind, idx = hit[len("__pr_confirm__"):].rsplit("__", 1)
+            pr_ui["confirm"] = (kind, int(idx))
+        elif hit == "__pr_do_confirm__" and pr_ui["confirm"] is not None:
+            kind, idx = pr_ui["confirm"]
+            if idx < len(pr_rows):
+                do_pr_run = (kind, pr_rows[idx])
+            pr_ui["confirm"] = None
+        elif hit == "__pr_do_cancel__":
+            pr_ui["confirm"] = None
+        elif hit is None and any(v is not None for v in pr_ui.values()):   # click outside closes
+            pr_ui = {"ci_idx": None, "comment_idx": None, "confirm": None, "err": None}
+    rest = mouse_re.sub("", data)
+    if "?" in rest:
+        show_help = not show_help
+    bare_esc = any(rest[i] == "\x1b" and (i + 1 >= len(rest) or rest[i + 1] != "[")
+                   for i in range(len(rest)))
+    if not action_running:
+        if pr_ui["confirm"] is not None:
+            kind, idx = pr_ui["confirm"]
+            if "y" in rest or "Y" in rest:
+                if idx < len(pr_rows):
+                    do_pr_run = (kind, pr_rows[idx])
+                pr_ui["confirm"] = None
+            elif "n" in rest or "N" in rest or "q" in rest or bare_esc:
+                pr_ui["confirm"] = None
+        elif "q" in rest or bare_esc:
+            if show_help:
+                show_help = False
+            elif pr_ui["err"]:
+                pr_ui["err"] = None
+            elif pr_ui["ci_idx"] is not None:
+                pr_ui["ci_idx"] = None
+            elif pr_ui["comment_idx"] is not None:
+                pr_ui["comment_idx"] = None
+            else:
+                go_live = True         # PRS has no parent overlay; q/esc leaves to Live
+    if "H" in rest or "h" in rest:
+        go_history = True
+    if "L" in rest or "l" in rest:
+        go_live = True
+    return pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run, pr_hover
 
 
 if __name__ == "__main__":
