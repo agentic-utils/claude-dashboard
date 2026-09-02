@@ -50,11 +50,13 @@ that slice down by session. `L` or `q` returns to Live. Configure with
 **PRS tab** — press **`P`** (or click the **PRs** tab): every open PR you've
 authored, plus every branch you've pushed commits to that has no open PR yet,
 across every repo `gh` can see for your account (no hardcoded org/owner — it's
-discovered via `gh search prs` and a commit-author search). Each row shows
-approval status (Approved / Changes requested / Awaiting review / No review
-needed), CI (a green/red/pending dot — click a red one for the failing checks),
-last commit (SHA, relative time, headline), and last comment (relative time,
-author, a 20-char preview — click for the full text). Row buttons, each behind
+discovered via `gh search prs` and a commit-author search). A grid-lined
+table: approval is a dot (solid green = approved, solid red = review
+required, hollow green = no review needed), CI is a dot too (green/red/amber
+— click a red one for the failing checks), then last commit (SHA, relative
+time, headline) and last comment (relative time, author, a 20-char preview —
+click for the full text). Hover any truncated cell for a tooltip with the
+full text. Row buttons, each behind
 a **`[Y]/[N]`** confirm popup and a Cylon progress bar while it runs:
 **Merge** (squash + delete branch — shown only once approved-or-no-review-needed
 AND CI is green AND it isn't a draft), **Draft ↔ Ready** toggle, **Close**, and

@@ -2307,7 +2307,7 @@ def _run_login_suspended(fd, old_term):
     try:
         # --- suspend: undo main()'s terminal setup ---
         if old_term is not None:
-            sys.stdout.write("\033[?1000l\033[?1006l")          # mouse off
+            sys.stdout.write("\033[?1000l\033[?1003l\033[?1006l")          # mouse off
         sys.stdout.write("\033[?7h\033[?25h\033[?1049l")         # wrap+cursor on, leave alt
         sys.stdout.flush()
         if old_term is not None:
@@ -2325,7 +2325,7 @@ def _run_login_suspended(fd, old_term):
         sys.stdout.write("\033[?1049h\033[?25l\033[?7l")         # alt, hide cursor, no wrap
         if old_term is not None:
             try:
-                sys.stdout.write("\033[?1000h\033[?1006h")       # mouse on
+                sys.stdout.write("\033[?1000h\033[?1003h\033[?1006h")       # mouse on
                 tty.setcbreak(fd)
             except (termios.error, ValueError, OSError):
                 pass
@@ -2809,7 +2809,9 @@ def pr_row_buttons(row):
 
 def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0):
     """PRS tab: your open PRs + branches you've contributed to with no open
-    PR. Returns (frame_str, hits) — same convention as render_frame(). Every
+    PR. Returns (frame_str, hits, tips) — same convention as render_frame()
+    plus `tips`: [(screen_row, lo, hi, full_text)] for cells whose shown text
+    is truncated, consumed by the hover-tooltip lookup in run_live. Every
     interactive cell/button carries a token consumed by process_input:
       "__pr_open__<i>"            click a row -> open its URL
       "__pr_ci__<i>"              click a red CI dot -> failing-checks popup
@@ -2819,7 +2821,7 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0):
     panel body for a Cylon progress bar, same treatment as the initial LIVE
     transcript scan — later background refreshes stay silent.
     """
-    out, hits = [], []
+    out, hits, tips = [], [], []
     brand = rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, "CLAUDE CODE", bold=True)
     brand_len = 2 + len("CLAUDE CODE")
     tabs_str, tabs_len, segs = view_tabs("prs")
@@ -2872,8 +2874,8 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0):
             commit = f"{row['commit_sha']} {_pr_relts(row['commit_ts'], now)} {row['commit_msg']}" if row["commit_sha"] else "—"
             comment = (f"{_pr_relts(row['comment_ts'], now)} {row['comment_author']}: {row['comment_preview']}"
                       if row["comment_full"] else "—")
-            line = (_padcol(rgb(TEXT, _clip(row["repo"], w["repo"] - 1)), w["repo"]) + PR_GRID_SEP
-                   + _padcol(rgb(TEXT, _clip(what, w["what"] - 1)), w["what"]) + PR_GRID_SEP
+            line = (_padcol(rgb(TEXT, _clip_ellip(row["repo"], w["repo"] - 1)), w["repo"]) + PR_GRID_SEP
+                   + _padcol(rgb(TEXT, _clip_ellip(what, w["what"] - 1)), w["what"]) + PR_GRID_SEP
                    + _padcol(_pr_approval_cell(row["approval"]), w["approval"]) + PR_GRID_SEP
                    + _padcol(_pr_ci_cell(row["ci"]), w["ci"]) + PR_GRID_SEP
                    + _padcol(rgb(DIM, _clip_ellip(commit, w["commit"] - 1)), w["commit"]) + PR_GRID_SEP
@@ -2894,6 +2896,11 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0):
             if row["comment_full"]:
                 hits.append((row_i, 2 + col_x["comment"], 1 + col_x["comment"] + w["comment"], f"__pr_comment__{i}"))
             hits.append((row_i, 2, 1 + row_w, f"__pr_open__{i}"))
+            for key, full in (("repo", row["repo"]), ("what", what),
+                              ("commit", commit), ("comment", comment)):
+                if _visible_len(full) > w[key] - 1:   # actually got clipped
+                    hits_lo, hits_hi = 2 + col_x[key], 1 + col_x[key] + w[key]
+                    tips.append((row_i, hits_lo, hits_hi, full))
             bpos = col_x["actions"]
             for lab, kind in btns:
                 btxt = f"[{lab}]"
@@ -2908,6 +2915,7 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0):
         # title-border line before body row 0, so body row r sits at out-line
         # panel_start + 1 + r (0-based) -> screen row panel_start + 2 + r.
         hits = hits[:len(segs)] + [(panel_start + 2 + r, lo, hi, tok) for r, lo, hi, tok in hits[len(segs):]]
+        tips = [(panel_start + 2 + r, lo, hi, full) for r, lo, hi, full in tips]
 
     foot = ("click a row to open · click a red CI dot / a comment for detail · "
            "click a button to act · L live · H history · ? help · ⌃C to exit")
@@ -2918,7 +2926,19 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0):
         j = foot.find(sub)
         if j >= 0:
             hits.append((foot_row, j + 3, j + 3 + _visible_len(sub) - 1, tok))
-    return "\n".join(out), hits
+    return "\n".join(out), hits, tips
+
+
+def render_pr_tooltip(text, max_width):
+    """Small floating box for a truncated cell's full text, drawn near the
+    mouse cursor — not a modal overlay, doesn't touch the click hit-map."""
+    inner = min(max(_visible_len(text), 4), max_width)
+    lines = _wrap(text, inner)
+    inner = max((_visible_len(l) for l in lines), default=inner)
+    top = rgb(DIM2, "╭" + "─" * (inner + 2) + "╮")
+    bot = rgb(DIM2, "╰" + "─" * (inner + 2) + "╯")
+    mid = [rgb(DIM2, "│ ") + _padcol(rgb(TEXT, l), inner) + rgb(DIM2, " │") for l in lines]
+    return [top] + mid + [bot]
 
 
 def render_pr_ci_popup(row, cols, term_rows):
@@ -3308,7 +3328,7 @@ def run_live(args):
         # Enable SGR mouse reporting + cbreak input so clicks/keys arrive
         # immediately. cbreak (not raw) keeps ISIG, so ⌃C still raises.
         try:
-            sys.stdout.write("\033[?1000h\033[?1006h")
+            sys.stdout.write("\033[?1000h\033[?1003h\033[?1006h")   # 1003: any-motion, for PRS-tab hover tooltips
             old_term = termios.tcgetattr(fd)
             tty.setcbreak(fd)
             # NB: do NOT set stdin non-blocking. stdin/stdout share one tty file
@@ -3333,6 +3353,7 @@ def run_live(args):
     # session/bucket/panel popups the live/history views use.
     show_prs = False
     pr_rows, pr_err, last_pr_collect = [], None, None
+    pr_tips, pr_hover = [], None
     pr_ui = {"ci_idx": None, "comment_idx": None, "confirm": None, "err": None}
     pr_action_running_prev = False
     pr_action_started = None
@@ -3472,8 +3493,8 @@ def run_live(args):
                 cur_buckets, cur_sessions = buckets, sessions
                 pr_loading = "prs" not in _pr_collect_result
                 pr_elapsed = (now - last_pr_collect).total_seconds() if last_pr_collect else 0
-                frame, hits = render_prs_frame(now, pr_rows, pr_err, cols, rows,
-                                               loading=pr_loading, elapsed=pr_elapsed)
+                frame, hits, pr_tips = render_prs_frame(now, pr_rows, pr_err, cols, rows,
+                                                        loading=pr_loading, elapsed=pr_elapsed)
             else:
                 cur_buckets, cur_sessions = buckets, sessions
                 layout = plan_layout(rows, cols, sessions, now) if alt else None
@@ -3573,6 +3594,19 @@ def run_live(args):
                     # No overlay: full base repaint each tick (shimmer live).
                     body = "\033[H" + frame.replace("\n", "\033[K\n") + "\033[K\033[J"
                     sys.stdout.write(body)
+                    # PRS hover tooltip: floats near the cursor, doesn't touch
+                    # `hits` — clicks still work normally while it's showing.
+                    if show_prs and pr_hover is not None:
+                        hx, hy = pr_hover
+                        tip_text = next((full for (tr, lo, hi, full) in pr_tips
+                                        if tr == hy and lo <= hx <= hi), None)
+                        if tip_text is not None:
+                            box = render_pr_tooltip(tip_text, min(cols - 4, 60))
+                            bw = max((_visible_len(l) for l in box), default=0)
+                            row0 = max(1, min(hy + 1, rows - len(box)))
+                            col0 = max(1, min(hx, cols - bw + 1))
+                            for k, ln in enumerate(box):
+                                sys.stdout.write(f"\033[{row0 + k};{col0}H" + ln)
                 else:
                     oh = len(overlay)
                     ow = max((_visible_len(x) for x in overlay), default=0)
@@ -3639,9 +3673,9 @@ def run_live(args):
                         scroll_delta = 0
                         do_login = do_retry = do_switch = do_cancel = False
                         (pr_ui, show_help, go_live, go_history, quit_flag,
-                         do_pr_run) = process_prs_input(
+                         do_pr_run, pr_hover) = process_prs_input(
                             data, mouse_re, hits, pr_ui, pr_rows, show_help,
-                            _pr_action["running"])
+                            _pr_action["running"], pr_hover)
                         if go_live or go_history:
                             show_prs = False
                             show_history = go_history
@@ -3702,7 +3736,7 @@ def run_live(args):
         if alt:
             if old_term is not None:
                 try:
-                    sys.stdout.write("\033[?1000l\033[?1006l")   # disable mouse
+                    sys.stdout.write("\033[?1000l\033[?1003l\033[?1006l")   # disable mouse
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
                 except (termios.error, ValueError, OSError):
                     pass
@@ -3920,22 +3954,28 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             do_login, do_retry, do_switch, do_cancel, do_prs)
 
 
-def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_running):
+def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_running, pr_hover):
     """Input handling for the PRS view — separate from process_input because
     its overlays (CI/comment drilldown, confirm-then-run, action progress) are
     independent of the live/history session/bucket/panel popups. Row/button
     clicks are ignored while action_running (a `gh` mutation is in flight);
     only the progress popup is shown then, with nothing to click.
 
-    Returns (pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run).
-    go_live/go_history ask run_live to leave the PRS view. do_pr_run is None
-    or (kind, row) once a confirm popup's [Y]/'y' has been accepted — run_live
-    owns actually starting the `gh` subprocess (kick_pr_action)."""
+    Returns (pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run,
+    pr_hover). go_live/go_history ask run_live to leave the PRS view.
+    do_pr_run is None or (kind, row) once a confirm popup's [Y]/'y' has been
+    accepted — run_live owns actually starting the `gh` subprocess
+    (kick_pr_action). pr_hover is the latest (x, y) from a mode-1003
+    no-button motion event (for the hover tooltip), or unchanged if none
+    arrived this tick."""
     pr_ui = dict(pr_ui)
     go_live = go_history = quit_flag = False
     do_pr_run = None
     for m in mouse_re.finditer(data):
         button, x, y, final = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
+        if button & 32 and button & 0b11 == 3:
+            pr_hover = (x, y)   # pure hover motion, no button — not a click
+            continue
         if button in (64, 65) or not (button & 0b11 == 0 and not button & 64 and final == "M"):
             continue   # only plain left-press is a click here; PRS has no scroll body
         if show_help:
@@ -4005,7 +4045,7 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_ru
         go_history = True
     if "L" in rest or "l" in rest:
         go_live = True
-    return pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run
+    return pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run, pr_hover
 
 
 if __name__ == "__main__":
