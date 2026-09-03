@@ -2747,6 +2747,7 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
 
 PR_COL_W = {"repo": 20, "number": 6, "what": 26, "approval": 3, "ci": 3, "commit": 30, "comment": 24}
 PR_COLS = ("repo", "number", "what", "approval", "ci", "commit", "comment")
+PR_FLEX_MIN = {"what": 12, "commit": 14, "comment": 10}   # never shrink below these
 PR_GRID_SEP = rgb(DIM2, " │ ")
 PR_GRID_SEP_LEN = 3
 
@@ -2826,19 +2827,39 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
     """
     out, hits, tips = [], [], []
     w = dict(PR_COL_W)
+    actions_w = 0
     if rows:
         # REPO expands to fit the longest name in view, capped at 20% of the
         # terminal width (never shrinks below the default column width).
         longest_repo = max(_visible_len(r["repo"]) for r in rows)
         repo_cap = max(int(cols * 0.20), w["repo"])
         w["repo"] = min(max(longest_repo, w["repo"]), repo_cap)
+        # Action buttons must always stay fully visible — size their budget
+        # from the actual widest button string, not a guess — then shrink
+        # WHAT/COMMIT/COMMENT (never REPO/#/A/CI/actions) to make everything
+        # fit the real terminal width, down to a readable floor each.
+        actions_w = max((len("  ".join(f"[{lab}]" for lab, _ in pr_row_buttons(r)))
+                         for r in rows), default=0)
+        fixed_w = w["repo"] + w["number"] + w["approval"] + w["ci"] + actions_w
+        sep_total = PR_GRID_SEP_LEN * len(PR_COLS)
+        flex_keys = ("what", "commit", "comment")
+        default_flex_total = sum(PR_COL_W[k] for k in flex_keys)
+        min_flex_total = sum(PR_FLEX_MIN[k] for k in flex_keys)
+        budget = max(cols - 2 - fixed_w - sep_total, min_flex_total)
+        if budget < default_flex_total:
+            room = default_flex_total - min_flex_total
+            extra = budget - min_flex_total
+            for k in flex_keys:
+                share = PR_COL_W[k] - PR_FLEX_MIN[k]
+                w[k] = PR_FLEX_MIN[k] + (int(share * extra / room) if room else 0)
+            w["what"] += budget - sum(w[k] for k in flex_keys)   # rounding remainder
     brand = rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, "CLAUDE CODE", bold=True)
     brand_len = 2 + len("CLAUDE CODE")
     tabs_str, tabs_len, segs = view_tabs("prs")
     local = now.astimezone()
     right = rgb(DIM, f"{local:%a %d %b · %H:%M:%S %Z}")
     BRAND_GAP = 4
-    inner = max(cols - 2, sum(w[k] for k in PR_COLS) + PR_GRID_SEP_LEN * len(PR_COLS) + 30)
+    inner = max(cols - 2, sum(w[k] for k in PR_COLS) + PR_GRID_SEP_LEN * len(PR_COLS) + actions_w)
     total_width = inner + 2
     pad = max(total_width - brand_len - BRAND_GAP - tabs_len - _visible_len(f"{local:%a %d %b · %H:%M:%S %Z}") - 2, 1)
     out += [" " + brand + " " * BRAND_GAP + tabs_str + " " * pad + right,
@@ -2924,7 +2945,9 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
             refresh_label = f" · updated {_pr_relts(last_refresh, now)}"
         else:
             refresh_label = ""
-        panel_lines = panel(f"PRS · {len(rows)} rows{refresh_label}", body, inner)
+        refresh_btn = "[Refresh Now]"
+        title = f"PRS · {len(rows)} rows{refresh_label}  {refresh_btn}"
+        panel_lines = panel(title, body, inner)
         panel_start = len(out)
         out += panel_lines
         # Translate body-relative row indices to screen coords: panel() adds one
@@ -2932,6 +2955,11 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
         # panel_start + 1 + r (0-based) -> screen row panel_start + 2 + r.
         hits = hits[:len(segs)] + [(panel_start + 2 + r, lo, hi, tok) for r, lo, hi, tok in hits[len(segs):]]
         tips = [(panel_start + 2 + r, lo, hi, full) for r, lo, hi, full in tips]
+        # Title row itself (panel_start + 1) sits above every body row, added
+        # after the translation above so it isn't swept up as a body offset.
+        btn_off = title.index(refresh_btn)   # 0-based, plain-text offset within title
+        hits.append((panel_start + 1, 4 + btn_off, 4 + btn_off + len(refresh_btn) - 1,
+                    "__pr_refresh_now__"))
 
     foot = ("click a row to open · click a red CI dot / a comment for detail · "
            "click a button to act · L live · H history · ? help · ⌃C to exit")
@@ -3691,9 +3719,11 @@ def run_live(args):
                         scroll_delta = 0
                         do_login = do_retry = do_switch = do_cancel = False
                         (pr_ui, show_help, go_live, go_history, quit_flag,
-                         do_pr_run, pr_hover) = process_prs_input(
+                         do_pr_run, pr_hover, do_pr_refresh) = process_prs_input(
                             data, mouse_re, hits, pr_ui, pr_rows, show_help,
                             _pr_action["running"], pr_hover)
+                        if do_pr_refresh:
+                            last_pr_collect = None   # forces an immediate rescan next tick
                         if go_live or go_history:
                             show_prs = False
                             show_history = go_history
@@ -3980,14 +4010,15 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_ru
     only the progress popup is shown then, with nothing to click.
 
     Returns (pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run,
-    pr_hover). go_live/go_history ask run_live to leave the PRS view.
-    do_pr_run is None or (kind, row) once a confirm popup's [Y]/'y' has been
-    accepted — run_live owns actually starting the `gh` subprocess
+    pr_hover, do_pr_refresh). go_live/go_history ask run_live to leave the
+    PRS view. do_pr_run is None or (kind, row) once a confirm popup's [Y]/'y'
+    has been accepted — run_live owns actually starting the `gh` subprocess
     (kick_pr_action). pr_hover is the latest (x, y) from a mode-1003
     no-button motion event (for the hover tooltip), or unchanged if none
-    arrived this tick."""
+    arrived this tick. do_pr_refresh is True once the [Refresh Now] button
+    was clicked — run_live forces an immediate rescan."""
     pr_ui = dict(pr_ui)
-    go_live = go_history = quit_flag = False
+    go_live = go_history = quit_flag = do_pr_refresh = False
     do_pr_run = None
     for m in mouse_re.finditer(data):
         button, x, y, final = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
@@ -4032,6 +4063,8 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_ru
             pr_ui["confirm"] = None
         elif hit == "__pr_do_cancel__":
             pr_ui["confirm"] = None
+        elif hit == "__pr_refresh_now__":
+            do_pr_refresh = True
         elif hit is None and any(v is not None for v in pr_ui.values()):   # click outside closes
             pr_ui = {"ci_idx": None, "comment_idx": None, "confirm": None, "err": None}
     rest = mouse_re.sub("", data)
@@ -4063,7 +4096,7 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_ru
         go_history = True
     if "L" in rest or "l" in rest:
         go_live = True
-    return pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run, pr_hover
+    return pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run, pr_hover, do_pr_refresh
 
 
 if __name__ == "__main__":
