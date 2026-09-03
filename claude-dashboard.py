@@ -2810,7 +2810,7 @@ def pr_row_buttons(row):
 
 
 def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
-                     last_refresh=None):
+                     last_refresh=None, refreshing=False):
     """PRS tab: your open PRs + branches you've contributed to with no open
     PR. Returns (frame_str, hits, tips) — same convention as render_frame()
     plus `tips`: [(screen_row, lo, hi, full_text)] for cells whose shown text
@@ -2918,7 +2918,12 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
                 bpos += len(btxt) + 2
             if i != len(rows) - 1:
                 body.append(hrule)
-        refresh_label = f" · updated {_pr_relts(last_refresh, now)}" if last_refresh else ""
+        if refreshing:
+            refresh_label = " · refreshing…"
+        elif last_refresh:
+            refresh_label = f" · updated {_pr_relts(last_refresh, now)}"
+        else:
+            refresh_label = ""
         panel_lines = panel(f"PRS · {len(rows)} rows{refresh_label}", body, inner)
         panel_start = len(out)
         out += panel_lines
@@ -3506,7 +3511,8 @@ def run_live(args):
                 pr_elapsed = (now - last_pr_collect).total_seconds() if last_pr_collect else 0
                 frame, hits, pr_tips = render_prs_frame(
                     now, pr_rows, pr_err, cols, rows, loading=pr_loading, elapsed=pr_elapsed,
-                    last_refresh=_pr_collect_result.get("prs_ts"))
+                    last_refresh=_pr_collect_result.get("prs_ts"),
+                    refreshing=(not pr_loading) and _pr_collect_inflight.locked())
             else:
                 cur_buckets, cur_sessions = buckets, sessions
                 layout = plan_layout(rows, cols, sessions, now) if alt else None
