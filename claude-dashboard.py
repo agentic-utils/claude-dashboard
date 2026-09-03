@@ -2945,8 +2945,8 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
             refresh_label = f" · updated {_pr_relts(last_refresh, now)}"
         else:
             refresh_label = ""
-        refresh_btn = "[Refresh Now]"
-        title = f"PRS · {len(rows)} rows{refresh_label}  {refresh_btn}"
+        refresh_btn = "" if refreshing else "  [Refresh Now]"
+        title = f"PRS · {len(rows)} rows{refresh_label}{refresh_btn}"
         panel_lines = panel(title, body, inner)
         panel_start = len(out)
         out += panel_lines
@@ -2957,9 +2957,12 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
         tips = [(panel_start + 2 + r, lo, hi, full) for r, lo, hi, full in tips]
         # Title row itself (panel_start + 1) sits above every body row, added
         # after the translation above so it isn't swept up as a body offset.
-        btn_off = title.index(refresh_btn)   # 0-based, plain-text offset within title
-        hits.append((panel_start + 1, 4 + btn_off, 4 + btn_off + len(refresh_btn) - 1,
-                    "__pr_refresh_now__"))
+        # Hidden (not just unclickable) while refreshing — a stale button
+        # sitting there after the click already looks broken.
+        if not refreshing:
+            btn_off = title.index("[Refresh Now]")   # 0-based, plain-text offset within title
+            hits.append((panel_start + 1, 4 + btn_off, 4 + btn_off + len("[Refresh Now]") - 1,
+                        "__pr_refresh_now__"))
 
     foot = ("click a row to open · click a red CI dot / a comment for detail · "
            "click a button to act · L live · H history · ? help · ⌃C to exit")
