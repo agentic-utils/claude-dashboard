@@ -75,7 +75,7 @@ tab shows a message instead of a table if it isn't. Refreshed every
 ./claude-dashboard.py --pr-refresh-seconds 120   # faster PRS-tab refresh (press P)
 ```
 
-Keys: `?` help · `L`/`H`/`P` live/history/PRs tabs · `S`/`M` history popups ·
+Keys: `?` help · `r` refresh the open tab now · `L`/`H`/`P` live/history/PRs tabs · `S`/`M` history popups ·
 `↑/↓` `PgUp/PgDn` `j/k` scroll help · `q`/`esc` close overlay / leave the current
 tab · click a tab/session/bar/PR row for detail · `Y`/`N` confirm a PRS action ·
 `Ctrl-C` (or click *"⌃C to exit"*) to quit.
