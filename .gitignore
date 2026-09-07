@@ -11,3 +11,4 @@ claude-dashboard.log
 # Python
 __pycache__/
 *.pyc
+.worktrees/
