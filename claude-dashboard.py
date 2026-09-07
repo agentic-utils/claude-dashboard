@@ -3,7 +3,7 @@
 
 Scans the JSONL transcripts under ~/.claude/projects/**/*.jsonl, reads the
 per-response `usage` structures, and renders a live truecolour dashboard.
-The transcript scan refreshes every 5 minutes (--interval); the screen repaints
+The transcript scan refreshes every 5 minutes (--interval, or `r` for now); the screen repaints
 ~5×/s for the shimmer, live clock, and to surface the background usage fetch.
 Covers the last 12 hours in 5-minute buckets.
 
@@ -1541,7 +1541,7 @@ def render_help(now, cols, rows):
         ("G", None),
         ("H", "KEYS"),
         ("T", "? help · L live / H history tabs · S/M history popups · "
-              "s/e/w live panels · click bar/session/tab · "
+              "s/e/w live panels · r refresh now · click bar/session/tab · "
               "up/down PgUp/PgDn j/k scroll · q / esc step back · ^C quit."),
     ]
 
@@ -2724,15 +2724,15 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
         if mode == "history":
             if layout.get("history_panels") == "inline":
                 foot = (f"history · {fmt_window(HIST_BUCKET)} buckets   ·   "
-                        f"click a bar   ·   L live   ·   G login   ·   ? help   ·   ⌃C to exit")
-                spans = [("L live", "__live__"), ("G login", "__login__"),
-                         ("⌃C to exit", "__exit__")]
+                        f"click a bar   ·   R refresh   ·   L live   ·   G login   ·   ? help   ·   ⌃C to exit")
+                spans = [("R refresh", "__refresh__"), ("L live", "__live__"),
+                         ("G login", "__login__"), ("⌃C to exit", "__exit__")]
             else:                          # panels didn't fit — offer the popups
                 foot = (f"history · {fmt_window(HIST_BUCKET)} buckets   ·   "
-                        f"S summary   ·   M heatmap   ·   L live   ·   G login   ·   ⌃C to exit")
+                        f"S summary   ·   M heatmap   ·   R refresh   ·   L live   ·   G login   ·   ⌃C to exit")
                 spans = [("S summary", "__hsummary__"), ("M heatmap", "__heatmap__"),
-                         ("L live", "__live__"), ("G login", "__login__"),
-                         ("⌃C to exit", "__exit__")]
+                         ("R refresh", "__refresh__"), ("L live", "__live__"),
+                         ("G login", "__login__"), ("⌃C to exit", "__exit__")]
         else:
             plan = " · ".join(p for p in (_usage.get("sub"), _usage.get("tier")) if p)
             stamp = _usage["at"].astimezone().strftime("%H:%M:%S") if _usage.get("at") else "—"
@@ -2742,11 +2742,13 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
                 extra = "   ·   e sessions"
             else:
                 extra = ""
+            cadence = ("refreshing…" if _collect_inflight["live"].locked()
+                       else f"charts every {max(1, INTERVAL_SECONDS // 60)}m")
             foot = (f"plan {plan or '?'}   ·   allowance live, updated {stamp}   ·   "
-                    f"charts every {max(1, INTERVAL_SECONDS // 60)}m{extra}   ·   "
+                    f"{cadence}{extra}   ·   R refresh   ·   "
                     f"H history   ·   G login   ·   ? help   ·   ⌃C to exit")
-            spans = [("H history", "__history__"), ("G login", "__login__"),
-                     ("⌃C to exit", "__exit__")]
+            spans = [("R refresh", "__refresh__"), ("H history", "__history__"),
+                     ("G login", "__login__"), ("⌃C to exit", "__exit__")]
         foot = foot[:TOTAL_WIDTH - 2]          # clip so it never wraps/overflows
         out += ["", "  " + rgb(DIM, foot)]
         # Clickable footer spans (H toggles history, M toggles the heatmap,
@@ -3737,7 +3739,7 @@ def run_live(args):
                     do_prs = False
                     if show_prs:
                         scroll_delta = 0
-                        do_login = do_retry = do_switch = do_cancel = False
+                        do_login = do_retry = do_switch = do_cancel = do_refresh = False
                         (pr_ui, show_help, go_live, go_history, quit_flag,
                          do_pr_run, pr_hover, do_pr_refresh) = process_prs_input(
                             data, mouse_re, hits, pr_ui, pr_rows, show_help,
@@ -3756,7 +3758,7 @@ def run_live(args):
                         (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
                          show_uerr, show_login, show_history, quit_flag,
                          scroll_delta, do_login, do_retry, do_switch,
-                         do_cancel, do_prs) = process_input(
+                         do_cancel, do_prs, do_refresh) = process_input(
                             data, mouse_re, hits, focus_sid, focus_bucket,
                             panel_view, summary_tab, show_help, show_uerr, show_login,
                             show_history, login_proc is not None)
@@ -3768,6 +3770,12 @@ def run_live(args):
                         break
                     # Manual retry/login bypass the retry_at backoff gate above.
                     if do_retry:
+                        kick_usage()
+                    if do_refresh:
+                        if show_history:
+                            last_hist_collect = None
+                        else:
+                            last_collect = None
                         kick_usage()
                     if do_switch:              # picked a saved account: just a
                         switch_account(do_switch)   # file swap, no TUI suspend
@@ -3850,14 +3858,15 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
 
     Returns (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
     show_uerr, show_login, show_history, quit_flag, scroll_delta, do_login,
-    do_retry, do_switch, do_cancel, do_prs). do_login/do_retry ask the main
-    loop to start the login flow or force an immediate usage refetch — both
-    bypass retry_at. do_switch is None or the slug of the saved account to
+    do_retry, do_switch, do_cancel, do_prs, do_refresh). do_login/do_retry ask
+    the main loop to start the login flow or force an immediate usage refetch —
+    both bypass retry_at. do_refresh ('r' / footer "R refresh") asks for an
+    immediate transcript rescan of the open view plus a usage refetch. do_switch is None or the slug of the saved account to
     switch to. do_cancel asks the main loop to kill an in-progress login.
     do_prs asks the main loop to switch to the PRS view (its own overlay
     state lives in run_live, handled by process_prs_input from then on)."""
     delta = 0
-    quit_flag = do_prs = False
+    quit_flag = do_prs = do_refresh = False
     do_login = do_retry = do_cancel = False
     do_switch = None
     for m in mouse_re.finditer(data):
@@ -3913,6 +3922,8 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
                 show_uerr = False
             elif hit == "__exit__":        # footer ⌃C span: quit
                 quit_flag = True
+            elif hit == "__refresh__":     # footer "R refresh"
+                do_refresh = True
             elif hit is not None:          # session row (incl. from a popup)
                 focus_sid = hit
                 focus_bucket = None
@@ -3986,6 +3997,8 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             do_prs = True
             focus_sid = focus_bucket = panel_view = None
             show_uerr = False
+        if "r" in rest:               # lowercase only: 'R' is re-login in the account modal
+            do_refresh = True
         # Panel popup toggles. In history: S = window SUMMARY, M = activity
         # heatmap (inline-fallback popups). In live: s/e/w = summary / sessions /
         # allowance. Opening a popup closes any session/bucket drill-down under it.
@@ -4019,7 +4032,7 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             show_history = False
     return (focus_sid, focus_bucket, panel_view, summary_tab, show_help,
             show_uerr, show_login, show_history, quit_flag, delta,
-            do_login, do_retry, do_switch, do_cancel, do_prs)
+            do_login, do_retry, do_switch, do_cancel, do_prs, do_refresh)
 
 
 def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_running, pr_hover):
@@ -4116,6 +4129,8 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_ru
         go_history = True
     if "L" in rest or "l" in rest:
         go_live = True
+    if "r" in rest and not action_running:
+        do_pr_refresh = True
     return pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run, pr_hover, do_pr_refresh
 
 
