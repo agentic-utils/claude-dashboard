@@ -119,13 +119,27 @@ def is_wsl():
 is_wsl._cached = None
 
 
-def _account_uuid(claude_json_path):
+def _account_email(claude_json_path):
     try:
         with open(claude_json_path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
-    return (data.get("oauthAccount") or {}).get("accountUuid")
+    email = (data.get("oauthAccount") or {}).get("emailAddress")
+    return email.lower() if email else None
+
+
+def _own_account_emails():
+    """Every account this user holds: the live login plus each saved snapshot
+    in ACCOUNTS_DIR (its "label" is the account email)."""
+    emails = set()
+    live = _account_email(os.path.expanduser("~/.claude.json"))
+    if live:
+        emails.add(live)
+    for _slug, label, _exp in list_saved_accounts():
+        if "@" in label:
+            emails.add(label.lower())
+    return emails
 
 
 def _logged_in_windows_users():
@@ -154,10 +168,13 @@ def _logged_in_windows_users():
 def windows_transcript_roots():
     """Extra `.claude/projects` roots for Claude Code run on the Windows host
     (e.g. via PowerShell), reached from WSL under /mnt/c. Only included for a
-    Windows user that is currently logged in AND signed into the SAME Claude
-    account as this WSL session (matched via accountUuid in ~/.claude.json) -
-    otherwise an unrelated account's transcripts on a shared machine would
-    leak into the dashboard. Cached for WIN_GLOBS_TTL seconds since collect()
+    Windows user that is currently logged in AND signed into one of THIS
+    user's Claude accounts (live login or any saved dashboard-accounts
+    snapshot, matched by email) - otherwise an unrelated account's transcripts
+    on a shared machine would leak into the dashboard. Matching the live login
+    alone breaks whenever WSL and Windows sit on different accounts of the
+    same person, which multi-account switching makes routine.
+    Cached for WIN_GLOBS_TTL seconds since collect()
     runs on a timer and `query user` is a subprocess spawn (slow: WSL
     interop into a Windows process)."""
     now = time.time()
@@ -165,11 +182,11 @@ def windows_transcript_roots():
         return _win_roots_cache["roots"]
     roots = []
     if is_wsl() and os.path.isdir("/mnt/c/Users"):
-        own_uuid = _account_uuid(os.path.expanduser("~/.claude.json"))
-        if own_uuid:
+        own = _own_account_emails()
+        if own:
             for uname in _logged_in_windows_users():
                 base = f"/mnt/c/Users/{uname}"
-                if _account_uuid(f"{base}/.claude.json") == own_uuid:
+                if _account_email(f"{base}/.claude.json") in own:
                     roots.append(f"{base}/.claude/projects")
     _win_roots_cache["ts"] = now
     _win_roots_cache["roots"] = roots
