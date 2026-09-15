@@ -95,7 +95,7 @@ brew untap agentic-utils/tap                   # change your mind
 ```
 
 The formula only downloads the tagged source tarball from this repo and drops
-`claude-dashboard.py` into `bin`. Nothing is compiled and no install script runs.
+`claude_dashboard.py` into `bin`. Nothing is compiled and no install script runs.
 
 Or skip Homebrew entirely: it is a single stdlib-only file you can run in place.
 
