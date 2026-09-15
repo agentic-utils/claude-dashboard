@@ -73,6 +73,16 @@ brew install claude-dashboard
 claude-dashboard --upgrade                     # update in place later
 ```
 
+Or with uv / pipx, straight from this repo:
+
+```bash
+uv tool install git+https://github.com/agentic-utils/claude-dashboard
+pipx install git+https://github.com/agentic-utils/claude-dashboard
+```
+
+`--upgrade` works either way: it looks at where this copy is installed and
+calls brew, uv or pipx accordingly.
+
 `brew install agentic-utils/tap/claude-dashboard` does both steps in one go.
 
 A tap is just a public GitHub repo, so there is no signing or approval step:
@@ -85,7 +95,7 @@ brew untap agentic-utils/tap                   # change your mind
 ```
 
 The formula only downloads the tagged source tarball from this repo and drops
-`claude-dashboard.py` into `bin`. Nothing is compiled and no install script runs.
+`claude_dashboard.py` into `bin`. Nothing is compiled and no install script runs.
 
 Or skip Homebrew entirely: it is a single stdlib-only file you can run in place.
 
@@ -93,11 +103,11 @@ Or skip Homebrew entirely: it is a single stdlib-only file you can run in place.
 
 ```bash
 claude-dashboard                       # if installed via brew
-./claude-dashboard.py                  # live dashboard (alt-screen)
-./claude-dashboard.py --once           # render a single frame and exit
-./claude-dashboard.py --interval 60    # override the 5-min data scan
-./claude-dashboard.py --history-hours 336   # 2-week history span (press H)
-./claude-dashboard.py --pr-refresh-seconds 120   # faster PRS-tab refresh (press P)
+./claude_dashboard.py                  # live dashboard (alt-screen)
+./claude_dashboard.py --once           # render a single frame and exit
+./claude_dashboard.py --interval 60    # override the 5-min data scan
+./claude_dashboard.py --history-hours 336   # 2-week history span (press H)
+./claude_dashboard.py --pr-refresh-seconds 120   # faster PRS-tab refresh (press P)
 ```
 
 Keys: `?` help · `r` refresh the open tab now · `L`/`H`/`P` (or `←`/`→`) live/history/PRs tabs · `tab`/`shift-tab` step through sessions · `S`/`M` history popups ·
