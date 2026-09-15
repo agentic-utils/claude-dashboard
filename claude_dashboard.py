@@ -2160,7 +2160,7 @@ def _pr_row(repo, num, fallback=None):
     fallback = fallback or {}
     detail = _gh_json(["pr", "view", str(num), "--repo", repo, "--json",
                        "state,reviewDecision,statusCheckRollup,commits,comments,"
-                       "headRefName,isDraft,url,title"])
+                       "headRefName,isDraft,url,title,mergeable,mergeStateStatus"])
     if not detail or detail.get("state") != "OPEN":
         return None
     commits = detail.get("commits") or []
@@ -2175,6 +2175,9 @@ def _pr_row(repo, num, fallback=None):
         "url": detail.get("url") or fallback.get("url") or "",
         "is_draft": bool(detail.get("isDraft")),
         "approval": _pr_approval(detail.get("reviewDecision")),
+        "mergeable": detail.get("mergeable"),
+        "merge_state": detail.get("mergeStateStatus"),
+        "can_push": repo_caps(repo)["push"],
         "ci": ci_state, "ci_checks": ci_checks,
         "commit_ts": parse_ts(last_commit.get("committedDate")) if last_commit.get("committedDate") else None,
         "commit_sha": (last_commit.get("oid") or "")[:7],
@@ -2229,6 +2232,7 @@ def _branch_rows(repo, user, seen):
         c = commit.get("commit") or {}
         out.append({
             "kind": "branch", "repo": repo, "number": None, "branch": name,
+            "can_push": repo_caps(repo)["push"],
             "title": name, "url": f"https://github.com/{repo}/tree/{name}",
             "is_draft": False, "approval": "", "ci": "none", "ci_checks": [],
             "commit_ts": parse_ts((c.get("committer") or {}).get("date")),
@@ -2408,6 +2412,21 @@ def kick_pr_action(kind, args, row_key):
 
 MERGE_METHOD = "--MERGE-METHOD--"   # placeholder; resolved off the render thread
 _merge_flags = {}                   # repo -> "--merge" / "--squash" / "--rebase"
+_repo_caps = {}                     # repo -> {"push": bool}
+# mergeStateStatus values that actually allow a merge right now. BLOCKED
+# (reviews or checks required), DIRTY (conflicts), DRAFT and BEHIND do not.
+MERGEABLE_STATES = {"CLEAN", "HAS_HOOKS", "UNSTABLE"}
+
+
+def repo_caps(repo):
+    """What this account may do in `repo`. Cached per process: it decides
+    whether a [Merge] button is offered at all, and a viewer with read-only
+    access can never merge, however green the PR looks."""
+    if repo not in _repo_caps:
+        r = _gh_json(["api", f"repos/{repo}", "--jq", "{push: .permissions.push}"],
+                     timeout=10) or {}
+        _repo_caps[repo] = {"push": bool(r.get("push"))}
+    return _repo_caps[repo]
 
 
 def merge_flag(repo):
@@ -3219,13 +3238,19 @@ def pr_row_buttons(row):
     if row.get("loading"):
         return btns
     if row["kind"] == "pr":
+        # GitHub itself has the last word on mergeability: an Approved, green PR
+        # can still be BLOCKED by a required review or DIRTY with conflicts, and
+        # a repo you only have read access to can never be merged from here.
         if (row["approval"] in ("Approved", "No review needed") and row["ci"] == "green"
-                and not row["is_draft"]):
+                and not row["is_draft"]
+                and row.get("mergeable") == "MERGEABLE"
+                and row.get("merge_state") in MERGEABLE_STATES
+                and row.get("can_push", True)):
             btns.append(("Merge", "merge"))
         btns.append(("Draft" if not row["is_draft"] else "Ready",
                      "draft" if not row["is_draft"] else "ready"))
         btns.append(("Close", "close"))
-    else:
+    elif row.get("can_push", True):
         btns.append(("Delete", "delete"))
     return btns
 
