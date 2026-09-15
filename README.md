@@ -69,6 +69,7 @@ tab shows a message instead of a table if it isn't. Refreshed every
 
 ```bash
 brew install agentic-utils/tap/claude-dashboard
+claude-dashboard --upgrade    # update in place later
 ```
 
 Or just run the script — it is a single stdlib-only file.

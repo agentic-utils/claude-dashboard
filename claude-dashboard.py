@@ -3172,6 +3172,17 @@ class _ArgumentParser(argparse.ArgumentParser):
         return shlex.split(line)
 
 
+def self_upgrade():
+    """Update a Homebrew install in place; anything else is a git checkout."""
+    # ponytail: brew already knows the tap and reports "already installed"
+    here = os.path.realpath(__file__)
+    if "/Cellar/" in here:
+        return subprocess.call(
+            ["brew", "upgrade", "agentic-utils/tap/claude-dashboard"])
+    print(f"Not a Homebrew install ({here}) - run `git pull` in that checkout.")
+    return 1
+
+
 def main():
     ap = _ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -3214,8 +3225,13 @@ def main():
                          f"{os.pathsep!r}-delimited (Python's os.pathsep on this "
                          "host: ';' on Windows, ':' on POSIX). No default - "
                          "nothing is excluded unless given.")
+    ap.add_argument("--upgrade", action="store_true",
+                    help="update this install in place (Homebrew) and exit")
     argv = (["@" + RC_PATH] if os.path.isfile(RC_PATH) else []) + sys.argv[1:]
     args = ap.parse_args(argv)
+
+    if args.upgrade:
+        sys.exit(self_upgrade())
 
     if args.exclude:
         EXCLUDE_PATTERNS.extend(
