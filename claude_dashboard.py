@@ -3108,8 +3108,10 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
 
     if layout["page_title"]:
         local = now.astimezone()
-        brand = rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, "CLAUDE CODE", bold=True)
-        brand_len = 2 + len("CLAUDE CODE")
+        ver = f" {VERSION}"
+        brand = (rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, "CLAUDE CODE", bold=True)
+                 + rgb(DIM, ver))
+        brand_len = 2 + len("CLAUDE CODE") + len(ver)
         tabs_str, tabs_len, segs = view_tabs(mode)
         ctx = ("HISTORY · last " + fmt_window(HIST_WINDOW)
                if mode == "history" else "live")
@@ -3421,8 +3423,10 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
                 share = PR_COL_W[k] - PR_FLEX_MIN[k]
                 w[k] = PR_FLEX_MIN[k] + (int(share * extra / room) if room else 0)
             w["what"] += budget - sum(w[k] for k in flex_keys)   # rounding remainder
-    brand = rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, "CLAUDE CODE", bold=True)
-    brand_len = 2 + len("CLAUDE CODE")
+    ver = f" {VERSION}"
+    brand = (rgb(ACCENT, "◆ ", bold=True) + rgb(TEXT, "CLAUDE CODE", bold=True)
+             + rgb(DIM, ver))
+    brand_len = 2 + len("CLAUDE CODE") + len(ver)
     tabs_str, tabs_len, segs = view_tabs("prs")
     local = now.astimezone()
     right = rgb(DIM, f"{local:%a %d %b · %H:%M:%S %Z}")
@@ -3876,6 +3880,11 @@ def version_string():
         except IndexError:
             pass
     return "dev"
+
+
+# Resolved once at import: reading package metadata every frame would be silly,
+# and the answer cannot change while the process lives (an update re-execs).
+VERSION = version_string()
 
 
 def set_term_title(text):
