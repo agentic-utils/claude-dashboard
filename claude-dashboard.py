@@ -1549,9 +1549,12 @@ def render_help(now, cols, rows):
         ("G", None),
         ("H", "KEYS"),
         ("T", "? help · L live / H history / P PRs tabs (or ←/→) · "
-              "S/M history popups · "
-              "s/e/w live panels · r refresh now · click bar/session/tab · "
+              "S/M history popups · s/e/w live panels · r refresh now · "
+              "tab / shift-tab step through sessions · click bar/session/tab · "
               "up/down PgUp/PgDn j/k scroll · q / esc step back · ^C quit."),
+        ("T", "PRS tab, no mouse needed: ↑/↓ (j/k) move the cursor · enter or "
+              "o opens the PR · c failing checks · v full comment · m merge · "
+              "d draft/ready · x close (branch: delete) · y/n answer a confirm."),
     ]
 
     # Flatten to coloured lines. Headings/legends/gaps -> one line; prose ->
@@ -3039,7 +3042,7 @@ def pr_row_buttons(row):
 
 
 def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
-                     last_refresh=None, refreshing=False):
+                     last_refresh=None, refreshing=False, sel=None):
     """PRS tab: your open PRs + branches you've contributed to with no open
     PR. Returns (frame_str, hits, tips) — same convention as render_frame()
     plus `tips`: [(screen_row, lo, hi, full_text)] for cells whose shown text
@@ -3132,7 +3135,11 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
             commit = f"{row['commit_sha']} {_pr_relts(row['commit_ts'], now)} {row['commit_msg']}" if row["commit_sha"] else "—"
             comment = (f"{_pr_relts(row['comment_ts'], now)} {row['comment_author']}: {row['comment_preview']}"
                       if row["comment_full"] else "—")
-            line = (_padcol(rgb(TEXT, _clip_ellip(row["repo"], w["repo"] - 1)), w["repo"]) + PR_GRID_SEP
+            # The keyboard cursor: "▸" in the repo cell's own width, so the
+            # grid stays aligned whether or not a row is selected.
+            repo_txt = ("▸" + _clip_ellip(row["repo"], w["repo"] - 2) if i == sel
+                        else _clip_ellip(row["repo"], w["repo"] - 1))
+            line = (_padcol(rgb(ACCENT if i == sel else TEXT, repo_txt), w["repo"]) + PR_GRID_SEP
                    + _padcol(rgb(DIM, number), w["number"]) + PR_GRID_SEP
                    + _padcol(rgb(TEXT, _clip_ellip(what, w["what"] - 1)), w["what"]) + PR_GRID_SEP
                    + _padcol(_pr_approval_cell(row["approval"]), w["approval"]) + PR_GRID_SEP
@@ -3645,6 +3652,7 @@ def run_live(args):
     show_prs = False
     pr_rows, pr_err, last_pr_collect = [], None, None
     pr_tips, pr_hover = [], None
+    pr_sel = None                # keyboard cursor in the PRS table
     pr_ui = {"ci_idx": None, "comment_idx": None, "confirm": None, "err": None}
     pr_action_running_prev = False
     pr_action_started = None
@@ -3787,7 +3795,8 @@ def run_live(args):
                 frame, hits, pr_tips = render_prs_frame(
                     now, pr_rows, pr_err, cols, rows, loading=pr_loading, elapsed=pr_elapsed,
                     last_refresh=_pr_collect_result.get("prs_ts"),
-                    refreshing=(not pr_loading) and _pr_collect_inflight.locked())
+                    refreshing=(not pr_loading) and _pr_collect_inflight.locked(),
+                    sel=pr_sel)
             else:
                 cur_buckets, cur_sessions = buckets, sessions
                 layout = plan_layout(rows, cols, sessions, now) if alt else None
@@ -3972,9 +3981,10 @@ def run_live(args):
                         scroll_delta = 0
                         do_login = do_retry = do_switch = do_cancel = do_refresh = False
                         (pr_ui, show_help, go_live, go_history, quit_flag,
-                         do_pr_run, pr_hover, do_pr_refresh) = process_prs_input(
+                         do_pr_run, pr_hover, do_pr_refresh,
+                         pr_sel) = process_prs_input(
                             data, mouse_re, hits, pr_ui, pr_rows, show_help,
-                            _pr_action["running"], pr_hover)
+                            _pr_action["running"], pr_hover, pr_sel)
                         if do_pr_refresh:
                             last_pr_collect = None   # forces an immediate rescan next tick
                         if go_live or go_history:
@@ -4228,6 +4238,17 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             do_prs = True
             focus_sid = focus_bucket = panel_view = None
             show_uerr = False
+        # Tab / shift-Tab step through the session rows on screen: their detail
+        # popups are otherwise reachable only by clicking. Session tokens are
+        # the sids themselves; every other token is a "__…__" control.
+        sids = list(dict.fromkeys(tok for (_r, _lo, _hi, tok) in hits
+                                  if not tok.startswith("__")))
+        if sids and ("\t" in rest or "\x1b[Z" in rest):
+            back = "\x1b[Z" in rest
+            focus_sid = (sids[(sids.index(focus_sid) + (-1 if back else 1)) % len(sids)]
+                         if focus_sid in sids else sids[-1 if back else 0])
+            focus_bucket = panel_view = None
+            show_uerr = False
         # ← / → walk the menu bar in its own order: Live, History, PRs (wrapping).
         step = 1 if "\x1b[C" in rest else -1 if "\x1b[D" in rest else 0
         if step:
@@ -4276,7 +4297,18 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             do_login, do_retry, do_switch, do_cancel, do_prs, do_refresh)
 
 
-def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_running, pr_hover):
+def _open_url(url):
+    """Hand a URL to the desktop browser; failures are logged, never raised."""
+    opener = "open" if sys.platform == "darwin" else "xdg-open"
+    try:
+        subprocess.Popen([opener, url], stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("open %s failed: %s", url, e)
+
+
+def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help,
+                      action_running, pr_hover, pr_sel=None):
     """Input handling for the PRS view — separate from process_input because
     its overlays (CI/comment drilldown, confirm-then-run, action progress) are
     independent of the live/history session/bucket/panel popups. Row/button
@@ -4284,7 +4316,8 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_ru
     only the progress popup is shown then, with nothing to click.
 
     Returns (pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run,
-    pr_hover, do_pr_refresh). go_live/go_history ask run_live to leave the
+    pr_hover, do_pr_refresh, pr_sel). pr_sel is the keyboard cursor's row
+    index. go_live/go_history ask run_live to leave the
     PRS view. do_pr_run is None or (kind, row) once a confirm popup's [Y]/'y'
     has been accepted — run_live owns actually starting the `gh` subprocess
     (kick_pr_action). pr_hover is the latest (x, y) from a mode-1003
@@ -4317,12 +4350,8 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_ru
             if not any(v is not None for v in pr_ui.values()):   # only a bare row-click opens
                 i = int(hit[len("__pr_open__"):])
                 if i < len(pr_rows):
-                    opener = "open" if sys.platform == "darwin" else "xdg-open"
-                    try:
-                        subprocess.Popen([opener, pr_rows[i]["url"]],
-                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    except (OSError, subprocess.SubprocessError) as e:
-                        log.warning("open %s failed: %s", pr_rows[i]["url"], e)
+                    pr_sel = i
+                    _open_url(pr_rows[i]["url"])
         elif hit and hit.startswith("__pr_ci__"):
             pr_ui["ci_idx"] = int(hit[len("__pr_ci__"):])
         elif hit and hit.startswith("__pr_comment__"):
@@ -4366,6 +4395,33 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_ru
                 pr_ui["comment_idx"] = None
             else:
                 go_live = True         # PRS has no parent overlay; q/esc leaves to Live
+    # Keyboard equivalents of every row interaction, so the table is usable
+    # without a mouse: ↑/↓ (j/k) move the cursor, Enter/o opens the PR, c/v the
+    # CI and comment popups, and m/d/x raise the same confirm popup a button
+    # click does (only for actions that row actually offers).
+    popup_open = any(pr_ui.get(k) is not None
+                     for k in ("ci_idx", "comment_idx", "confirm", "err"))
+    if pr_rows and not action_running and not popup_open and not show_help:
+        step = (rest.count("\x1b[B") + rest.count("j")
+                - rest.count("\x1b[A") - rest.count("k"))
+        if step:
+            pr_sel = 0 if pr_sel is None else pr_sel + step
+            pr_sel = max(0, min(pr_sel, len(pr_rows) - 1))
+        if pr_sel is not None and pr_sel < len(pr_rows):
+            row = pr_rows[pr_sel]
+            if "\r" in rest or "\n" in rest or "o" in rest:
+                _open_url(row["url"])
+            elif "c" in rest and row["ci"] == "red":
+                pr_ui["ci_idx"] = pr_sel
+            elif "v" in rest and row["comment_full"]:
+                pr_ui["comment_idx"] = pr_sel
+            else:
+                kinds = {k for _lab, k in pr_row_buttons(row)}
+                for key, wanted in (("m", {"merge"}), ("d", {"draft", "ready"}),
+                                    ("x", {"close", "delete"})):
+                    if key in rest and kinds & wanted:
+                        pr_ui["confirm"] = ((kinds & wanted).pop(), pr_sel)
+                        break
     if "H" in rest or "h" in rest:
         go_history = True
     if "L" in rest or "l" in rest:
@@ -4376,7 +4432,8 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_ru
         go_live = True
     if "r" in rest and not action_running:
         do_pr_refresh = True
-    return pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run, pr_hover, do_pr_refresh
+    return (pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run,
+            pr_hover, do_pr_refresh, pr_sel)
 
 
 if __name__ == "__main__":
