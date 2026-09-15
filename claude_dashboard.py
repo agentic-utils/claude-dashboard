@@ -4648,6 +4648,13 @@ def run_live(args):
             set_term_title("")                                # back to the shell's own
             sys.stdout.write("\033[?7h\033[?25h\033[?1049l")   # re-enable wrap, show cursor, leave alt
             sys.stdout.flush()
+        # Leave NOW. concurrent.futures registers an atexit hook that joins its
+        # worker threads, and a scan's threads sit in `gh` calls for up to 30s,
+        # so a normal exit hung on ⌃C for as long as the slowest call. The
+        # terminal is already restored above and the disk cache is written with
+        # a rename, so there is nothing left to flush; any `gh` still running is
+        # a short-lived read-only child that exits on its own.
+        os._exit(0)
 
 
 def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
