@@ -100,10 +100,19 @@ claude-dashboard                       # if installed via brew
 ./claude-dashboard.py --pr-refresh-seconds 120   # faster PRS-tab refresh (press P)
 ```
 
-Keys: `?` help · `r` refresh the open tab now · `L`/`H`/`P` (or `←`/`→`) live/history/PRs tabs · `S`/`M` history popups ·
+Keys: `?` help · `r` refresh the open tab now · `L`/`H`/`P` (or `←`/`→`) live/history/PRs tabs · `tab`/`shift-tab` step through sessions · `S`/`M` history popups ·
 `↑/↓` `PgUp/PgDn` `j/k` scroll help · `q`/`esc` close overlay / leave the current
 tab · click a tab/session/bar/PR row for detail · `Y`/`N` confirm a PRS action ·
 `Ctrl-C` (or click *"⌃C to exit"*) to quit.
+
+The PRS table pages when it outgrows the window: `↑`/`↓` scroll it via the cursor,
+`PgUp`/`PgDn` and the wheel scroll it directly, and a line under the table says how
+many rows sit above and below.
+
+In the PRS tab, nothing needs a mouse: `↑`/`↓` (or `j`/`k`) move the row cursor,
+`enter`/`o` opens the PR, `c` shows failing checks, `v` the full comment, and
+`m` / `d` / `x` merge, toggle draft, or close it (delete, on a branch row) via the
+same confirm popup the buttons use.
 
 ## How it works / requirements
 
