@@ -3745,6 +3745,7 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 TAP_FORMULA = "agentic-utils/tap/claude-dashboard"
 TERM_TITLE = "claude-dashboard"
+FRAME_FAIL_LIMIT = 5                # consecutive bad frames before saying so
 
 
 def install_method():
@@ -4079,6 +4080,8 @@ def run_live(args):
     pr_sel = None                # keyboard cursor in the PRS table
     pr_top = 0                   # first visible row of the PRS table
     pr_sel_prev = None           # cursor as of the previous input tick
+    pr_filter = 0                # index into PR_FILTERS; a view filter only
+    pr_view_rows = []            # pr_rows with that filter applied
     pr_ui = {"ci_idx": None, "comment_idx": None, "confirm": None, "err": None}
     pr_action_running_prev = False
     pr_action_started = None
@@ -4100,6 +4103,7 @@ def run_live(args):
     loading_started = time.monotonic()
     overlay_scroll = 0
     prev_okey = None
+    frame_fails = 0              # consecutive render failures
     mouse_re = re.compile(r"\033\[<(\d+);(\d+);(\d+)([Mm])")
     try:
         while True:
@@ -4258,6 +4262,7 @@ def run_live(args):
                 # usable frame with a "too small" notice that contradicts itself.
                 frame = "\n".join(frame.split("\n")[:rows])
                 hits = [h for h in hits if h[0] <= rows]
+            frame_fails = 0
             if alt:
                 # One overlay at a time: loading > help > login-confirm >
                 # usage-error > session > bucket > panel popup. overlay_regions
@@ -4492,9 +4497,22 @@ def run_live(args):
                     overlay_scroll += scroll_delta
             else:
                 time.sleep(TICK_SECONDS)
-          except Exception:
+          except Exception as e:
               log.exception("render loop: frame failed, continuing")
-              time.sleep(TICK_SECONDS)
+              frame_fails += 1
+              if alt and frame_fails > FRAME_FAIL_LIMIT:
+                  # Repainting kept throwing: the screen would otherwise sit
+                  # frozen with no clue why, which is indistinguishable from a
+                  # hang. Say it, and where the traceback is.
+                  sys.stdout.write("\033[H\033[2J" + "\r\n".join([
+                      rgb(HOT_C, "  the dashboard hit a rendering error", bold=True),
+                      "", "  " + rgb(TEXT, f"{type(e).__name__}: {e}"[:cols - 4]),
+                      "", rgb(DIM, f"  details in {LOG_PATH}"),
+                      rgb(DIM, "  ⌃C to quit")]))
+                  sys.stdout.flush()
+                  time.sleep(1)
+              else:
+                  time.sleep(TICK_SECONDS)
     except KeyboardInterrupt:
         pass
     finally:
