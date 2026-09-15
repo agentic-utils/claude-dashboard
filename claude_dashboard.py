@@ -2723,6 +2723,7 @@ def _run_login_suspended(fd, old_term):
         # --- suspend: undo main()'s terminal setup ---
         if old_term is not None:
             sys.stdout.write("\033[?1000l\033[?1003l\033[?1006l")          # mouse off
+        set_term_title("")                                       # back to the shell's own
         sys.stdout.write("\033[?7h\033[?25h\033[?1049l")         # wrap+cursor on, leave alt
         sys.stdout.flush()
         if old_term is not None:
@@ -2738,6 +2739,7 @@ def _run_login_suspended(fd, old_term):
     finally:
         # --- resume: redo main()'s terminal setup ---
         sys.stdout.write("\033[?1049h\033[?25l\033[?7l")         # alt, hide cursor, no wrap
+        set_term_title(TERM_TITLE)
         if old_term is not None:
             try:
                 sys.stdout.write("\033[?1000h\033[?1003h\033[?1006h")       # mouse on
@@ -3597,6 +3599,7 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 
 TAP_FORMULA = "agentic-utils/tap/claude-dashboard"
+TERM_TITLE = "claude-dashboard"
 
 
 def install_method():
@@ -3629,6 +3632,13 @@ def version_string():
         except IndexError:
             pass
     return "dev"
+
+
+def set_term_title(text):
+    """Name the window/tab. Without this the terminal falls back to the running
+    process, which shows up as "Python". OSC 0 sets icon+title together; a
+    terminal that doesn't understand it ignores the sequence."""
+    sys.stdout.write(f"\033]0;{text}\007")
 
 
 def self_upgrade():
@@ -3882,6 +3892,7 @@ def run_live(args):
         # autowrap off, full-width lines render in place (and any stray
         # over-width line clips instead of wrapping + desyncing the layout).
         sys.stdout.write("\033[?1049h\033[?25l\033[?7l")
+        set_term_title(TERM_TITLE)
         # Enable SGR mouse reporting + cbreak input so clicks/keys arrive
         # immediately. cbreak (not raw) keeps ISIG, so ⌃C still raises.
         try:
@@ -4333,6 +4344,7 @@ def run_live(args):
                     termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
                 except (termios.error, ValueError, OSError):
                     pass
+            set_term_title("")                                # back to the shell's own
             sys.stdout.write("\033[?7h\033[?25h\033[?1049l")   # re-enable wrap, show cursor, leave alt
             sys.stdout.flush()
 
