@@ -1724,7 +1724,7 @@ def render_login_confirm(now, cols, rows, login_elapsed=None):
         live_label = _usage.get("account")
         if live_label:
             try:
-                live_exp = _expiry_label(json.load(open(CREDS_PATH)))
+                live_exp = _expiry_label(read_creds())
             except (OSError, ValueError):
                 live_exp = ""
             saved = [("", live_label, live_exp)] + saved
@@ -1767,6 +1767,23 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
 ACCOUNTS_DIR = os.path.expanduser("~/.claude/dashboard-accounts")
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+
+def read_creds():
+    """The live OAuth store. Claude Code writes CREDS_PATH on Linux/WSL but
+    keeps the same JSON in the macOS login Keychain instead, where there is no
+    file at all - read both so the ALLOWANCE panel works on either."""
+    try:
+        return json.load(open(CREDS_PATH))
+    except FileNotFoundError:
+        # ponytail: `security` is in the base system; no keyring dependency
+        out = subprocess.run(
+            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
+            capture_output=True, text=True)
+        if out.returncode != 0:
+            raise
+        return json.loads(out.stdout)
 # Shared by the context light (ctx_grade) and allowance gauge (gauge_grade) —
 # the actual thresholds live in those functions, not here.
 OK_C = (52, 224, 150)       # green
@@ -1845,7 +1862,7 @@ def fetch_usage(timeout=15):
     back = lambda s: now + timedelta(seconds=s)
     try:
         log.info("fetch_usage: start")
-        oa = (json.load(open(CREDS_PATH)).get("claudeAiOauth") or {})
+        oa = (read_creds().get("claudeAiOauth") or {})
         tok = oa.get("accessToken")
         if not tok:
             _usage_set(err="no oauth token", err_body=None, retry_at=back(USAGE_BACKOFF))
@@ -2197,7 +2214,7 @@ def current_account_slug():
     """Slug of the saved account matching the live creds file, or None if the
     live account was never snapshotted."""
     try:
-        live = json.load(open(CREDS_PATH))
+        live = read_creds()
     except (OSError, ValueError):
         return None
     for path in sorted(glob.glob(os.path.join(ACCOUNTS_DIR, "*.json"))):
@@ -2217,8 +2234,8 @@ def save_account_snapshot(label=None):
     label used, or None on any failure (missing creds file, dead token,
     unreachable profile endpoint)."""
     try:
-        raw = open(CREDS_PATH).read()
-        creds = json.loads(raw)
+        creds = read_creds()
+        raw = json.dumps(creds)
     except (OSError, ValueError):
         return None
     if label is None:
@@ -3592,14 +3609,20 @@ def run_live(args):
             # Too small to fit? The frame would overflow and scroll, desyncing the
             # click hit-regions onto the wrong rows. Show a notice and drop hits so
             # clicks can't misfire; close any overlay until there's room again.
-            if alt and (cols < TOTAL_WIDTH or rows < 9
-                        or frame.count("\n") + 1 > rows):
+            if alt and (cols < TOTAL_WIDTH or rows < 9):
                 hits = []
                 show_help = show_uerr = show_login = False
                 panel_view = None
                 focus_sid = focus_bucket = None
                 pr_ui = {"ci_idx": None, "comment_idx": None, "confirm": None, "err": None}
                 frame = render_too_small(cols, rows, 9)
+            elif alt and frame.count("\n") + 1 > rows:
+                # The terminal is big enough but the layout overshot its height:
+                # clip to the visible rows (hits are 1-based terminal rows, so
+                # everything below the fold goes with it) rather than replace a
+                # usable frame with a "too small" notice that contradicts itself.
+                frame = "\n".join(frame.split("\n")[:rows])
+                hits = [h for h in hits if h[0] <= rows]
             if alt:
                 # One overlay at a time: loading > help > login-confirm >
                 # usage-error > session > bucket > panel popup. overlay_regions
