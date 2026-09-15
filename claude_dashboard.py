@@ -2265,6 +2265,66 @@ def rate_headroom():
     return True, None
 
 
+def prune_merged_branches(apply=False, limit=200):
+    """Delete head branches left behind by YOUR merged PRs.
+
+    Deliberately not the PRS tab's discovery: that walks recent commits ->
+    repos -> branches -> a compare per branch, which is a lot of calls and,
+    for a branch that IS merged, cannot tell whose it was (a merged branch is
+    an ancestor of the default branch, so the compare returns no commits and
+    no author). Asking for merged PRs you authored answers both questions in
+    one search, and never proposes someone else's branch."""
+    if not _GH_BIN:
+        print("gh CLI not found - install from https://cli.github.com")
+        return 1
+    # GraphQL, because `gh search prs` cannot return headRefName at all and
+    # `--state` has no "merged" value (merged PRs need `is:merged`).
+    query = ("query($q:String!,$n:Int!){search(query:$q,type:ISSUE,first:$n)"
+             "{nodes{... on PullRequest{number headRefName "
+             "repository{nameWithOwner}}}}}")
+    data = _gh_json(["api", "graphql", "-f", f"query={query}",
+                     "-f", "q=author:@me is:pr is:merged archived:false",
+                     "-F", f"n={min(limit, 100)}"], timeout=30) or {}
+    heads, seen = [], set()
+    for p in (((data.get("data") or {}).get("search") or {}).get("nodes") or []):
+        repo = ((p.get("repository") or {}).get("nameWithOwner"))
+        branch = p.get("headRefName")
+        if repo and branch and (repo, branch) not in seen:
+            seen.add((repo, branch))
+            heads.append((repo, branch, p.get("number")))
+
+    def still_there(item):
+        repo, branch, num = item
+        if branch == (_gh_json(["api", f"repos/{repo}", "--jq", "{d: .default_branch}"],
+                               timeout=10) or {}).get("d"):
+            return None              # never the default branch
+        ref = _gh_json(["api", f"repos/{repo}/branches/{branch}", "--jq", "{n: .name}"],
+                       timeout=10)
+        return item if ref else None
+
+    with futures.ThreadPoolExecutor(max_workers=PR_WORKERS) as ex:
+        live = [x for x in ex.map(still_there, heads) if x]
+    if not live:
+        print("nothing to prune: every merged PR's branch is already gone")
+        return 0
+    for repo, branch, num in live:
+        if not apply:
+            print(f"would delete {repo}  {branch}  (PR #{num})")
+            continue
+        if not repo_caps(repo)["push"]:
+            print(f"skipped      {repo}  {branch}  (no write access)")
+            continue
+        out = subprocess.run([_GH_BIN, "api", "-X", "DELETE",
+                              f"repos/{repo}/git/refs/heads/{branch}"],
+                             capture_output=True, text=True, timeout=30)
+        state = "deleted     " if out.returncode == 0 else "FAILED      "
+        print(f"{state} {repo}  {branch}  (PR #{num})"
+              + ("" if out.returncode == 0 else f"  {out.stderr.strip()[:80]}"))
+    if not apply:
+        print(f"\n{len(live)} branches. Re-run with --prune-merged --yes to delete them.")
+    return 0
+
+
 def collect_prs(cached=None, publish=None):
     """Scan (background-threaded by kick_collect_prs): open PRs authored by the
     signed-in user, plus branches with no open PR whose latest commit is also
@@ -3729,6 +3789,11 @@ def main():
                          f"{os.pathsep!r}-delimited (Python's os.pathsep on this "
                          "host: ';' on Windows, ':' on POSIX). No default - "
                          "nothing is excluded unless given.")
+    ap.add_argument("--prune-merged", action="store_true",
+                    help="list the branches left behind by your merged PRs and "
+                         "exit; add --yes to delete them")
+    ap.add_argument("--yes", action="store_true",
+                    help="with --prune-merged, actually delete the branches")
     ap.add_argument("--upgrade", action="store_true",
                     help="update this install in place (brew / uv / pipx) and exit")
     ap.add_argument("--version", action="version",
@@ -3738,6 +3803,8 @@ def main():
 
     if args.upgrade:
         sys.exit(self_upgrade())
+    if args.prune_merged:
+        sys.exit(prune_merged_branches(apply=args.yes))
 
     if args.exclude:
         EXCLUDE_PATTERNS.extend(
