@@ -2107,6 +2107,7 @@ COMMIT_SEARCH_PER_PAGE = 100        # recent commits scanned for branch repos
 BRANCH_REPO_LIMIT = 10              # repos to look for unopened branches in
 BRANCH_LIMIT_PER_REPO = 50          # branches checked per repo
 RATE_FLOOR = 500                    # leave this much GitHub quota for everything else
+PUBLISH_EVERY = 1.0                 # seconds between partial repaints of a scan
 
 
 def _iso(dt):
@@ -2130,15 +2131,23 @@ def load_pr_cache():
 
 
 def save_pr_cache(rows):
-    """Best-effort: a cache that can't be written costs a slow first paint."""
+    """Best-effort, and atomic: a plain open(…, "w") truncates first, so a quit
+    mid-write leaves a 0-byte cache behind and the next start is back to the
+    spinner. Write a sibling file, then rename over the old one."""
+    tmp = PR_CACHE_PATH + ".tmp"
     try:
-        json.dump({"at": time.time(),
-                   "rows": [dict(r, commit_ts=_iso(r.get("commit_ts")),
-                                 comment_ts=_iso(r.get("comment_ts")))
-                            for r in rows]},
-                  open(PR_CACHE_PATH, "w"))
+        with open(tmp, "w") as fh:
+            json.dump({"at": time.time(),
+                       "rows": [dict(r, commit_ts=_iso(r.get("commit_ts")),
+                                     comment_ts=_iso(r.get("comment_ts")))
+                                for r in rows]}, fh)
+        os.replace(tmp, PR_CACHE_PATH)
     except (OSError, TypeError, ValueError) as e:
         log.warning("save_pr_cache: %s", e)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _pr_row(repo, num, fallback=None):
@@ -2270,7 +2279,20 @@ def collect_prs(cached=None, publish=None):
             repo = repo.get("nameWithOwner") if isinstance(repo, dict) else repo
             if repo:
                 found.append((repo, p["number"], p))
-        rows = [r for r in ex.map(lambda t: _pr_row(t[0], t[1], t[2]), found) if r]
+        # Publish as rows land rather than at the end: a hundred PRs is a
+        # minute of `gh` calls, and an empty progress bar for that long is the
+        # whole complaint. Results keep their submission slot so a row never
+        # jumps around as its neighbours arrive.
+        done = [None] * len(found)
+        pending = {ex.submit(_pr_row, t[0], t[1], t[2]): i
+                   for i, t in enumerate(found)}
+        last_publish = 0.0
+        for fut in futures.as_completed(pending):
+            done[pending[fut]] = fut.result() or False   # False: no longer open
+            if publish and time.monotonic() - last_publish > PUBLISH_EVERY:
+                publish([r for r in done if r])
+                last_publish = time.monotonic()
+        rows = [r for r in done if r]
         seen = {(r["repo"], r["branch"]) for r in rows}
 
         # Most-recently-committed-to repos first, capped: each one costs a
@@ -2281,6 +2303,8 @@ def collect_prs(cached=None, publish=None):
             if (it.get("repository") or {}).get("full_name")))[:BRANCH_REPO_LIMIT]
         for batch in ex.map(lambda repo: _branch_rows(repo, user, seen), repos):
             rows += batch
+            if publish and batch:
+                publish(rows)
     return rows, None
 
 
