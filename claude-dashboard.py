@@ -2259,9 +2259,39 @@ def _expiry_label(creds, now=None):
     return "expires " + exp.astimezone().strftime("%H:%M")
 
 
+def cswap_bin():
+    """Path to the cswap CLI, or None. cswap is an OPTIONAL companion: when it
+    is installed it owns account switching (it rewrites the same credential
+    store AND the `~/.claude.json` identity that Claude Code and cswap itself
+    read back), so the dashboard defers to it instead of keeping a second,
+    divergent registry of accounts under ACCOUNTS_DIR."""
+    return shutil.which("cswap")
+
+
+def _cswap_json(*args):
+    """`cswap <args> --json`, or None if cswap failed or printed non-JSON."""
+    try:
+        out = subprocess.run([cswap_bin(), *args, "--json"],
+                             capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        log.warning("cswap %s failed: %s", " ".join(args), out.stderr.strip())
+        return None
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        return None
+
+
 def list_saved_accounts():
-    """Return [(slug, label, expiry_label), ...] sorted by label. Corrupt
-    files are skipped."""
+    """Return [(slug, label, expiry_label), ...] sorted by label. With cswap
+    installed the slug is its slot number and the list is cswap's; otherwise
+    it is the snapshots in ACCOUNTS_DIR, and corrupt files are skipped."""
+    if cswap_bin():
+        data = _cswap_json("list") or {}
+        return [(str(a.get("number")), a.get("email") or str(a.get("number")), "")
+                for a in (data.get("accounts") or []) if a.get("number") is not None]
     out = []
     for path in sorted(glob.glob(os.path.join(ACCOUNTS_DIR, "*.json"))):
         try:
@@ -2286,8 +2316,13 @@ def _same_account(creds_a, creds_b):
 
 
 def current_account_slug():
-    """Slug of the saved account matching the live creds file, or None if the
-    live account was never snapshotted."""
+    """Slug of the account that is live right now, or None if it isn't one we
+    know about. With cswap installed that is its active slot, which it resolves
+    from the `~/.claude.json` identity rather than from the credential."""
+    if cswap_bin():
+        active = (_cswap_json("status") or {}).get("active") or {}
+        num = active.get("number")
+        return None if num is None else str(num)
     try:
         live = read_creds()
     except (OSError, ValueError):
@@ -2307,7 +2342,11 @@ def save_account_snapshot(label=None):
     account email (fetched fresh if not given). Skips the write if a saved
     account already holds byte-identical creds. Best-effort: returns the
     label used, or None on any failure (missing creds file, dead token,
-    unreachable profile endpoint)."""
+    unreachable profile endpoint). No-op when cswap is installed: it already
+    holds a backup of every account it manages, and a second copy here would
+    be the divergent registry this defers to cswap to avoid."""
+    if cswap_bin():
+        return None
     try:
         creds = read_creds()
         raw = json.dumps(creds)
@@ -2345,6 +2384,17 @@ def switch_account(slug):
     (file, or the macOS Keychain). Non-disruptive: Claude Code and this
     dashboard both re-read it fresh, so other running sessions pick up the new
     account on their next call, no restart needed."""
+    if cswap_bin():
+        # ponytail: one switcher, and it is the one that also updates identity
+        try:
+            out = subprocess.run([cswap_bin(), "switch", slug],
+                                 capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            log.warning("cswap switch %s: %s", slug, e)
+            return False
+        if out.returncode != 0:
+            log.warning("cswap switch %s failed: %s", slug, out.stderr.strip())
+        return out.returncode == 0
     path = os.path.join(ACCOUNTS_DIR, slug + ".json")
     try:
         creds = json.load(open(path))["creds"]
