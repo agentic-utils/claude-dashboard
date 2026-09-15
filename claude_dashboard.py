@@ -3338,6 +3338,29 @@ def pr_capacity(term_rows):
     return max(1, (term_rows - PR_CHROME_LINES) // PR_ROW_LINES)
 
 
+def _with_scrollbar(panel_lines, n_visible, top, total, cap):
+    """Draw a thumb into the panel's right border over the data rows, so a
+    long list shows where in it you are. Body row 0 (the column header) is
+    panel line 1, each data row takes PR_ROW_LINES lines after the header and
+    its rule, and the track is the data rows only."""
+    track_start = 3                       # border, header, header rule
+    track_len = max(n_visible * PR_ROW_LINES - 1, 1)
+    thumb_len = max(1, round(track_len * cap / total))
+    span = max(total - cap, 1)
+    thumb_top = round((track_len - thumb_len) * min(top, span) / span)
+    out = list(panel_lines)
+    for k in range(track_len):
+        i = track_start + k
+        if i >= len(out):
+            break
+        j = out[i].rfind("│")             # the row's right border
+        if j < 0:
+            continue
+        glyph = "┃" if thumb_top <= k < thumb_top + thumb_len else "│"
+        out[i] = out[i][:j] + rgb(ACCENT if glyph == "┃" else DIM2, glyph) + out[i][j + 1:]
+    return out
+
+
 def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
                      last_refresh=None, refreshing=False, sel=None, top=0):
     """PRS tab: your open PRs + branches you've contributed to with no open
@@ -3495,6 +3518,9 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
         status_row = len(out) + 1            # 1-based screen row
         out.append("  " + rgb(ACCENT, _clip(status, total_width - 2), bold=True))
         panel_lines = panel("", body, inner)
+        if len(rows) > cap:
+            panel_lines = _with_scrollbar(panel_lines, len(visible), top,
+                                          len(rows), cap)
         panel_start = len(out)
         out += panel_lines
         # Translate body-relative row indices to screen coords: panel() adds one
