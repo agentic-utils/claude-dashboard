@@ -3315,13 +3315,18 @@ def pr_row_buttons(row):
     return btns
 
 
-PR_CHROME_LINES = 8     # menu bar, panel title/borders, column header, footer
+# Everything that is not a data row: menu bar and rule, blank, status line,
+# panel top border, column header, header rule, key legend, bottom border,
+# blank, footer. The rendered height is exactly PR_ROW_LINES * rows + this.
+PR_CHROME_LINES = 10
 PR_ROW_LINES = 2        # every row is followed by a gridline
 
 
 def pr_capacity(term_rows):
-    """PR rows that fit on screen, keeping a line for the "more rows" hint."""
-    return max(1, (term_rows - PR_CHROME_LINES - 1) // PR_ROW_LINES)
+    """PR rows that fit on screen. Overstating this is not cosmetic: the frame
+    then runs past the last line, the overflow is clipped, and the rows below
+    the fold cannot be scrolled to at all."""
+    return max(1, (term_rows - PR_CHROME_LINES) // PR_ROW_LINES)
 
 
 def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
