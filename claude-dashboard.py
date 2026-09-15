@@ -56,7 +56,7 @@ a message instead of a table if it isn't. Refreshed on --pr-refresh-seconds
 Stdlib only (except the optional `gh` CLI for the PRS tab). --once prints a
 single frame; --interval overrides the period.
 
-Flags can also be set in .claude-dashboard.rc, next to this script (one flag
+Flags can also be set in .claude-dashboard.rc, next to this script or in $HOME (one flag
 per line, '#' comments OK) - CLI flags given at the command line override it.
 """
 
@@ -270,10 +270,14 @@ LOGIN_INLINE_TIMEOUT = 45           # give inline (no-suspend) login this long b
                                      # falling back to a real tty (SSO flows that need
                                      # keyboard input would otherwise hang forever silently)
 
-LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+# ponytail: the script dir is read-only under a Homebrew install, so fall back to $HOME
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_HOME = os.path.expanduser("~")
+LOG_PATH = os.path.join(_HERE if os.access(_HERE, os.W_OK) else _HOME,
                         "claude-dashboard.log")
-RC_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        ".claude-dashboard.rc")
+RC_PATH = os.path.join(_HERE, ".claude-dashboard.rc")
+if not os.path.exists(RC_PATH):
+    RC_PATH = os.path.join(_HOME, ".claude-dashboard.rc")
 logging.basicConfig(filename=LOG_PATH, level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("ccmon")

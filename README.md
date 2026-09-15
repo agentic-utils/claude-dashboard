@@ -65,9 +65,18 @@ GitHub. Needs the `gh` CLI installed and authenticated (`gh auth login`) — the
 tab shows a message instead of a table if it isn't. Refreshed every
 `--pr-refresh-seconds` (default 300).
 
+## Install
+
+```bash
+brew install agentic-utils/tap/claude-dashboard
+```
+
+Or just run the script — it is a single stdlib-only file.
+
 ## Run
 
 ```bash
+claude-dashboard                       # if installed via brew
 ./claude-dashboard.py                  # live dashboard (alt-screen)
 ./claude-dashboard.py --once           # render a single frame and exit
 ./claude-dashboard.py --interval 60    # override the 5-min data scan
@@ -97,5 +106,6 @@ tab · click a tab/session/bar/PR row for detail · `Y`/`N` confirm a PRS action
 
 - Empirically, Claude Code's **5-minute** ephemeral cache holds subagent/sidechain
   context and the **1-hour** cache holds the main thread.
-- The script writes a local `claude-dashboard.log` (diagnostics only, no secrets);
+- The script writes `claude-dashboard.log` next to itself, or in `$HOME` when
+  that directory is read-only (a brew install). Diagnostics only, no secrets;
   it's gitignored.
