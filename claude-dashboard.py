@@ -63,6 +63,7 @@ per line, '#' comments OK) - CLI flags given at the command line override it.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as futures
 import getpass
 import glob
 import hashlib
@@ -2092,82 +2093,146 @@ def _pr_approval(review_decision):
             "REVIEW_REQUIRED": "Awaiting review"}.get(review_decision, "No review needed")
 
 
-def collect_prs():
-    """Synchronous scan (background-threaded by kick_collect_prs): open PRs
-    authored by the signed-in user, plus branches with no open PR whose latest
-    commit is also theirs. Returns (rows, err) — err is a user-facing string
-    when the whole tab should show a message instead of a table."""
+PR_CACHE_PATH = os.path.join(CONFIG_HOME, "dashboard-prs.json")
+PR_CACHE_TTL = 7 * 24 * 3600        # a week-old row set is not worth painting
+PR_WORKERS = 8                      # concurrent `gh` calls per scan
+
+
+def _iso(dt):
+    return dt.isoformat() if dt else None
+
+
+def load_pr_cache():
+    """Rows from the last successful scan, so the PRS tab paints immediately
+    instead of showing an empty progress bar for the length of a full scan."""
+    try:
+        data = json.load(open(PR_CACHE_PATH))
+    except (OSError, ValueError):
+        return None
+    if time.time() - (data.get("at") or 0) > PR_CACHE_TTL:
+        return None
+    rows = data.get("rows") or []
+    for r in rows:                  # timestamps round-trip through ISO strings
+        for k in ("commit_ts", "comment_ts"):
+            r[k] = parse_ts(r[k]) if r.get(k) else None
+    return rows or None
+
+
+def save_pr_cache(rows):
+    """Best-effort: a cache that can't be written costs a slow first paint."""
+    try:
+        json.dump({"at": time.time(),
+                   "rows": [dict(r, commit_ts=_iso(r.get("commit_ts")),
+                                 comment_ts=_iso(r.get("comment_ts")))
+                            for r in rows]},
+                  open(PR_CACHE_PATH, "w"))
+    except (OSError, TypeError, ValueError) as e:
+        log.warning("save_pr_cache: %s", e)
+
+
+def _pr_row(repo, num, fallback=None):
+    """One open PR's row, or None if it is no longer open (merged or closed
+    since the cached scan) or `gh` could not read it."""
+    fallback = fallback or {}
+    detail = _gh_json(["pr", "view", str(num), "--repo", repo, "--json",
+                       "state,reviewDecision,statusCheckRollup,commits,comments,"
+                       "headRefName,isDraft,url,title"])
+    if not detail or detail.get("state") != "OPEN":
+        return None
+    commits = detail.get("commits") or []
+    last_commit = commits[-1] if commits else {}
+    comments = detail.get("comments") or []
+    last_comment = comments[-1] if comments else None
+    ci_state, ci_checks = _pr_ci_status(detail.get("statusCheckRollup"))
+    return {
+        "kind": "pr", "repo": repo, "number": num,
+        "branch": detail.get("headRefName", ""),
+        "title": detail.get("title") or fallback.get("title") or "",
+        "url": detail.get("url") or fallback.get("url") or "",
+        "is_draft": bool(detail.get("isDraft")),
+        "approval": _pr_approval(detail.get("reviewDecision")),
+        "ci": ci_state, "ci_checks": ci_checks,
+        "commit_ts": parse_ts(last_commit.get("committedDate")) if last_commit.get("committedDate") else None,
+        "commit_sha": (last_commit.get("oid") or "")[:7],
+        "commit_msg": (last_commit.get("messageHeadline") or ""),
+        "comment_ts": parse_ts(last_comment["createdAt"]) if last_comment else None,
+        "comment_author": (last_comment.get("author", {}) or {}).get("login", "") if last_comment else "",
+        "comment_preview": (last_comment.get("body") or "")[:20] if last_comment else "",
+        "comment_full": (last_comment.get("body") or "") if last_comment else "",
+    }
+
+
+def _branch_rows(repo, user, seen):
+    """Rows for this repo's branches that have no open PR and whose tip commit
+    is the signed-in user's."""
+    repo_obj = _gh_json(["api", repo], timeout=10)
+    default_branch = repo_obj.get("default_branch") if repo_obj else None
+    out = []
+    for b in _gh_json(["api", f"repos/{repo}/branches", "--paginate"], timeout=20) or []:
+        name = b.get("name")
+        sha = (b.get("commit") or {}).get("sha")
+        if not name or not sha or name == default_branch or (repo, name) in seen:
+            continue
+        commit = _gh_json(["api", f"repos/{repo}/commits/{sha}"], timeout=10) or {}
+        if (commit.get("author") or {}).get("login") != user:
+            continue
+        c = commit.get("commit") or {}
+        out.append({
+            "kind": "branch", "repo": repo, "number": None, "branch": name,
+            "title": name, "url": f"https://github.com/{repo}/tree/{name}",
+            "is_draft": False, "approval": "", "ci": "none", "ci_checks": [],
+            "commit_ts": parse_ts((c.get("committer") or {}).get("date")),
+            "commit_sha": sha[:7],
+            "commit_msg": (c.get("message") or "").splitlines()[0] if c.get("message") else "",
+            "comment_ts": None, "comment_author": "", "comment_preview": "",
+            "comment_full": "",
+        })
+    return out
+
+
+def collect_prs(cached=None, publish=None):
+    """Scan (background-threaded by kick_collect_prs): open PRs authored by the
+    signed-in user, plus branches with no open PR whose latest commit is also
+    theirs. Returns (rows, err) — err is a user-facing string when the whole tab
+    should show a message instead of a table.
+
+    Every `gh` call is one network round trip and a serial scan spent most of a
+    minute waiting on them, so they run PR_WORKERS at a time. `cached` rows (the
+    previous scan, from disk on the first run) are re-checked FIRST and handed to
+    `publish` as soon as they land, so the table goes live while discovery of new
+    PRs and branches is still in flight."""
     if not _GH_BIN:
         return [], "gh CLI not found — install from https://cli.github.com"
     user = gh_username()
     if not user:
         return [], "gh not authenticated — run `gh auth login`"
 
-    rows, seen = [], set()   # seen: (repo, branch) already surfaced as a PR
-    prs = _gh_json(["search", "prs", "--author=@me", "--state=open",
-                    "--json", "repository,number,title,url,updatedAt"]) or []
-    for p in prs:
-        repo = p.get("repository")
-        repo = repo.get("nameWithOwner") if isinstance(repo, dict) else repo
-        if not repo:
-            continue
-        num = p["number"]
-        detail = _gh_json(["pr", "view", str(num), "--repo", repo, "--json",
-                           "reviewDecision,statusCheckRollup,commits,comments,"
-                           "headRefName,isDraft,url,title"]) or {}
-        commits = detail.get("commits") or []
-        last_commit = commits[-1] if commits else {}
-        comments = detail.get("comments") or []
-        last_comment = comments[-1] if comments else None
-        ci_state, ci_checks = _pr_ci_status(detail.get("statusCheckRollup"))
-        rows.append({
-            "kind": "pr", "repo": repo, "number": num,
-            "branch": detail.get("headRefName", ""),
-            "title": detail.get("title") or p.get("title") or "",
-            "url": detail.get("url") or p.get("url") or "",
-            "is_draft": bool(detail.get("isDraft")),
-            "approval": _pr_approval(detail.get("reviewDecision")),
-            "ci": ci_state, "ci_checks": ci_checks,
-            "commit_ts": parse_ts(last_commit.get("committedDate")) if last_commit.get("committedDate") else None,
-            "commit_sha": (last_commit.get("oid") or "")[:7],
-            "commit_msg": (last_commit.get("messageHeadline") or ""),
-            "comment_ts": parse_ts(last_comment["createdAt"]) if last_comment else None,
-            "comment_author": (last_comment.get("author", {}) or {}).get("login", "") if last_comment else "",
-            "comment_preview": (last_comment.get("body") or "")[:20] if last_comment else "",
-            "comment_full": (last_comment.get("body") or "") if last_comment else "",
-        })
-        seen.add((repo, detail.get("headRefName", "")))
+    with futures.ThreadPoolExecutor(max_workers=PR_WORKERS) as ex:
+        search = ex.submit(_gh_json, ["search", "prs", "--author=@me", "--state=open",
+                                      "--json", "repository,number,title,url,updatedAt"])
+        commits = ex.submit(_gh_json, ["api", "search/commits", "-f", f"q=author:{user}"], 25)
 
-    commits_hits = _gh_json(["api", "search/commits", "-f", f"q=author:{user}"], timeout=25) or {}
-    repos = sorted({(it.get("repository") or {}).get("full_name")
-                    for it in (commits_hits.get("items") or [])
-                    if (it.get("repository") or {}).get("full_name")})
-    for repo in repos:
-        repo_obj = _gh_json(["api", repo], timeout=10)
-        default_branch = repo_obj.get("default_branch") if repo_obj else None
-        branches = _gh_json(["api", f"repos/{repo}/branches", "--paginate"], timeout=20) or []
-        for b in branches:
-            name = b.get("name")
-            if not name or name == default_branch or (repo, name) in seen:
-                continue
-            sha = (b.get("commit") or {}).get("sha")
-            if not sha:
-                continue
-            commit = _gh_json(["api", f"repos/{repo}/commits/{sha}"], timeout=10) or {}
-            author_login = (commit.get("author") or {}).get("login")
-            if author_login != user:
-                continue
-            c = commit.get("commit") or {}
-            rows.append({
-                "kind": "branch", "repo": repo, "number": None, "branch": name,
-                "title": name, "url": f"https://github.com/{repo}/tree/{name}",
-                "is_draft": False, "approval": "", "ci": "none", "ci_checks": [],
-                "commit_ts": parse_ts((c.get("committer") or {}).get("date")),
-                "commit_sha": sha[:7],
-                "commit_msg": (c.get("message") or "").splitlines()[0] if c.get("message") else "",
-                "comment_ts": None, "comment_author": "", "comment_preview": "",
-                "comment_full": "",
-            })
+        if cached and publish:
+            keys = [(r["repo"], r["number"]) for r in cached
+                    if r.get("kind") == "pr" and r.get("number")]
+            fresh = [r for r in ex.map(lambda k: _pr_row(*k), keys) if r]
+            if fresh:
+                publish(fresh + [r for r in cached if r.get("kind") != "pr"])
+
+        found = []
+        for p in search.result() or []:
+            repo = p.get("repository")
+            repo = repo.get("nameWithOwner") if isinstance(repo, dict) else repo
+            if repo:
+                found.append((repo, p["number"], p))
+        rows = [r for r in ex.map(lambda t: _pr_row(t[0], t[1], t[2]), found) if r]
+        seen = {(r["repo"], r["branch"]) for r in rows}
+
+        repos = sorted({(it.get("repository") or {}).get("full_name")
+                        for it in ((commits.result() or {}).get("items") or [])
+                        if (it.get("repository") or {}).get("full_name")})
+        for batch in ex.map(lambda repo: _branch_rows(repo, user, seen), repos):
+            rows += batch
     return rows, None
 
 
@@ -2179,9 +2244,16 @@ def kick_collect_prs():
 
     def run():
         try:
-            rows, err = collect_prs()
+            cached = (_pr_collect_result.get("prs") or ([], None))[0]
+
+            def publish(partial):        # cached rows, re-checked: show them now
+                _pr_collect_result["prs"] = (partial, None)
+
+            rows, err = collect_prs(cached=cached, publish=publish)
             _pr_collect_result["prs"] = (rows, err)
             _pr_collect_result["prs_ts"] = datetime.now(timezone.utc)
+            if rows and not err:
+                save_pr_cache(rows)
         except Exception:
             log.exception("kick_collect_prs: scan failed")
         finally:
@@ -3641,7 +3713,9 @@ def run_live(args):
     # popups (CI/comment drilldown, confirm-then-run) are independent of the
     # session/bucket/panel popups the live/history views use.
     show_prs = False
-    pr_rows, pr_err, last_pr_collect = [], None, None
+    pr_rows, pr_err, last_pr_collect = load_pr_cache() or [], None, None
+    if pr_rows:                  # paint the last scan immediately, then refresh
+        _pr_collect_result["prs"] = (pr_rows, None)
     pr_tips, pr_hover = [], None
     pr_ui = {"ci_idx": None, "comment_idx": None, "confirm": None, "err": None}
     pr_action_running_prev = False
