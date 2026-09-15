@@ -31,7 +31,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.tag.outputs.new_tag }}
-        run: gh release create "$TAG" --title "$TAG" --generate-notes --latest
+          # commit-derived list: --generate-notes alone shows nothing for
+          # commits pushed straight to main (it only lists merged PRs)
+          CHANGELOG: ${{ steps.tag.outputs.changelog }}
+        run: |
+          gh release create "$TAG" --title "$TAG" --latest \
+            --notes "$CHANGELOG" --generate-notes
 
       # ponytail: no build artefacts, so the formula just points at the tag tarball
       - name: Update Homebrew tap
