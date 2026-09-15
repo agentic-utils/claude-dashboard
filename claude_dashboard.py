@@ -2102,6 +2102,11 @@ def _pr_approval(review_decision):
 PR_CACHE_PATH = os.path.join(CONFIG_HOME, "dashboard-prs.json")
 PR_CACHE_TTL = 7 * 24 * 3600        # a week-old row set is not worth painting
 PR_WORKERS = 8                      # concurrent `gh` calls per scan
+PR_SEARCH_LIMIT = 200               # open PRs to fetch (gh defaults to 30)
+COMMIT_SEARCH_PER_PAGE = 100        # recent commits scanned for branch repos
+BRANCH_REPO_LIMIT = 10              # repos to look for unopened branches in
+BRANCH_LIMIT_PER_REPO = 50          # branches checked per repo
+RATE_FLOOR = 500                    # leave this much GitHub quota for everything else
 
 
 def _iso(dt):
@@ -2171,10 +2176,11 @@ def _pr_row(repo, num, fallback=None):
 def _branch_rows(repo, user, seen):
     """Rows for this repo's branches that have no open PR and whose tip commit
     is the signed-in user's."""
-    repo_obj = _gh_json(["api", repo], timeout=10)
+    repo_obj = _gh_json(["api", f"repos/{repo}"], timeout=10)
     default_branch = repo_obj.get("default_branch") if repo_obj else None
     out = []
-    for b in _gh_json(["api", f"repos/{repo}/branches", "--paginate"], timeout=20) or []:
+    for b in (_gh_json(["api", f"repos/{repo}/branches?per_page=100"],
+                       timeout=20) or [])[:BRANCH_LIMIT_PER_REPO]:
         name = b.get("name")
         sha = (b.get("commit") or {}).get("sha")
         if not name or not sha or name == default_branch or (repo, name) in seen:
@@ -2196,6 +2202,27 @@ def _branch_rows(repo, user, seen):
     return out
 
 
+def rate_headroom():
+    """(ok, message) from GitHub's rate-limit endpoint, which is itself free.
+    A scan is a few hundred calls, so it must not be the thing that exhausts
+    the hourly quota and locks the user out of `gh` everywhere else."""
+    data = _gh_json(["api", "rate_limit"], timeout=10) or {}
+    res = data.get("resources") or {}
+    for name in ("core", "graphql", "search"):
+        bucket = res.get(name) or {}
+        remaining, limit = bucket.get("remaining"), bucket.get("limit")
+        if remaining is None:
+            continue
+        floor = RATE_FLOOR if name != "search" else 3
+        if remaining < floor:
+            reset = bucket.get("reset")
+            when = (datetime.fromtimestamp(reset, timezone.utc).strftime("%H:%M")
+                    if reset else "soon")
+            return False, (f"GitHub {name} rate limit low ({remaining}/{limit}) - "
+                           f"skipping the scan until it resets at {when} UTC")
+    return True, None
+
+
 def collect_prs(cached=None, publish=None):
     """Scan (background-threaded by kick_collect_prs): open PRs authored by the
     signed-in user, plus branches with no open PR whose latest commit is also
@@ -2212,11 +2239,23 @@ def collect_prs(cached=None, publish=None):
     user = gh_username()
     if not user:
         return [], "gh not authenticated — run `gh auth login`"
+    ok, why = rate_headroom()
+    if not ok:
+        return (cached or []), why
 
     with futures.ThreadPoolExecutor(max_workers=PR_WORKERS) as ex:
+        # Both searches are capped by gh's defaults - 30 results - and those 30
+        # are the top of a relevance ordering, not a random sample, so without
+        # an explicit limit the table silently showed a third of the PRs.
         search = ex.submit(_gh_json, ["search", "prs", "--author=@me", "--state=open",
+                                      "--limit", str(PR_SEARCH_LIMIT),
                                       "--json", "repository,number,title,url,updatedAt"])
-        commits = ex.submit(_gh_json, ["api", "search/commits", "-f", f"q=author:{user}"], 25)
+        # Query string, NOT -f: `gh api -f` switches the request to POST, which
+        # /search/commits answers with a 404 - so this search silently returned
+        # nothing and no branch rows were ever discovered.
+        commits = ex.submit(_gh_json, ["api", f"search/commits?q=author:{user}"
+                                       "&sort=author-date&order=desc"
+                                       f"&per_page={COMMIT_SEARCH_PER_PAGE}"], 25)
 
         if cached and publish:
             keys = [(r["repo"], r["number"]) for r in cached
@@ -2234,9 +2273,12 @@ def collect_prs(cached=None, publish=None):
         rows = [r for r in ex.map(lambda t: _pr_row(t[0], t[1], t[2]), found) if r]
         seen = {(r["repo"], r["branch"]) for r in rows}
 
-        repos = sorted({(it.get("repository") or {}).get("full_name")
-                        for it in ((commits.result() or {}).get("items") or [])
-                        if (it.get("repository") or {}).get("full_name")})
+        # Most-recently-committed-to repos first, capped: each one costs a
+        # branch listing plus a commit lookup per branch.
+        repos = list(dict.fromkeys(
+            (it.get("repository") or {}).get("full_name")
+            for it in ((commits.result() or {}).get("items") or [])
+            if (it.get("repository") or {}).get("full_name")))[:BRANCH_REPO_LIMIT]
         for batch in ex.map(lambda repo: _branch_rows(repo, user, seen), repos):
             rows += batch
     return rows, None
@@ -3578,8 +3620,8 @@ def main():
                     help="base input $/million-tokens for the history $ estimate "
                          "(default 5.0 = Opus 4.8 input); effective tokens are "
                          "priced at this rate")
-    ap.add_argument("--pr-refresh-seconds", type=int, default=300, metavar="SECONDS",
-                    help="seconds between PRS-tab refreshes (default 300). Each "
+    ap.add_argument("--pr-refresh-seconds", type=int, default=600, metavar="SECONDS",
+                    help="seconds between PRS-tab refreshes (default 600). Each "
                          "scan is several `gh` subprocess calls, so this is "
                          "deliberately coarser than --interval.")
     ap.add_argument("--exclude", default=None, metavar="PATH" + os.pathsep + "PATH",
