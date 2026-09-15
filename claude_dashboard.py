@@ -4018,6 +4018,7 @@ def run_live(args):
     pr_tips, pr_hover = [], None
     pr_sel = None                # keyboard cursor in the PRS table
     pr_top = 0                   # first visible row of the PRS table
+    pr_sel_prev = None           # cursor as of the previous input tick
     pr_ui = {"ci_idx": None, "comment_idx": None, "confirm": None, "err": None}
     pr_action_running_prev = False
     pr_action_started = None
@@ -4357,12 +4358,15 @@ def run_live(args):
                          pr_delta) = process_prs_input(
                             data, mouse_re, hits, pr_ui, pr_rows, show_help,
                             _pr_action["running"], pr_hover, pr_sel)
-                        # Scroll, then keep the keyboard cursor on screen, then
-                        # clamp to the last page.
+                        # Scroll, then clamp. The view follows the cursor only
+                        # on the tick the cursor MOVED: doing it every tick
+                        # yanked the table straight back whenever the wheel
+                        # scrolled away from a selected row.
                         cap = pr_capacity(rows)
                         pr_top += pr_delta
-                        if pr_sel is not None:
+                        if pr_sel is not None and pr_sel != pr_sel_prev:
                             pr_top = min(max(pr_top, pr_sel - cap + 1), pr_sel)
+                        pr_sel_prev = pr_sel
                         pr_top = max(0, min(pr_top, max(0, len(pr_rows) - cap)))
                         if do_pr_refresh:
                             last_pr_collect = None   # forces an immediate rescan next tick
@@ -4495,10 +4499,8 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
         # Bit 6 (64) flags scroll-wheel events, which also satisfy &0b11==0;
         # exclude them from clicks so scrolling over a row doesn't open a popup.
         # Wheel up == button 64, wheel down == button 65; use them to scroll.
-        if button == 64:
-            delta -= 3
-        elif button == 65:
-            delta += 3
+        if button & 64:                 # wheel, with or without the motion bit
+            delta += 3 if button & 1 else -3
         elif button & 0b11 == 0 and not button & 64 and final == "M":  # left press
             if show_help:
                 show_help = False          # any click dismisses help
@@ -4714,8 +4716,8 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help,
         if button & 32 and button & 0b11 == 3:
             pr_hover = (x, y)   # pure hover motion, no button — not a click
             continue
-        if button in (64, 65):          # wheel up / down scrolls the table
-            pr_delta += -3 if button == 64 else 3
+        if button & 64:                 # wheel: 64 up / 65 down, +32 when the
+            pr_delta += 3 if button & 1 else -3   # pointer also moved
             continue
         if not (button & 0b11 == 0 and not button & 64 and final == "M"):
             continue   # only a plain left-press counts as a click here
