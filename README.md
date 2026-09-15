@@ -122,11 +122,15 @@ The PRS table pages when it outgrows the window: `↑`/`↓` scroll it via the c
 `PgUp`/`PgDn` and the wheel scroll it directly, and a line under the table says how
 many rows sit above and below.
 
-In the PRS tab, nothing needs a mouse: `↑`/`↓` (or `j`/`k`) move the row cursor,
-`enter`/`o` opens the PR, `c` shows failing checks, `v` the full comment, and
-`m` / `d` / `x` merge, toggle draft, or close it (delete, on a branch row) via the
-same confirm popup the buttons use. `f` cycles the view filter: all → no drafts →
+In the PRS tab, nothing needs a mouse: `↑`/`↓` (or `J`/`K`) move the row cursor,
+`enter`/`O` opens the PR, `C` shows failing checks, `V` the full comment, and
+`M` / `D` / `X` merge, toggle draft, or close it (delete, on a branch row) via the
+same confirm popup the buttons use. `F` cycles the view filter: all → no drafts →
 ready to merge; it filters what's on screen and never refetches.
+
+Every shortcut is case-insensitive. They are written upper case here and in the
+app; what a letter does depends on the view, so `R` is refresh in the tabs and
+re-login inside the account popup.
 
 ## How it works / requirements
 
