@@ -63,7 +63,9 @@ per line, '#' comments OK) - CLI flags given at the command line override it.
 from __future__ import annotations
 
 import argparse
+import getpass
 import glob
+import hashlib
 import json
 import logging
 import math
@@ -78,6 +80,7 @@ import termios
 import threading
 import time
 import tty
+import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -1765,25 +1768,78 @@ def render_login_confirm(now, cols, rows, login_elapsed=None):
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
-CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
+# CLAUDE_CONFIG_DIR moves the whole Claude Code profile, which is how
+# `cswap run <account>` pins one terminal to one login.
+CONFIG_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+CREDS_PATH = os.path.join(CONFIG_HOME, ".credentials.json")
 ACCOUNTS_DIR = os.path.expanduser("~/.claude/dashboard-accounts")
 KEYCHAIN_SERVICE = "Claude Code-credentials"
+SECURITY = "/usr/bin/security"      # pinned: a credential tool, not PATH-resolved
+
+
+def keychain_service():
+    """Service name holding this profile's active OAuth credential. Claude Code
+    hashes the RAW CLAUDE_CONFIG_DIR value (NFC, unresolved) into the name, so a
+    `cswap run` terminal reads its own item and not the default account's.
+    CLAUDE_SECURESTORAGE_CONFIG_DIR overrides it, empty meaning the default."""
+    secure = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    cfg = secure if secure is not None else os.environ.get("CLAUDE_CONFIG_DIR")
+    if not cfg:
+        return KEYCHAIN_SERVICE
+    digest = hashlib.sha256(
+        unicodedata.normalize("NFC", cfg).encode("utf-8")).hexdigest()[:8]
+    return f"{KEYCHAIN_SERVICE}-{digest}"
+
+
+def keychain_account():
+    """Mirrors Claude Code's getUsername(): $USER, else the OS username."""
+    try:
+        return os.environ.get("USER") or getpass.getuser()
+    except Exception:
+        return "user"
 
 
 def read_creds():
-    """The live OAuth store. Claude Code writes CREDS_PATH on Linux/WSL but
-    keeps the same JSON in the macOS login Keychain instead, where there is no
-    file at all - read both so the ALLOWANCE panel works on either."""
+    """The live OAuth store, whichever backend Claude Code is using here: the
+    file on Linux/WSL, the macOS login Keychain (where no file exists at all).
+    cswap switches accounts by rewriting these same two, so reading them keeps
+    the dashboard on whatever account cswap last selected."""
     try:
         return json.load(open(CREDS_PATH))
     except FileNotFoundError:
-        # ponytail: `security` is in the base system; no keyring dependency
+        if sys.platform != "darwin":
+            raise                    # no Keychain anywhere else; keep the error
+        # ponytail: `security` ships with macOS; no keyring dependency
         out = subprocess.run(
-            ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
-            capture_output=True, text=True)
+            [SECURITY, "find-generic-password", "-s", keychain_service(),
+             "-a", keychain_account(), "-w"],
+            capture_output=True, text=True, timeout=5)
         if out.returncode != 0:
             raise
         return json.loads(out.stdout)
+
+
+def creds_in_keychain():
+    """True when this profile's credential lives in the Keychain, not a file."""
+    return not os.path.exists(CREDS_PATH) and sys.platform == "darwin"
+
+
+def write_creds(creds):
+    """Write the active credential back to whichever store is in use. The
+    Keychain value is hex-encoded (-X) and fed through `security -i` so the
+    token never appears in argv, the same shape Claude Code and cswap use."""
+    if not creds_in_keychain():
+        json.dump(creds, open(CREDS_PATH, "w"))
+        return True
+    payload = json.dumps(creds).encode("utf-8").hex()
+    cmd = (f"add-generic-password -U -s {shlex.quote(keychain_service())} "
+           f"-a {shlex.quote(keychain_account())} -X {payload}\n")
+    out = subprocess.run([SECURITY, "-i"], input=cmd,
+                         capture_output=True, text=True, timeout=5)
+    if out.returncode != 0:
+        log.warning("write_creds: keychain write failed: %s", out.stderr.strip())
+        return False
+    return True
 # Shared by the context light (ctx_grade) and allowance gauge (gauge_grade) —
 # the actual thresholds live in those functions, not here.
 OK_C = (52, 224, 150)       # green
@@ -2265,17 +2321,19 @@ def save_account_snapshot(label=None):
 
 
 def switch_account(slug):
-    """Snapshot the current account (so it isn't lost), then overwrite the
-    live creds file with the saved account's. Non-disruptive: Claude Code and
-    this dashboard both re-read CREDS_PATH fresh, so other running sessions
-    pick up the new account on their next call, no restart needed."""
+    """Snapshot the current account (so it isn't lost), then overwrite the live
+    credential with the saved account's, in whichever store this profile uses
+    (file, or the macOS Keychain). Non-disruptive: Claude Code and this
+    dashboard both re-read it fresh, so other running sessions pick up the new
+    account on their next call, no restart needed."""
     path = os.path.join(ACCOUNTS_DIR, slug + ".json")
     try:
         creds = json.load(open(path))["creds"]
     except (OSError, ValueError, KeyError):
         return False
     save_account_snapshot()          # best-effort; swallows its own failures
-    json.dump(creds, open(CREDS_PATH, "w"))
+    if not write_creds(creds):
+        return False
     return True
 
 
