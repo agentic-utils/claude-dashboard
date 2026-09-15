@@ -81,7 +81,10 @@ pipx install git+https://github.com/agentic-utils/claude-dashboard
 ```
 
 `--upgrade` works either way: it looks at where this copy is installed and
-calls brew, uv or pipx accordingly.
+calls brew, uv or pipx accordingly. It also checks for a new release on start
+(and every six hours) and offers it in the footer: `U` installs it and relaunches
+in place, `N` dismisses it for the session, `--no-auto-update` turns the check
+off. A git checkout is left alone.
 
 `brew install agentic-utils/tap/claude-dashboard` does both steps in one go.
 

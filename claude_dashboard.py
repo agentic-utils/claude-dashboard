@@ -3746,6 +3746,7 @@ class _ArgumentParser(argparse.ArgumentParser):
 TAP_FORMULA = "agentic-utils/tap/claude-dashboard"
 TERM_TITLE = "claude-dashboard"
 FRAME_FAIL_LIMIT = 5                # consecutive bad frames before saying so
+NO_AUTO_UPDATE = False              # set from --no-auto-update
 
 
 def install_method():
@@ -3760,6 +3761,103 @@ def install_method():
     if ("pipx", "venvs") in pairs:
         return "pipx"
     return None
+
+
+UPDATE_CHECK_EVERY = 6 * 3600       # seconds between release-tag checks
+UPDATE_CACHE = os.path.join(CONFIG_HOME, "dashboard-update.json")
+RELEASE_URL = ("https://api.github.com/repos/agentic-utils/claude-dashboard"
+               "/releases/latest")
+# Shared with the render thread: {"latest": str|None, "ready": bool}
+_update = {"latest": None, "dismissed": False}
+
+
+def _version_tuple(v):
+    """Comparable (1, 2, 3) from "1.2.3"; anything odd sorts as (0,)."""
+    try:
+        return tuple(int(x) for x in v.lstrip("v").split(".")[:3])
+    except (AttributeError, ValueError):
+        return (0,)
+
+
+def latest_version():
+    """Newest published release tag, cached on disk so a restart loop can't
+    hammer the API. None if the check failed or is not due yet."""
+    try:
+        cached = json.load(open(UPDATE_CACHE))
+        if time.time() - cached.get("at", 0) < UPDATE_CHECK_EVERY:
+            return cached.get("latest")
+    except (OSError, ValueError):
+        pass
+    latest = None
+    if _GH_BIN:      # authenticated: the anonymous API is 60/hour per IP and
+                     # shared with everything else on this network
+        latest = ((_gh_json(["api", "repos/agentic-utils/claude-dashboard"
+                             "/releases/latest", "--jq", "{t: .tag_name}"],
+                            timeout=10) or {}).get("t") or "").lstrip("v") or None
+    if not latest:
+        try:
+            req = urllib.request.Request(
+                RELEASE_URL, headers={"Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=10) as r:
+                latest = (json.load(r).get("tag_name") or "").lstrip("v") or None
+        except Exception as e:                  # offline, rate limited, whatever
+            log.warning("latest_version: %s", e)
+    if latest:       # only a real answer is worth caching for six hours
+        try:
+            json.dump({"at": time.time(), "latest": latest}, open(UPDATE_CACHE, "w"))
+        except OSError:
+            pass
+    return latest
+
+
+def kick_update_check():
+    """Background: is a newer release published? Nothing is installed here -
+    the user is asked first, and an install only helps once the process
+    re-execs anyway, since this file is already imported."""
+    def run():
+        try:
+            forced = os.environ.get("CLAUDE_DASHBOARD_FORCE_UPDATE")   # for testing
+            if not forced and version_string() == "dev":
+                return          # a checkout updates with git pull, not with us
+            latest = forced or latest_version()
+            if latest and _version_tuple(latest) > _version_tuple(version_string()):
+                _update["latest"] = latest
+        except Exception:
+            log.exception("kick_update_check failed")
+    if not NO_AUTO_UPDATE:
+        threading.Thread(target=run, daemon=True).start()
+
+
+def reload_argv():
+    """How to re-exec this program. The installed console script is preferred:
+    a brew upgrade moves the code to a new Cellar path, so re-running the old
+    __file__ would start the version we just replaced."""
+    exe = shutil.which("claude-dashboard")
+    if exe:
+        return exe, [exe] + sys.argv[1:]
+    return sys.executable, [sys.executable, os.path.abspath(__file__)] + sys.argv[1:]
+
+
+def hot_reload(fd, old_term):
+    """Re-exec the (just updated) program in place. The terminal is handed back
+    first - alt screen off, cursor and wrap on, cooked mode - because execv
+    never returns and the new process starts from a clean terminal."""
+    try:
+        sys.stdout.write("\033[?1000l\033[?1003l\033[?1006l")
+        set_term_title("")
+        sys.stdout.write("\033[?7h\033[?25h\033[?1049l")
+        sys.stdout.flush()
+        if old_term is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_term)
+    except (termios.error, ValueError, OSError):
+        pass
+    exe, argv = reload_argv()
+    log.info("hot reload: %s", argv)
+    try:
+        os.execv(exe, argv)
+    except OSError as e:               # nothing has been torn down but the TUI
+        print(f"could not reload ({e}); start claude-dashboard again")
+        raise SystemExit(1)
 
 
 def version_string():
@@ -3850,6 +3948,8 @@ def main():
                          f"{os.pathsep!r}-delimited (Python's os.pathsep on this "
                          "host: ';' on Windows, ':' on POSIX). No default - "
                          "nothing is excluded unless given.")
+    ap.add_argument("--no-auto-update", action="store_true",
+                    help="check for a new release but don't install it")
     ap.add_argument("--prune-merged", action="store_true",
                     help="list the branches left behind by your merged PRs and "
                          "exit; add --yes to delete them")
@@ -3862,6 +3962,8 @@ def main():
     argv = (["@" + RC_PATH] if os.path.isfile(RC_PATH) else []) + sys.argv[1:]
     args = ap.parse_args(argv)
 
+    global NO_AUTO_UPDATE
+    NO_AUTO_UPDATE = args.no_auto_update
     if args.upgrade:
         sys.exit(self_upgrade())
     if args.prune_merged:
@@ -4046,6 +4148,7 @@ def run_live(args):
         # over-width line clips instead of wrapping + desyncing the layout).
         sys.stdout.write("\033[?1049h\033[?25l\033[?7l")
         set_term_title(TERM_TITLE)
+        kick_update_check()
         # Enable SGR mouse reporting + cbreak input so clicks/keys arrive
         # immediately. cbreak (not raw) keeps ISIG, so ⌃C still raises.
         try:
@@ -4263,6 +4366,14 @@ def run_live(args):
                 frame = "\n".join(frame.split("\n")[:rows])
                 hits = [h for h in hits if h[0] <= rows]
             frame_fails = 0
+            if alt and _update["latest"] and not _update["dismissed"]:
+                # Replaces the footer line rather than adding one, so no frame
+                # grows past the terminal and nothing below it shifts.
+                lines = frame.split("\n")
+                lines[-1] = "  " + rgb(
+                    OK_C, f"claude-dashboard {_update['latest']} is available · "
+                          "U to update and relaunch · N to dismiss", bold=True)
+                frame = "\n".join(lines)
             if alt:
                 # One overlay at a time: loading > help > login-confirm >
                 # usage-error > session > bucket > panel popup. overlay_regions
@@ -4419,6 +4530,17 @@ def run_live(args):
                         data = os.read(fd, 4096).decode("utf-8", "ignore")
                     except OSError:
                         data = ""
+                    if _update["latest"] and not _update["dismissed"]:
+                        if "N" in data:
+                            _update["dismissed"] = True
+                        elif "U" in data:
+                            sys.stdout.write("\033[H\033[2J  updating…\r\n")
+                            sys.stdout.flush()
+                            if install_method() and self_upgrade() != 0:
+                                _update["dismissed"] = True   # leave a usable TUI
+                                log.warning("update failed; staying on this version")
+                            else:
+                                hot_reload(fd, old_term)      # never returns
                     do_prs = False
                     if show_prs:
                         scroll_delta = 0
