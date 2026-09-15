@@ -2200,8 +2200,10 @@ def _pr_skeleton(repo, num, hit):
 def _branch_rows(repo, user, seen):
     """Rows for this repo's branches that have no open PR and whose tip commit
     is the signed-in user's."""
-    repo_obj = _gh_json(["api", f"repos/{repo}"], timeout=10)
-    default_branch = repo_obj.get("default_branch") if repo_obj else None
+    repo_obj = _gh_json(["api", f"repos/{repo}"], timeout=10) or {}
+    if repo_obj.get("archived"):
+        return []                    # read-only: a branch there is not actionable
+    default_branch = repo_obj.get("default_branch")
     out = []
     for b in (_gh_json(["api", f"repos/{repo}/branches?per_page=100"],
                        timeout=20) or [])[:BRANCH_LIMIT_PER_REPO]:
@@ -2272,6 +2274,7 @@ def collect_prs(cached=None, publish=None):
         # are the top of a relevance ordering, not a random sample, so without
         # an explicit limit the table silently showed a third of the PRs.
         search = ex.submit(_gh_json, ["search", "prs", "--author=@me", "--state=open",
+                                      "--archived=false",   # nothing to do there
                                       "--limit", str(PR_SEARCH_LIMIT),
                                       "--json", "repository,number,title,url,updatedAt"])
         # Query string, NOT -f: `gh api -f` switches the request to POST, which
