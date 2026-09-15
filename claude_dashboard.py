@@ -2182,6 +2182,21 @@ def _pr_row(repo, num, fallback=None):
     }
 
 
+def _pr_skeleton(repo, num, hit):
+    """A row from the search payload alone, shown while its detail call is in
+    flight: the search knows repo, number and title, nothing else. `loading`
+    keeps the action buttons off it - a Draft toggle built on a guessed state
+    would flip the wrong way."""
+    return {
+        "kind": "pr", "repo": repo, "number": num, "branch": "",
+        "title": hit.get("title") or "", "url": hit.get("url") or "",
+        "is_draft": False, "approval": "", "ci": "none", "ci_checks": [],
+        "commit_ts": None, "commit_sha": "", "commit_msg": "…",
+        "comment_ts": None, "comment_author": "", "comment_preview": "",
+        "comment_full": "", "loading": True,
+    }
+
+
 def _branch_rows(repo, user, seen):
     """Rows for this repo's branches that have no open PR and whose tip commit
     is the signed-in user's."""
@@ -2283,7 +2298,9 @@ def collect_prs(cached=None, publish=None):
         # minute of `gh` calls, and an empty progress bar for that long is the
         # whole complaint. Results keep their submission slot so a row never
         # jumps around as its neighbours arrive.
-        done = [None] * len(found)
+        done = [_pr_skeleton(repo, num, hit) for repo, num, hit in found]
+        if publish and done:
+            publish(list(done))      # every PR visible on the search alone
         pending = {ex.submit(_pr_row, t[0], t[1], t[2]): i
                    for i, t in enumerate(found)}
         last_publish = 0.0
@@ -3182,6 +3199,8 @@ def _clip_ellip(s, width):
 def pr_row_buttons(row):
     """(label, action_kind) pairs shown for this row, in click order."""
     btns = []
+    if row.get("loading"):
+        return btns
     if row["kind"] == "pr":
         if (row["approval"] in ("Approved", "No review needed") and row["ci"] == "green"
                 and not row["is_draft"]):
