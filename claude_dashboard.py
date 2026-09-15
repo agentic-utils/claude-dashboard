@@ -3505,13 +3505,21 @@ def install_method():
 
 
 def version_string():
-    """This copy's version. Installed copies carry package metadata (hatch-vcs
-    stamps it from the git tag); a plain checkout has none, so it reads dev."""
+    """This copy's version. A uv/pipx install carries package metadata (hatch-vcs
+    stamps it from the git tag). A brew install is a bare script with no metadata
+    at all, but its Cellar path names the version. A checkout has neither."""
     try:
         from importlib.metadata import version
         return version("claude-dashboard")
     except Exception:
-        return "dev"
+        pass
+    parts = Path(os.path.realpath(__file__)).parts
+    if "Cellar" in parts:            # …/Cellar/<formula>/<version>/bin/<script>
+        try:
+            return parts[parts.index("Cellar") + 2]
+        except IndexError:
+            pass
+    return "dev"
 
 
 def self_upgrade():
