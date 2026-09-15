@@ -68,11 +68,26 @@ tab shows a message instead of a table if it isn't. Refreshed every
 ## Install
 
 ```bash
-brew install agentic-utils/tap/claude-dashboard
-claude-dashboard --upgrade    # update in place later
+brew tap agentic-utils/tap                     # add the tap (once)
+brew install claude-dashboard
+claude-dashboard --upgrade                     # update in place later
 ```
 
-Or just run the script — it is a single stdlib-only file.
+`brew install agentic-utils/tap/claude-dashboard` does both steps in one go.
+
+A tap is just a public GitHub repo, so there is no signing or approval step:
+Homebrew adds it and trusts whatever you point it at. Read it before you do.
+
+```bash
+brew tap-info agentic-utils/tap                # where the tap comes from
+brew cat agentic-utils/tap/claude-dashboard    # the formula, before installing
+brew untap agentic-utils/tap                   # change your mind
+```
+
+The formula only downloads the tagged source tarball from this repo and drops
+`claude-dashboard.py` into `bin`. Nothing is compiled and no install script runs.
+
+Or skip Homebrew entirely: it is a single stdlib-only file you can run in place.
 
 ## Run
 
