@@ -1560,7 +1560,9 @@ def render_help(now, cols, rows):
               "up/down PgUp/PgDn j/k scroll · q / esc step back · ^C quit."),
         ("T", "PRS tab, no mouse needed: ↑/↓ (j/k) move the cursor · enter or "
               "o opens the PR · c failing checks · v full comment · m merge · "
-              "d draft/ready · x close (branch: delete) · y/n answer a confirm."),
+              "d draft/ready · x close (branch: delete) · y/n answer a confirm · "
+              "f cycles the filter: all / no drafts / ready to merge (a view "
+              "filter - it never refetches)."),
     ]
 
     # Flatten to coloured lines. Headings/legends/gaps -> one line; prose ->
@@ -3361,8 +3363,23 @@ def _with_scrollbar(panel_lines, n_visible, top, total, cap):
     return out
 
 
+PR_FILTERS = ("all", "no drafts", "ready to merge")
+
+
+def filter_pr_rows(rows, mode):
+    """A VIEW filter: the scan and its disk cache keep every row, so cycling
+    the filter costs nothing and never triggers a refetch."""
+    if mode == "no drafts":
+        return [r for r in rows if not r.get("is_draft")]
+    if mode == "ready to merge":
+        return [r for r in rows
+                if any(kind == "merge" for _label, kind in pr_row_buttons(r))]
+    return rows
+
+
 def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
-                     last_refresh=None, refreshing=False, sel=None, top=0):
+                     last_refresh=None, refreshing=False, sel=None, top=0,
+                     total=None, filter_mode="all"):
     """PRS tab: your open PRs + branches you've contributed to with no open
     PR. Returns (frame_str, hits, tips) — same convention as render_frame()
     plus `tips`: [(screen_row, lo, hi, full_text)] for cells whose shown text
@@ -3500,7 +3517,7 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
         # A standing key legend: the row actions are all keyboard-reachable but
         # nothing on screen said so, and the scroll position needs a home too.
         keys = ("↑/↓ move · enter open · c checks · v comment · "
-                "m merge · d draft · x close · r refresh")
+                "m merge · d draft · x close · f filter · r refresh")
         if len(rows) > cap:
             below = len(rows) - top - len(visible)
             keys = f"{top} above · {below} below · {keys}"
@@ -3514,7 +3531,10 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
         refresh_btn = "" if refreshing else "  [Refresh Now]"
         # A line of its own ABOVE the panel: in the border it read as floating
         # text overlapping the table's top row.
-        status = f"PRS · {len(rows)} rows{refresh_label}{refresh_btn}"
+        count = (f"{len(rows)} rows" if filter_mode == "all"
+                 else f"{len(rows)} of {total if total is not None else len(rows)}"
+                      f" rows · {filter_mode}")
+        status = f"PRS · {count}{refresh_label}{refresh_btn}"
         status_row = len(out) + 1            # 1-based screen row
         out.append("  " + rgb(ACCENT, _clip(status, total_width - 2), bold=True))
         panel_lines = panel("", body, inner)
@@ -4205,8 +4225,13 @@ def run_live(args):
                 cur_buckets, cur_sessions = buckets, sessions
                 pr_loading = "prs" not in _pr_collect_result
                 pr_elapsed = (now - last_pr_collect).total_seconds() if last_pr_collect else 0
+                pr_view_rows = filter_pr_rows(pr_rows, PR_FILTERS[pr_filter])
+                if pr_sel is not None and pr_sel >= len(pr_view_rows):
+                    pr_sel = (len(pr_view_rows) - 1) if pr_view_rows else None
                 frame, hits, pr_tips = render_prs_frame(
-                    now, pr_rows, pr_err, cols, rows, loading=pr_loading, elapsed=pr_elapsed,
+                    now, pr_view_rows, pr_err, cols, rows, loading=pr_loading,
+                    total=len(pr_rows), filter_mode=PR_FILTERS[pr_filter],
+                    elapsed=pr_elapsed,
                     last_refresh=_pr_collect_result.get("prs_ts"),
                     refreshing=(not pr_loading) and _pr_collect_inflight.locked(),
                     sel=pr_sel, top=pr_top)
@@ -4395,9 +4420,9 @@ def run_live(args):
                         do_login = do_retry = do_switch = do_cancel = do_refresh = False
                         (pr_ui, show_help, go_live, go_history, quit_flag,
                          do_pr_run, pr_hover, do_pr_refresh, pr_sel,
-                         pr_delta) = process_prs_input(
-                            data, mouse_re, hits, pr_ui, pr_rows, show_help,
-                            _pr_action["running"], pr_hover, pr_sel)
+                         pr_delta, pr_filter) = process_prs_input(
+                            data, mouse_re, hits, pr_ui, pr_view_rows, show_help,
+                            _pr_action["running"], pr_hover, pr_sel, pr_filter)
                         # Scroll, then clamp. The view follows the cursor only
                         # on the tick the cursor MOVED: doing it every tick
                         # yanked the table straight back whenever the wheel
@@ -4407,7 +4432,7 @@ def run_live(args):
                         if pr_sel is not None and pr_sel != pr_sel_prev:
                             pr_top = min(max(pr_top, pr_sel - cap + 1), pr_sel)
                         pr_sel_prev = pr_sel
-                        pr_top = max(0, min(pr_top, max(0, len(pr_rows) - cap)))
+                        pr_top = max(0, min(pr_top, max(0, len(pr_view_rows) - cap)))
                         if do_pr_refresh:
                             last_pr_collect = None   # forces an immediate rescan next tick
                         if go_live or go_history:
@@ -4730,7 +4755,7 @@ def _open_url(url):
 
 
 def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help,
-                      action_running, pr_hover, pr_sel=None):
+                      action_running, pr_hover, pr_sel=None, pr_filter=0):
     """Input handling for the PRS view — separate from process_input because
     its overlays (CI/comment drilldown, confirm-then-run, action progress) are
     independent of the live/history session/bucket/panel popups. Row/button
@@ -4859,9 +4884,11 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help,
         go_live = True
     if "r" in rest and not action_running:
         do_pr_refresh = True
+    if "f" in rest:                  # cycle the view filter; no refetch
+        pr_filter = (pr_filter + rest.count("f")) % len(PR_FILTERS)
     pr_delta += 10 * (rest.count("\x1b[6~") - rest.count("\x1b[5~"))   # PgDn / PgUp
     return (pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run,
-            pr_hover, do_pr_refresh, pr_sel, pr_delta)
+            pr_hover, do_pr_refresh, pr_sel, pr_delta, pr_filter)
 
 
 if __name__ == "__main__":

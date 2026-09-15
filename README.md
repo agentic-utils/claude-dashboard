@@ -122,7 +122,8 @@ many rows sit above and below.
 In the PRS tab, nothing needs a mouse: `↑`/`↓` (or `j`/`k`) move the row cursor,
 `enter`/`o` opens the PR, `c` shows failing checks, `v` the full comment, and
 `m` / `d` / `x` merge, toggle draft, or close it (delete, on a branch row) via the
-same confirm popup the buttons use.
+same confirm popup the buttons use. `f` cycles the view filter: all → no drafts →
+ready to merge; it filters what's on screen and never refetches.
 
 ## How it works / requirements
 
