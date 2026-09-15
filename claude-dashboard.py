@@ -1094,7 +1094,8 @@ def _menu_cell(label, ul_idx, on):
 
 
 def view_tabs(mode):
-    """The Live / History / PRs menu-bar tabs (accelerator letters L/H/P
+    """The Live / History / PRs menu-bar tabs (accelerator letters L/H/P,
+    or ←/→ to walk them in order
     underlined, active tab highlighted). Returns (styled, visible_len, segs)
     where segs = [(token, lo_off, hi_off)] are 0-based char offsets for the
     hit-map."""
@@ -1548,7 +1549,8 @@ def render_help(now, cols, rows):
               "(heatmap). L (or q) returns to the Live tab."),
         ("G", None),
         ("H", "KEYS"),
-        ("T", "? help · L live / H history tabs · S/M history popups · "
+        ("T", "? help · L live / H history / P PRs tabs (or ←/→) · "
+              "S/M history popups · "
               "s/e/w live panels · r refresh now · click bar/session/tab · "
               "up/down PgUp/PgDn j/k scroll · q / esc step back · ^C quit."),
     ]
@@ -4300,6 +4302,16 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             do_prs = True
             focus_sid = focus_bucket = panel_view = None
             show_uerr = False
+        # ← / → walk the menu bar in its own order: Live, History, PRs (wrapping).
+        step = 1 if "\x1b[C" in rest else -1 if "\x1b[D" in rest else 0
+        if step:
+            tabs = ["live", "history", "prs"]
+            nxt = tabs[(tabs.index("history" if show_history else "live") + step)
+                       % len(tabs)]
+            show_history = nxt == "history"
+            do_prs = nxt == "prs"
+            focus_sid = focus_bucket = panel_view = None
+            show_uerr = False
         if "r" in rest:               # lowercase only: 'R' is re-login in the account modal
             do_refresh = True
         # Panel popup toggles. In history: S = window SUMMARY, M = activity
@@ -4431,6 +4443,10 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help, action_ru
     if "H" in rest or "h" in rest:
         go_history = True
     if "L" in rest or "l" in rest:
+        go_live = True
+    if "\x1b[D" in rest:             # ← back to History
+        go_history = True
+    elif "\x1b[C" in rest:           # → wraps round to Live
         go_live = True
     if "r" in rest and not action_running:
         do_pr_refresh = True
