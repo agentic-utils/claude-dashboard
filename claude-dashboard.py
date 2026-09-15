@@ -3486,15 +3486,22 @@ class _ArgumentParser(argparse.ArgumentParser):
         return shlex.split(line)
 
 
+TAP_FORMULA = "agentic-utils/tap/claude-dashboard"
+
+
 def self_upgrade():
     """Update a Homebrew install in place; anything else is a git checkout."""
-    # ponytail: brew already knows the tap and reports "already installed"
     here = os.path.realpath(__file__)
-    if "/Cellar/" in here:
-        return subprocess.call(
-            ["brew", "upgrade", "agentic-utils/tap/claude-dashboard"])
-    print(f"Not a Homebrew install ({here}) - run `git pull` in that checkout.")
-    return 1
+    if "/Cellar/" not in here:
+        print(f"Not a Homebrew install ({here}) - run `git pull` in that checkout.")
+        return 1
+    # `brew upgrade` compares against the tap clone it already has. With
+    # HOMEBREW_NO_AUTO_UPDATE=1 set (common, it makes every brew command
+    # faster) that clone is never refreshed, so a new release is invisible and
+    # the upgrade silently does nothing. Fetch first, then upgrade.
+    print("Updating Homebrew…")
+    subprocess.call(["brew", "update", "--quiet"])
+    return subprocess.call(["brew", "upgrade", TAP_FORMULA])
 
 
 def main():
