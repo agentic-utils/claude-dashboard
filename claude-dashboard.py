@@ -2200,7 +2200,11 @@ def kick_pr_action(kind, args, row_key):
 
     def run():
         try:
-            out = subprocess.run([_GH_BIN] + args, capture_output=True, text=True,
+            argv = args
+            if MERGE_METHOD in argv:      # needs a `gh api` call, so not inline
+                repo = argv[argv.index("--repo") + 1]
+                argv = [merge_flag(repo) if a == MERGE_METHOD else a for a in argv]
+            out = subprocess.run([_GH_BIN] + argv, capture_output=True, text=True,
                                  timeout=30)
             if out.returncode != 0:
                 _pr_action["error"] = out.stderr.strip()[:300] or "gh command failed"
@@ -2212,11 +2216,32 @@ def kick_pr_action(kind, args, row_key):
     return True
 
 
+MERGE_METHOD = "--MERGE-METHOD--"   # placeholder; resolved off the render thread
+_merge_flags = {}                   # repo -> "--merge" / "--squash" / "--rebase"
+
+
+def merge_flag(repo):
+    """The merge method this repo actually allows, preferring a merge commit,
+    then squash, then rebase. `gh pr merge` demands one of the three and the
+    API rejects a method the repo forbids ("Squash merges are not allowed on
+    this repository"), which is why this is asked per repo rather than assumed.
+    Cached for the life of the process; an unreadable repo keeps the default."""
+    if repo not in _merge_flags:
+        r = _gh_json(["api", f"repos/{repo}", "--jq",
+                      "{m:.allow_merge_commit,s:.allow_squash_merge,"
+                      "r:.allow_rebase_merge}"]) or {}
+        _merge_flags[repo] = ("--merge" if r.get("m") else
+                              "--squash" if r.get("s") else
+                              "--rebase" if r.get("r") else "--merge")
+    return _merge_flags[repo]
+
+
 def pr_action_args(kind, row):
     """Build the `gh` argv for a confirmed action on `row`."""
     repo, num, branch = row["repo"], row["number"], row["branch"]
     if kind == "merge":
-        return ["pr", "merge", str(num), "--repo", repo, "--squash", "--delete-branch"]
+        return ["pr", "merge", str(num), "--repo", repo, MERGE_METHOD,
+                "--delete-branch"]
     if kind == "close":
         return ["pr", "close", str(num), "--repo", repo]
     if kind == "ready":
