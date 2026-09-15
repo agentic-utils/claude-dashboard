@@ -4149,6 +4149,7 @@ def run_live(args):
         sys.stdout.write("\033[?1049h\033[?25l\033[?7l")
         set_term_title(TERM_TITLE)
         kick_update_check()
+        last_update_check = time.monotonic()
         # Enable SGR mouse reporting + cbreak input so clicks/keys arrive
         # immediately. cbreak (not raw) keeps ISIG, so ⌃C still raises.
         try:
@@ -4287,6 +4288,14 @@ def run_live(args):
             if due:
                 kick_usage()        # fetch_usage owns retry_at (sets/clears it)
                 last_usage = now
+
+            # Re-check for a release on the same cadence as the disk cache, so
+            # a session left open for days still notices one. The check itself
+            # is one API call and only when the cached answer has aged out.
+            if (not _update["latest"]
+                    and time.monotonic() - last_update_check >= UPDATE_CHECK_EVERY):
+                kick_update_check()
+                last_update_check = time.monotonic()
 
             # History view: collect its (longer, coarser) buckets on demand —
             # on entry, on --interval, and after a resize. Select which dataset
