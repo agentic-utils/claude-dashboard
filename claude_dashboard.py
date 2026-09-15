@@ -3273,10 +3273,14 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
                 bpos += len(btxt) + 2
             if i != visible[-1][0]:
                 body.append(hrule)
+        # A standing key legend: the row actions are all keyboard-reachable but
+        # nothing on screen said so, and the scroll position needs a home too.
+        keys = ("↑/↓ move · enter open · c checks · v comment · "
+                "m merge · d draft · x close · r refresh")
         if len(rows) > cap:
             below = len(rows) - top - len(visible)
-            body.append(rgb(DIM, f"… {top} above · {below} below · "
-                                 "↑/↓ PgUp/PgDn wheel to scroll"))
+            keys = f"{top} above · {below} below · {keys}"
+        body.append(rgb(DIM, _clip(keys, inner)))
         if refreshing:
             refresh_label = " · refreshing…"
         elif last_refresh:
