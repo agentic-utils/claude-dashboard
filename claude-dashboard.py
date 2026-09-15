@@ -1732,7 +1732,8 @@ def render_login_confirm(now, cols, rows, login_elapsed=None):
                 live_exp = ""
             saved = [("", live_label, live_exp)] + saved
 
-    content = [_acct_row([("ACCOUNT", aw, TEXT, True), ("EXPIRY", ew, TEXT, True),
+    content = [_acct_row([("ACCOUNT", aw, TEXT, True),
+                          ("USAGE" if cswap_bin() else "EXPIRY", ew, TEXT, True),
                           ("STATUS", sw, TEXT, True), ("ACTION", cw, TEXT, True)]),
                rgb(DIM2, "─" * (aw + 2 * ACCT_PAD) + "┼" + "─" * (ew + 2 * ACCT_PAD)
                    + "┼" + "─" * (sw + 2 * ACCT_PAD) + "┼" + "─" * (cw + 2 * ACCT_PAD))]
@@ -1745,7 +1746,7 @@ def render_login_confirm(now, cols, rows, login_elapsed=None):
         action_plain = "[Re-login]"
         content.append(_acct_row([
             (_clip(label, aw), aw, TEXT, False),
-            (exp or "-", ew, DIM, False),
+            (_clip(exp or "-", ew), ew, DIM, False),
             (status_plain, sw, ACCENT if is_cur else WARN_C, is_cur),
             (action_plain, cw, WARN_C, False),
         ]))
@@ -2284,13 +2285,27 @@ def _cswap_json(*args):
         return None
 
 
+def _cswap_usage_label(acct):
+    """"5h 20% · 7d 56%" from a cswap list entry. cswap reports usage, not token
+    expiry, so the column is labelled USAGE while it is the one listing."""
+    # ljust'd into ACCT_COL_W[1] (13) without clipping, so keep it short
+    if acct.get("usageStatus") == "relogin_required":
+        return "re-login"          # cswap can't read usage without a live token
+    u = acct.get("usage") or acct.get("lastGoodUsage") or {}
+    parts = [f"{k} {u[j]['pct']:.0f}%"
+             for k, j in (("5h", "fiveHour"), ("7d", "sevenDay"))
+             if isinstance((u.get(j) or {}).get("pct"), (int, float))]
+    return " ".join(parts)
+
+
 def list_saved_accounts():
     """Return [(slug, label, expiry_label), ...] sorted by label. With cswap
     installed the slug is its slot number and the list is cswap's; otherwise
     it is the snapshots in ACCOUNTS_DIR, and corrupt files are skipped."""
     if cswap_bin():
         data = _cswap_json("list") or {}
-        return [(str(a.get("number")), a.get("email") or str(a.get("number")), "")
+        return [(str(a.get("number")), a.get("email") or str(a.get("number")),
+                 _cswap_usage_label(a))
                 for a in (data.get("accounts") or []) if a.get("number") is not None]
     out = []
     for path in sorted(glob.glob(os.path.join(ACCOUNTS_DIR, "*.json"))):
@@ -2335,6 +2350,25 @@ def current_account_slug():
         if _same_account(live, creds):
             return os.path.splitext(os.path.basename(path))[0]
     return None
+
+
+def register_login():
+    """Record a just-completed login with whatever owns accounts here: `cswap
+    add`, its own documented post-login step (it is how a re-logged-in account
+    gets its stored credential refreshed), or a local snapshot when cswap is
+    not installed."""
+    if not cswap_bin():
+        return save_account_snapshot()
+    try:
+        out = subprocess.run([cswap_bin(), "add"], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("cswap add: %s", e)
+        return None
+    if out.returncode != 0:
+        log.warning("cswap add failed: %s", out.stderr.strip())
+        return None
+    return (out.stdout or "").strip() or None
 
 
 def save_account_snapshot(label=None):
@@ -3628,7 +3662,7 @@ def run_live(args):
             if login_proc is not None:
                 if login_proc.poll() is not None:
                     login_proc = None
-                    save_account_snapshot()
+                    register_login()
                     kick_usage()
                     show_login = False
                     prev_okey = None
@@ -3640,7 +3674,7 @@ def run_live(args):
                         login_proc.kill()
                     login_proc = None
                     _run_login_suspended(fd, old_term)
-                    save_account_snapshot()
+                    register_login()
                     kick_usage()
                     show_login = False
                     prev_okey = None
