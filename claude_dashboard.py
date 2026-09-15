@@ -3521,7 +3521,6 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
         if len(rows) > cap:
             below = len(rows) - top - len(visible)
             keys = f"{top} above · {below} below · {keys}"
-        body.append(rgb(DIM, _clip(keys, inner)))
         if refreshing:
             refresh_label = " · refreshing…"
         elif last_refresh:
@@ -3543,6 +3542,7 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
                                           len(rows), cap)
         panel_start = len(out)
         out += panel_lines
+        out.append("  " + rgb(DIM, _clip(keys, total_width - 2)))   # under the table
         # Translate body-relative row indices to screen coords: panel() adds one
         # title-border line before body row 0, so body row r sits at out-line
         # panel_start + 1 + r (0-based) -> screen row panel_start + 2 + r.
