@@ -4432,6 +4432,17 @@ def run_live(args):
                 # usable frame with a "too small" notice that contradicts itself.
                 frame = "\n".join(frame.split("\n")[:rows])
                 hits = [h for h in hits if h[0] <= rows]
+            elif alt and frame.count("\n") + 1 < rows:
+                # Odd leftovers (a chart ladder step, or a PR row needing two
+                # lines when only one is left) left the footer floating with a
+                # blank line under it. Push the padding ABOVE the footer so it
+                # still sits on the last line, and move the footer's own click
+                # spans down with it.
+                lines = frame.split("\n")
+                pad, foot_row = rows - len(lines), len(lines)
+                frame = "\n".join(lines[:-1] + [""] * pad + lines[-1:])
+                hits = [(r + pad if r >= foot_row else r, lo, hi, tok)
+                        for r, lo, hi, tok in hits]
             frame_fails = 0
             if alt and _update["latest"] and not _update["dismissed"]:
                 # Replaces the footer line rather than adding one, so no frame
