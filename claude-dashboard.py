@@ -2266,6 +2266,20 @@ def kick_collect_prs():
     threading.Thread(target=run, daemon=True).start()
 
 
+def apply_pr_action_locally(rows, kind, row_key):
+    """Reflect a completed action in the table straight away. The rescan behind
+    it takes seconds, and a merged PR must not sit there with a live [Merge]
+    button in the meantime."""
+    out = []
+    for r in rows:
+        if (r["repo"], r["number"] or r["branch"]) != row_key:
+            out.append(r)
+        elif kind in ("draft", "ready"):
+            out.append(dict(r, is_draft=kind == "draft"))
+        # merge / close / delete: the row is gone, so drop it
+    return out
+
+
 def kick_pr_action(kind, args, row_key):
     """Fire a mutating `gh` command (merge/close/ready-toggle/branch-delete)
     in the background. run_live polls _pr_action and shows the Cylon bar
@@ -3862,6 +3876,13 @@ def run_live(args):
                     if _pr_action["error"]:
                         pr_ui["err"] = _pr_action["error"]
                         _pr_action["error"] = None
+                    else:
+                        rows_now, err_now = _pr_collect_result.get("prs",
+                                                                   (pr_rows, pr_err))
+                        pr_rows = apply_pr_action_locally(
+                            rows_now, _pr_action["kind"], _pr_action["row_key"])
+                        _pr_collect_result["prs"] = (pr_rows, err_now)
+                        pr_sel = None
                 pr_action_running_prev = _pr_action["running"]
                 cur_buckets, cur_sessions = buckets, sessions
                 pr_loading = "prs" not in _pr_collect_result
