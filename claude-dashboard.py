@@ -3127,8 +3127,17 @@ def pr_row_buttons(row):
     return btns
 
 
+PR_CHROME_LINES = 8     # menu bar, panel title/borders, column header, footer
+PR_ROW_LINES = 2        # every row is followed by a gridline
+
+
+def pr_capacity(term_rows):
+    """PR rows that fit on screen, keeping a line for the "more rows" hint."""
+    return max(1, (term_rows - PR_CHROME_LINES - 1) // PR_ROW_LINES)
+
+
 def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
-                     last_refresh=None, refreshing=False, sel=None):
+                     last_refresh=None, refreshing=False, sel=None, top=0):
     """PRS tab: your open PRs + branches you've contributed to with no open
     PR. Returns (frame_str, hits, tips) — same convention as render_frame()
     plus `tips`: [(screen_row, lo, hi, full_text)] for cells whose shown text
@@ -3215,7 +3224,10 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
         col_x["actions"] = pos
         hrule = _pr_hrule(col_x, w, inner)
         body = [head, hrule]
-        for i, row in enumerate(rows):
+        cap = pr_capacity(term_rows)
+        top = max(0, min(top, max(0, len(rows) - cap)))
+        visible = list(enumerate(rows))[top:top + cap]
+        for i, row in visible:
             what = (("[draft] " if row["is_draft"] else "") + row["title"]) if row["kind"] == "pr" else row["branch"]
             number = f"#{row['number']}" if row["kind"] == "pr" else "—"
             commit = f"{row['commit_sha']} {_pr_relts(row['commit_ts'], now)} {row['commit_msg']}" if row["commit_sha"] else "—"
@@ -3258,8 +3270,12 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
                 btxt = f"[{lab}]"
                 hits.append((row_i, 2 + bpos, 1 + bpos + len(btxt), f"__pr_confirm__{kind}__{i}"))
                 bpos += len(btxt) + 2
-            if i != len(rows) - 1:
+            if i != visible[-1][0]:
                 body.append(hrule)
+        if len(rows) > cap:
+            below = len(rows) - top - len(visible)
+            body.append(rgb(DIM, f"… {top} above · {below} below · "
+                                 "↑/↓ PgUp/PgDn wheel to scroll"))
         if refreshing:
             refresh_label = " · refreshing…"
         elif last_refresh:
@@ -3741,6 +3757,7 @@ def run_live(args):
         _pr_collect_result["prs"] = (pr_rows, None)
     pr_tips, pr_hover = [], None
     pr_sel = None                # keyboard cursor in the PRS table
+    pr_top = 0                   # first visible row of the PRS table
     pr_ui = {"ci_idx": None, "comment_idx": None, "confirm": None, "err": None}
     pr_action_running_prev = False
     pr_action_started = None
@@ -3891,7 +3908,7 @@ def run_live(args):
                     now, pr_rows, pr_err, cols, rows, loading=pr_loading, elapsed=pr_elapsed,
                     last_refresh=_pr_collect_result.get("prs_ts"),
                     refreshing=(not pr_loading) and _pr_collect_inflight.locked(),
-                    sel=pr_sel)
+                    sel=pr_sel, top=pr_top)
             else:
                 cur_buckets, cur_sessions = buckets, sessions
                 layout = plan_layout(rows, cols, sessions, now) if alt else None
@@ -4076,10 +4093,17 @@ def run_live(args):
                         scroll_delta = 0
                         do_login = do_retry = do_switch = do_cancel = do_refresh = False
                         (pr_ui, show_help, go_live, go_history, quit_flag,
-                         do_pr_run, pr_hover, do_pr_refresh,
-                         pr_sel) = process_prs_input(
+                         do_pr_run, pr_hover, do_pr_refresh, pr_sel,
+                         pr_delta) = process_prs_input(
                             data, mouse_re, hits, pr_ui, pr_rows, show_help,
                             _pr_action["running"], pr_hover, pr_sel)
+                        # Scroll, then keep the keyboard cursor on screen, then
+                        # clamp to the last page.
+                        cap = pr_capacity(rows)
+                        pr_top += pr_delta
+                        if pr_sel is not None:
+                            pr_top = min(max(pr_top, pr_sel - cap + 1), pr_sel)
+                        pr_top = max(0, min(pr_top, max(0, len(pr_rows) - cap)))
                         if do_pr_refresh:
                             last_pr_collect = None   # forces an immediate rescan next tick
                         if go_live or go_history:
@@ -4411,8 +4435,9 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help,
     only the progress popup is shown then, with nothing to click.
 
     Returns (pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run,
-    pr_hover, do_pr_refresh, pr_sel). pr_sel is the keyboard cursor's row
-    index. go_live/go_history ask run_live to leave the
+    pr_hover, do_pr_refresh, pr_sel, pr_delta). pr_sel is the keyboard
+    cursor's row index and pr_delta how far the wheel/PgUp/PgDn asked to
+    scroll the table. go_live/go_history ask run_live to leave the
     PRS view. do_pr_run is None or (kind, row) once a confirm popup's [Y]/'y'
     has been accepted — run_live owns actually starting the `gh` subprocess
     (kick_pr_action). pr_hover is the latest (x, y) from a mode-1003
@@ -4422,13 +4447,17 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help,
     pr_ui = dict(pr_ui)
     go_live = go_history = quit_flag = do_pr_refresh = False
     do_pr_run = None
+    pr_delta = 0            # rows to scroll the table by, wheel / PgUp / PgDn
     for m in mouse_re.finditer(data):
         button, x, y, final = int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4)
         if button & 32 and button & 0b11 == 3:
             pr_hover = (x, y)   # pure hover motion, no button — not a click
             continue
-        if button in (64, 65) or not (button & 0b11 == 0 and not button & 64 and final == "M"):
-            continue   # only plain left-press is a click here; PRS has no scroll body
+        if button in (64, 65):          # wheel up / down scrolls the table
+            pr_delta += -3 if button == 64 else 3
+            continue
+        if not (button & 0b11 == 0 and not button & 64 and final == "M"):
+            continue   # only a plain left-press counts as a click here
         if show_help:
             show_help = False
             continue
@@ -4527,8 +4556,9 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help,
         go_live = True
     if "r" in rest and not action_running:
         do_pr_refresh = True
+    pr_delta += 10 * (rest.count("\x1b[6~") - rest.count("\x1b[5~"))   # PgDn / PgUp
     return (pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run,
-            pr_hover, do_pr_refresh, pr_sel)
+            pr_hover, do_pr_refresh, pr_sel, pr_delta)
 
 
 if __name__ == "__main__":
