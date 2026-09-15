@@ -3504,6 +3504,16 @@ def install_method():
     return None
 
 
+def version_string():
+    """This copy's version. Installed copies carry package metadata (hatch-vcs
+    stamps it from the git tag); a plain checkout has none, so it reads dev."""
+    try:
+        from importlib.metadata import version
+        return version("claude-dashboard")
+    except Exception:
+        return "dev"
+
+
 def self_upgrade():
     """Upgrade this copy with whichever tool installed it."""
     method = install_method()
@@ -3569,6 +3579,8 @@ def main():
                          "nothing is excluded unless given.")
     ap.add_argument("--upgrade", action="store_true",
                     help="update this install in place (brew / uv / pipx) and exit")
+    ap.add_argument("--version", action="version",
+                    version=f"claude-dashboard {version_string()}")
     argv = (["@" + RC_PATH] if os.path.isfile(RC_PATH) else []) + sys.argv[1:]
     args = ap.parse_args(argv)
 
