@@ -63,7 +63,9 @@ per line, '#' comments OK) - CLI flags given at the command line override it.
 from __future__ import annotations
 
 import argparse
+import getpass
 import glob
+import hashlib
 import json
 import logging
 import math
@@ -78,6 +80,7 @@ import termios
 import threading
 import time
 import tty
+import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -1724,12 +1727,13 @@ def render_login_confirm(now, cols, rows, login_elapsed=None):
         live_label = _usage.get("account")
         if live_label:
             try:
-                live_exp = _expiry_label(json.load(open(CREDS_PATH)))
+                live_exp = _expiry_label(read_creds())
             except (OSError, ValueError):
                 live_exp = ""
             saved = [("", live_label, live_exp)] + saved
 
-    content = [_acct_row([("ACCOUNT", aw, TEXT, True), ("EXPIRY", ew, TEXT, True),
+    content = [_acct_row([("ACCOUNT", aw, TEXT, True),
+                          ("USAGE" if cswap_bin() else "EXPIRY", ew, TEXT, True),
                           ("STATUS", sw, TEXT, True), ("ACTION", cw, TEXT, True)]),
                rgb(DIM2, "─" * (aw + 2 * ACCT_PAD) + "┼" + "─" * (ew + 2 * ACCT_PAD)
                    + "┼" + "─" * (sw + 2 * ACCT_PAD) + "┼" + "─" * (cw + 2 * ACCT_PAD))]
@@ -1742,7 +1746,7 @@ def render_login_confirm(now, cols, rows, login_elapsed=None):
         action_plain = "[Re-login]"
         content.append(_acct_row([
             (_clip(label, aw), aw, TEXT, False),
-            (exp or "-", ew, DIM, False),
+            (_clip(exp or "-", ew), ew, DIM, False),
             (status_plain, sw, ACCENT if is_cur else WARN_C, is_cur),
             (action_plain, cw, WARN_C, False),
         ]))
@@ -1765,8 +1769,97 @@ def render_login_confirm(now, cols, rows, login_elapsed=None):
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
-CREDS_PATH = os.path.expanduser("~/.claude/.credentials.json")
+# CLAUDE_CONFIG_DIR moves the whole Claude Code profile, which is how
+# `cswap run <account>` pins one terminal to one login.
+CONFIG_HOME = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+CREDS_PATH = os.path.join(CONFIG_HOME, ".credentials.json")
 ACCOUNTS_DIR = os.path.expanduser("~/.claude/dashboard-accounts")
+KEYCHAIN_SERVICE = "Claude Code-credentials"
+SECURITY = "/usr/bin/security"      # pinned: a credential tool, not PATH-resolved
+
+
+def keychain_service():
+    """Service name holding this profile's active OAuth credential. Claude Code
+    hashes the RAW CLAUDE_CONFIG_DIR value (NFC, unresolved) into the name, so a
+    `cswap run` terminal reads its own item and not the default account's.
+    CLAUDE_SECURESTORAGE_CONFIG_DIR overrides it, empty meaning the default."""
+    secure = os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR")
+    cfg = secure if secure is not None else os.environ.get("CLAUDE_CONFIG_DIR")
+    if not cfg:
+        return KEYCHAIN_SERVICE
+    digest = hashlib.sha256(
+        unicodedata.normalize("NFC", cfg).encode("utf-8")).hexdigest()[:8]
+    return f"{KEYCHAIN_SERVICE}-{digest}"
+
+
+def keychain_account():
+    """Mirrors Claude Code's getUsername(): $USER, else the OS username."""
+    try:
+        return os.environ.get("USER") or getpass.getuser()
+    except Exception:
+        return "user"
+
+
+MACOS = sys.platform == "darwin"
+KEYCHAIN_NOT_FOUND = 44             # errSecItemNotFound from `security`
+
+
+def _keychain_read():
+    """This profile's credential from the login Keychain, or None if there is
+    no such item. Raises on a Keychain that exists but won't answer (locked,
+    denied) so a real failure is never mistaken for a logged-out profile."""
+    out = subprocess.run(
+        [SECURITY, "find-generic-password", "-s", keychain_service(),
+         "-a", keychain_account(), "-w"],
+        capture_output=True, text=True, timeout=5)
+    if out.returncode == KEYCHAIN_NOT_FOUND:
+        return None
+    if out.returncode != 0:
+        raise OSError(f"keychain read failed: {out.stderr.strip()}")
+    return json.loads(out.stdout)
+
+
+def _keychain_write(creds):
+    """Store the credential in the login Keychain. Hex-encoded (-X) and fed
+    through `security -i` so the token never appears in argv, the same shape
+    Claude Code and cswap use. False if the Keychain refused the write."""
+    cmd = (f"add-generic-password -U -s {shlex.quote(keychain_service())} "
+           f"-a {shlex.quote(keychain_account())} "
+           f"-X {json.dumps(creds).encode('utf-8').hex()}\n")
+    out = subprocess.run([SECURITY, "-i"], input=cmd,
+                         capture_output=True, text=True, timeout=5)
+    if out.returncode != 0:
+        log.warning("keychain write failed: %s", out.stderr.strip())
+        return False
+    return True
+
+
+def read_creds():
+    """The live OAuth credential, from the store Claude Code uses on THIS
+    platform: the login Keychain on macOS, CREDS_PATH everywhere else. macOS
+    still falls back to the file, which is where Claude Code itself writes when
+    the Keychain is unusable. cswap rewrites these same stores when it switches
+    accounts, so the dashboard follows whatever account is live."""
+    if MACOS:
+        creds = _keychain_read()
+        if creds is not None:
+            return creds
+    return json.load(open(CREDS_PATH))
+
+
+def write_creds(creds):
+    """Write the active credential back to this platform's store, falling back
+    to the file on macOS exactly as Claude Code does when the Keychain refuses."""
+    if MACOS and _keychain_write(creds):
+        return True
+    try:
+        json.dump(creds, open(CREDS_PATH, "w"))
+    except OSError as e:
+        log.warning("write_creds: %s", e)
+        return False
+    return True
+
+
 # Shared by the context light (ctx_grade) and allowance gauge (gauge_grade) —
 # the actual thresholds live in those functions, not here.
 OK_C = (52, 224, 150)       # green
@@ -1845,7 +1938,7 @@ def fetch_usage(timeout=15):
     back = lambda s: now + timedelta(seconds=s)
     try:
         log.info("fetch_usage: start")
-        oa = (json.load(open(CREDS_PATH)).get("claudeAiOauth") or {})
+        oa = (read_creds().get("claudeAiOauth") or {})
         tok = oa.get("accessToken")
         if not tok:
             _usage_set(err="no oauth token", err_body=None, retry_at=back(USAGE_BACKOFF))
@@ -2167,9 +2260,53 @@ def _expiry_label(creds, now=None):
     return "expires " + exp.astimezone().strftime("%H:%M")
 
 
+def cswap_bin():
+    """Path to the cswap CLI, or None. cswap is an OPTIONAL companion: when it
+    is installed it owns account switching (it rewrites the same credential
+    store AND the `~/.claude.json` identity that Claude Code and cswap itself
+    read back), so the dashboard defers to it instead of keeping a second,
+    divergent registry of accounts under ACCOUNTS_DIR."""
+    return shutil.which("cswap")
+
+
+def _cswap_json(*args):
+    """`cswap <args> --json`, or None if cswap failed or printed non-JSON."""
+    try:
+        out = subprocess.run([cswap_bin(), *args, "--json"],
+                             capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        log.warning("cswap %s failed: %s", " ".join(args), out.stderr.strip())
+        return None
+    try:
+        return json.loads(out.stdout)
+    except ValueError:
+        return None
+
+
+def _cswap_usage_label(acct):
+    """"5h 20% · 7d 56%" from a cswap list entry. cswap reports usage, not token
+    expiry, so the column is labelled USAGE while it is the one listing."""
+    # ljust'd into ACCT_COL_W[1] (13) without clipping, so keep it short
+    if acct.get("usageStatus") == "relogin_required":
+        return "re-login"          # cswap can't read usage without a live token
+    u = acct.get("usage") or acct.get("lastGoodUsage") or {}
+    parts = [f"{k} {u[j]['pct']:.0f}%"
+             for k, j in (("5h", "fiveHour"), ("7d", "sevenDay"))
+             if isinstance((u.get(j) or {}).get("pct"), (int, float))]
+    return " ".join(parts)
+
+
 def list_saved_accounts():
-    """Return [(slug, label, expiry_label), ...] sorted by label. Corrupt
-    files are skipped."""
+    """Return [(slug, label, expiry_label), ...] sorted by label. With cswap
+    installed the slug is its slot number and the list is cswap's; otherwise
+    it is the snapshots in ACCOUNTS_DIR, and corrupt files are skipped."""
+    if cswap_bin():
+        data = _cswap_json("list") or {}
+        return [(str(a.get("number")), a.get("email") or str(a.get("number")),
+                 _cswap_usage_label(a))
+                for a in (data.get("accounts") or []) if a.get("number") is not None]
     out = []
     for path in sorted(glob.glob(os.path.join(ACCOUNTS_DIR, "*.json"))):
         try:
@@ -2194,10 +2331,15 @@ def _same_account(creds_a, creds_b):
 
 
 def current_account_slug():
-    """Slug of the saved account matching the live creds file, or None if the
-    live account was never snapshotted."""
+    """Slug of the account that is live right now, or None if it isn't one we
+    know about. With cswap installed that is its active slot, which it resolves
+    from the `~/.claude.json` identity rather than from the credential."""
+    if cswap_bin():
+        active = (_cswap_json("status") or {}).get("active") or {}
+        num = active.get("number")
+        return None if num is None else str(num)
     try:
-        live = json.load(open(CREDS_PATH))
+        live = read_creds()
     except (OSError, ValueError):
         return None
     for path in sorted(glob.glob(os.path.join(ACCOUNTS_DIR, "*.json"))):
@@ -2210,15 +2352,38 @@ def current_account_slug():
     return None
 
 
+def register_login():
+    """Record a just-completed login with whatever owns accounts here: `cswap
+    add`, its own documented post-login step (it is how a re-logged-in account
+    gets its stored credential refreshed), or a local snapshot when cswap is
+    not installed."""
+    if not cswap_bin():
+        return save_account_snapshot()
+    try:
+        out = subprocess.run([cswap_bin(), "add"], stdin=subprocess.DEVNULL,
+                             capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError) as e:
+        log.warning("cswap add: %s", e)
+        return None
+    if out.returncode != 0:
+        log.warning("cswap add failed: %s", out.stderr.strip())
+        return None
+    return (out.stdout or "").strip() or None
+
+
 def save_account_snapshot(label=None):
     """Snapshot the CURRENT live creds file into the accounts dir, keyed by
     account email (fetched fresh if not given). Skips the write if a saved
     account already holds byte-identical creds. Best-effort: returns the
     label used, or None on any failure (missing creds file, dead token,
-    unreachable profile endpoint)."""
+    unreachable profile endpoint). No-op when cswap is installed: it already
+    holds a backup of every account it manages, and a second copy here would
+    be the divergent registry this defers to cswap to avoid."""
+    if cswap_bin():
+        return None
     try:
-        raw = open(CREDS_PATH).read()
-        creds = json.loads(raw)
+        creds = read_creds()
+        raw = json.dumps(creds)
     except (OSError, ValueError):
         return None
     if label is None:
@@ -2248,17 +2413,30 @@ def save_account_snapshot(label=None):
 
 
 def switch_account(slug):
-    """Snapshot the current account (so it isn't lost), then overwrite the
-    live creds file with the saved account's. Non-disruptive: Claude Code and
-    this dashboard both re-read CREDS_PATH fresh, so other running sessions
-    pick up the new account on their next call, no restart needed."""
+    """Snapshot the current account (so it isn't lost), then overwrite the live
+    credential with the saved account's, in whichever store this profile uses
+    (file, or the macOS Keychain). Non-disruptive: Claude Code and this
+    dashboard both re-read it fresh, so other running sessions pick up the new
+    account on their next call, no restart needed."""
+    if cswap_bin():
+        # ponytail: one switcher, and it is the one that also updates identity
+        try:
+            out = subprocess.run([cswap_bin(), "switch", slug],
+                                 capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            log.warning("cswap switch %s: %s", slug, e)
+            return False
+        if out.returncode != 0:
+            log.warning("cswap switch %s failed: %s", slug, out.stderr.strip())
+        return out.returncode == 0
     path = os.path.join(ACCOUNTS_DIR, slug + ".json")
     try:
         creds = json.load(open(path))["creds"]
     except (OSError, ValueError, KeyError):
         return False
     save_account_snapshot()          # best-effort; swallows its own failures
-    json.dump(creds, open(CREDS_PATH, "w"))
+    if not write_creds(creds):
+        return False
     return True
 
 
@@ -3484,7 +3662,7 @@ def run_live(args):
             if login_proc is not None:
                 if login_proc.poll() is not None:
                     login_proc = None
-                    save_account_snapshot()
+                    register_login()
                     kick_usage()
                     show_login = False
                     prev_okey = None
@@ -3496,7 +3674,7 @@ def run_live(args):
                         login_proc.kill()
                     login_proc = None
                     _run_login_suspended(fd, old_term)
-                    save_account_snapshot()
+                    register_login()
                     kick_usage()
                     show_login = False
                     prev_okey = None
@@ -3592,14 +3770,20 @@ def run_live(args):
             # Too small to fit? The frame would overflow and scroll, desyncing the
             # click hit-regions onto the wrong rows. Show a notice and drop hits so
             # clicks can't misfire; close any overlay until there's room again.
-            if alt and (cols < TOTAL_WIDTH or rows < 9
-                        or frame.count("\n") + 1 > rows):
+            if alt and (cols < TOTAL_WIDTH or rows < 9):
                 hits = []
                 show_help = show_uerr = show_login = False
                 panel_view = None
                 focus_sid = focus_bucket = None
                 pr_ui = {"ci_idx": None, "comment_idx": None, "confirm": None, "err": None}
                 frame = render_too_small(cols, rows, 9)
+            elif alt and frame.count("\n") + 1 > rows:
+                # The terminal is big enough but the layout overshot its height:
+                # clip to the visible rows (hits are 1-based terminal rows, so
+                # everything below the fold goes with it) rather than replace a
+                # usable frame with a "too small" notice that contradicts itself.
+                frame = "\n".join(frame.split("\n")[:rows])
+                hits = [h for h in hits if h[0] <= rows]
             if alt:
                 # One overlay at a time: loading > help > login-confirm >
                 # usage-error > session > bucket > panel popup. overlay_regions
