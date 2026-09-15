@@ -2327,6 +2327,53 @@ def prune_merged_branches(apply=False, limit=200):
     return 0
 
 
+def prune_stale_branches(days=180, apply=False):
+    """Delete YOUR branches with no open PR whose last commit is older than
+    `days`. Unlike --prune-merged these still hold commits the default branch
+    does not, so deleting one throws that work away: dry run by default, and
+    the listing shows the age and last commit so the decision is informed."""
+    if not _GH_BIN:
+        print("gh CLI not found - install from https://cli.github.com")
+        return 1
+    user = gh_username()
+    if not user:
+        print("gh not authenticated - run `gh auth login`")
+        return 1
+    commits = _gh_json(["api", f"search/commits?q=author:{user}"
+                        "&sort=author-date&order=desc"
+                        f"&per_page={COMMIT_SEARCH_PER_PAGE}"], timeout=25) or {}
+    repos = list(dict.fromkeys(
+        (it.get("repository") or {}).get("full_name")
+        for it in (commits.get("items") or [])
+        if (it.get("repository") or {}).get("full_name")))[:BRANCH_REPO_LIMIT]
+    with futures.ThreadPoolExecutor(max_workers=PR_WORKERS) as ex:
+        found = [r for batch in ex.map(lambda repo: _branch_rows(repo, user, set()), repos)
+                 for r in batch]
+    now = datetime.now(timezone.utc)
+    stale = sorted((r for r in found
+                    if r["commit_ts"] and (now - r["commit_ts"]).days >= days),
+                   key=lambda r: r["commit_ts"])
+    if not stale:
+        print(f"no branches older than {days} days in the {len(repos)} repos scanned")
+        return 0
+    for r in stale:
+        age = (now - r["commit_ts"]).days
+        head = f"{age:>5}d  {r['repo']}  {r['branch']}"
+        if not apply:
+            print(f"would delete {head}  ({r['commit_sha']} {r['commit_msg'][:40]})")
+        elif not r.get("can_push", True):
+            print(f"skipped      {head}  (no write access)")
+        else:
+            out = subprocess.run([_GH_BIN, "api", "-X", "DELETE",
+                                  f"repos/{r['repo']}/git/refs/heads/{r['branch']}"],
+                                 capture_output=True, text=True, timeout=30)
+            print(("deleted      " if out.returncode == 0 else "FAILED       ") + head)
+    if not apply:
+        print(f"\n{len(stale)} branches older than {days} days. These still hold "
+              "unmerged commits.\nRe-run with --yes to delete them.")
+    return 0
+
+
 def collect_prs(cached=None, publish=None):
     """Scan (background-threaded by kick_collect_prs): open PRs authored by the
     signed-in user, plus branches with no open PR whose latest commit is also
@@ -3950,6 +3997,11 @@ def main():
                          "nothing is excluded unless given.")
     ap.add_argument("--no-auto-update", action="store_true",
                     help="check for a new release but don't install it")
+    ap.add_argument("--prune-stale", action="store_true",
+                    help="list your branches with no open PR whose last commit "
+                         "is older than --days, and exit; add --yes to delete")
+    ap.add_argument("--days", type=int, default=180, metavar="DAYS",
+                    help="age threshold for --prune-stale (default 180)")
     ap.add_argument("--prune-merged", action="store_true",
                     help="list the branches left behind by your merged PRs and "
                          "exit; add --yes to delete them")
@@ -3968,6 +4020,8 @@ def main():
         sys.exit(self_upgrade())
     if args.prune_merged:
         sys.exit(prune_merged_branches(apply=args.yes))
+    if args.prune_stale:
+        sys.exit(prune_stale_branches(days=args.days, apply=args.yes))
 
     if args.exclude:
         EXCLUDE_PATTERNS.extend(
