@@ -1799,47 +1799,66 @@ def keychain_account():
         return "user"
 
 
-def read_creds():
-    """The live OAuth store, whichever backend Claude Code is using here: the
-    file on Linux/WSL, the macOS login Keychain (where no file exists at all).
-    cswap switches accounts by rewriting these same two, so reading them keeps
-    the dashboard on whatever account cswap last selected."""
-    try:
-        return json.load(open(CREDS_PATH))
-    except FileNotFoundError:
-        if sys.platform != "darwin":
-            raise                    # no Keychain anywhere else; keep the error
-        # ponytail: `security` ships with macOS; no keyring dependency
-        out = subprocess.run(
-            [SECURITY, "find-generic-password", "-s", keychain_service(),
-             "-a", keychain_account(), "-w"],
-            capture_output=True, text=True, timeout=5)
-        if out.returncode != 0:
-            raise
-        return json.loads(out.stdout)
+MACOS = sys.platform == "darwin"
+KEYCHAIN_NOT_FOUND = 44             # errSecItemNotFound from `security`
 
 
-def creds_in_keychain():
-    """True when this profile's credential lives in the Keychain, not a file."""
-    return not os.path.exists(CREDS_PATH) and sys.platform == "darwin"
+def _keychain_read():
+    """This profile's credential from the login Keychain, or None if there is
+    no such item. Raises on a Keychain that exists but won't answer (locked,
+    denied) so a real failure is never mistaken for a logged-out profile."""
+    out = subprocess.run(
+        [SECURITY, "find-generic-password", "-s", keychain_service(),
+         "-a", keychain_account(), "-w"],
+        capture_output=True, text=True, timeout=5)
+    if out.returncode == KEYCHAIN_NOT_FOUND:
+        return None
+    if out.returncode != 0:
+        raise OSError(f"keychain read failed: {out.stderr.strip()}")
+    return json.loads(out.stdout)
 
 
-def write_creds(creds):
-    """Write the active credential back to whichever store is in use. The
-    Keychain value is hex-encoded (-X) and fed through `security -i` so the
-    token never appears in argv, the same shape Claude Code and cswap use."""
-    if not creds_in_keychain():
-        json.dump(creds, open(CREDS_PATH, "w"))
-        return True
-    payload = json.dumps(creds).encode("utf-8").hex()
+def _keychain_write(creds):
+    """Store the credential in the login Keychain. Hex-encoded (-X) and fed
+    through `security -i` so the token never appears in argv, the same shape
+    Claude Code and cswap use. False if the Keychain refused the write."""
     cmd = (f"add-generic-password -U -s {shlex.quote(keychain_service())} "
-           f"-a {shlex.quote(keychain_account())} -X {payload}\n")
+           f"-a {shlex.quote(keychain_account())} "
+           f"-X {json.dumps(creds).encode('utf-8').hex()}\n")
     out = subprocess.run([SECURITY, "-i"], input=cmd,
                          capture_output=True, text=True, timeout=5)
     if out.returncode != 0:
-        log.warning("write_creds: keychain write failed: %s", out.stderr.strip())
+        log.warning("keychain write failed: %s", out.stderr.strip())
         return False
     return True
+
+
+def read_creds():
+    """The live OAuth credential, from the store Claude Code uses on THIS
+    platform: the login Keychain on macOS, CREDS_PATH everywhere else. macOS
+    still falls back to the file, which is where Claude Code itself writes when
+    the Keychain is unusable. cswap rewrites these same stores when it switches
+    accounts, so the dashboard follows whatever account is live."""
+    if MACOS:
+        creds = _keychain_read()
+        if creds is not None:
+            return creds
+    return json.load(open(CREDS_PATH))
+
+
+def write_creds(creds):
+    """Write the active credential back to this platform's store, falling back
+    to the file on macOS exactly as Claude Code does when the Keychain refuses."""
+    if MACOS and _keychain_write(creds):
+        return True
+    try:
+        json.dump(creds, open(CREDS_PATH, "w"))
+    except OSError as e:
+        log.warning("write_creds: %s", e)
+        return False
+    return True
+
+
 # Shared by the context light (ctx_grade) and allowance gauge (gauge_grade) —
 # the actual thresholds live in those functions, not here.
 OK_C = (52, 224, 150)       # green
