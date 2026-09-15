@@ -2360,12 +2360,17 @@ def collect_prs(cached=None, publish=None):
                                        "&sort=author-date&order=desc"
                                        f"&per_page={COMMIT_SEARCH_PER_PAGE}"], 25)
 
+        # Branch discovery finishes long after the PRs, so until it does, the
+        # cached branch rows stay on screen: dropping them made the row count
+        # fall (135 -> 79) and jump back at the end.
+        carry = [r for r in (cached or []) if r.get("kind") != "pr"]
+
         if cached and publish:
             keys = [(r["repo"], r["number"]) for r in cached
                     if r.get("kind") == "pr" and r.get("number")]
             fresh = [r for r in ex.map(lambda k: _pr_row(*k), keys) if r]
             if fresh:
-                publish(fresh + [r for r in cached if r.get("kind") != "pr"])
+                publish(fresh + carry)
 
         found = []
         for p in search.result() or []:
@@ -2379,14 +2384,14 @@ def collect_prs(cached=None, publish=None):
         # jumps around as its neighbours arrive.
         done = [_pr_skeleton(repo, num, hit) for repo, num, hit in found]
         if publish and done:
-            publish(list(done))      # every PR visible on the search alone
+            publish(list(done) + carry)   # every PR visible on the search alone
         pending = {ex.submit(_pr_row, t[0], t[1], t[2]): i
                    for i, t in enumerate(found)}
         last_publish = 0.0
         for fut in futures.as_completed(pending):
             done[pending[fut]] = fut.result() or False   # False: no longer open
             if publish and time.monotonic() - last_publish > PUBLISH_EVERY:
-                publish([r for r in done if r])
+                publish([r for r in done if r] + carry)
                 last_publish = time.monotonic()
         rows = [r for r in done if r]
         seen = {(r["repo"], r["branch"]) for r in rows}
@@ -2397,10 +2402,14 @@ def collect_prs(cached=None, publish=None):
             (it.get("repository") or {}).get("full_name")
             for it in ((commits.result() or {}).get("items") or [])
             if (it.get("repository") or {}).get("full_name")))[:BRANCH_REPO_LIMIT]
-        for batch in ex.map(lambda repo: _branch_rows(repo, user, seen), repos):
+        carried_repos = set()
+        for repo, batch in zip(repos, ex.map(lambda r: _branch_rows(r, user, seen), repos)):
             rows += batch
-            if publish and batch:
-                publish(rows)
+            carried_repos.add(repo)
+            # Drop a repo's cached branches once its fresh ones are in, so the
+            # two never double up.
+            if publish:
+                publish(rows + [r for r in carry if r["repo"] not in carried_repos])
     return rows, None
 
 
