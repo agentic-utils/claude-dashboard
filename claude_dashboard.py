@@ -1554,15 +1554,16 @@ def render_help(now, cols, rows):
               "(heatmap). L (or q) returns to the Live tab."),
         ("G", None),
         ("H", "KEYS"),
-        ("T", "? help · L live / H history / P PRs tabs (or ←/→) · "
-              "S/M history popups · s/e/w live panels · r refresh now · "
+        ("T", "Shortcuts are case-insensitive; shown upper case here. "
+              "? help · L live / H history / P PRs tabs (or ←/→) · "
+              "S/M history popups · S/E/W live panels · R refresh now · "
               "tab / shift-tab step through sessions · click bar/session/tab · "
-              "up/down PgUp/PgDn j/k scroll · q / esc step back · ^C quit."),
-        ("T", "PRS tab, no mouse needed: ↑/↓ (j/k) move the cursor · enter or "
-              "o opens the PR · c failing checks · v full comment · m merge · "
-              "d draft/ready · x close (branch: delete) · y/n answer a confirm · "
-              "f cycles the filter: all / no drafts / ready to merge (a view "
-              "filter - it never refetches)."),
+              "↑/↓ PgUp/PgDn J/K scroll · Q / esc step back · ⌃C quit."),
+        ("T", "PRS tab, no mouse needed: ↑/↓ (J/K) move the cursor · enter or "
+              "O opens the PR · C failing checks · V full comment · M merge · "
+              "D draft/ready · X close (branch: delete) · Y/N answer a confirm · "
+              "F cycles the filter: all / no drafts / ready to merge (a view "
+              "filter - it never refetches) · U update, when one is offered."),
     ]
 
     # Flatten to coloured lines. Headings/legends/gaps -> one line; prose ->
@@ -3275,9 +3276,9 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
             plan = " · ".join(p for p in (_usage.get("sub"), _usage.get("tier")) if p)
             stamp = _usage["at"].astimezone().strftime("%H:%M:%S") if _usage.get("at") else "—"
             if not layout["panels_inline"]:
-                extra = "   ·   s/e/w panels"
+                extra = "   ·   S/E/W panels"
             elif layout.get("sess_cols") is None:
-                extra = "   ·   e sessions"
+                extra = "   ·   E sessions"
             else:
                 extra = ""
             cadence = ("refreshing…" if _collect_inflight["live"].locked()
@@ -3567,8 +3568,8 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
                 body.append(hrule)
         # A standing key legend: the row actions are all keyboard-reachable but
         # nothing on screen said so, and the scroll position needs a home too.
-        keys = ("↑/↓ move · enter open · c checks · v comment · "
-                "m merge · d draft · x close · f filter · r refresh")
+        keys = ("↑/↓ move · enter open · C checks · V comment · "
+                "M merge · D draft · X close · F filter · R refresh")
         if len(rows) > cap:
             below = len(rows) - top - len(visible)
             keys = f"{top} above · {below} below · {keys}"
@@ -3857,12 +3858,39 @@ def latest_version():
                 latest = (json.load(r).get("tag_name") or "").lstrip("v") or None
         except Exception as e:                  # offline, rate limited, whatever
             log.warning("latest_version: %s", e)
-    if latest:       # only a real answer is worth caching for six hours
+    if latest:       # only a real answer is worth caching
         try:
-            json.dump({"at": time.time(), "latest": latest}, open(UPDATE_CACHE, "w"))
+            try:
+                keep = json.load(open(UPDATE_CACHE)).get("dismissed")
+            except (OSError, ValueError):
+                keep = None
+            json.dump({"at": time.time(), "latest": latest, "dismissed": keep},
+                      open(UPDATE_CACHE, "w"))
         except OSError:
             pass
     return latest
+
+
+def remember_dismissed(version):
+    """Persist "not this one, thanks" so a restart doesn't ask again. Kept in
+    the update cache next to the last seen tag; a NEWER release still prompts."""
+    try:
+        data = json.load(open(UPDATE_CACHE))
+    except (OSError, ValueError):
+        data = {}
+    data["dismissed"] = version
+    try:
+        json.dump(data, open(UPDATE_CACHE, "w"))
+    except OSError as e:
+        log.warning("remember_dismissed: %s", e)
+
+
+def dismissed_version():
+    """The version the user last said no to, or None."""
+    try:
+        return json.load(open(UPDATE_CACHE)).get("dismissed")
+    except (OSError, ValueError):
+        return None
 
 
 def kick_update_check():
@@ -3877,6 +3905,8 @@ def kick_update_check():
             latest = forced or latest_version()
             if latest and _version_tuple(latest) > _version_tuple(version_string()):
                 _update["latest"] = latest
+                if not forced and latest == dismissed_version():
+                    _update["dismissed"] = True      # already declined this one
         except Exception:
             log.exception("kick_update_check failed")
     if not NO_AUTO_UPDATE:
@@ -4609,9 +4639,11 @@ def run_live(args):
                     except OSError:
                         data = ""
                     if _update["latest"] and not _update["dismissed"]:
-                        if "N" in data:
+                        upd_keys = letter_keys(mouse_re.sub("", data))
+                        if "n" in upd_keys:
                             _update["dismissed"] = True
-                        elif "U" in data:
+                            remember_dismissed(_update["latest"])
+                        elif "u" in upd_keys:
                             sys.stdout.write("\033[H\033[2J  updating…\r\n")
                             sys.stdout.flush()
                             if install_method() and self_upgrade() != 0:
@@ -4735,6 +4767,18 @@ def run_live(args):
         os._exit(0)
 
 
+_CSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z~]")
+
+
+def letter_keys(rest):
+    """Plain letters typed this tick, lower-cased, with CSI escape sequences
+    removed first: arrows are "\x1b[A".."\x1b[D", so lower-casing the raw
+    string would turn → into "c" and ← into "d" and fire those shortcuts.
+    Shortcuts are case-insensitive; the caller's context decides what a letter
+    means, so the same key can do different things in different views."""
+    return _CSI_RE.sub("", rest).lower()
+
+
 def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
                   summary_tab, show_help, show_uerr, show_login, show_history,
                   login_active=False):
@@ -4853,12 +4897,13 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
     # a bare ESC (a "\x1b" not part of such a sequence) is the only thing that
     # triggers the close-overlay logic below.
     rest = mouse_re.sub("", data)
+    keys = letter_keys(rest)
     for seq, step in (("\x1b[A", -1), ("\x1b[B", 1),     # arrow up / down
                       ("\x1b[5~", -10), ("\x1b[6~", 10)):  # PgUp / PgDn
         while seq in rest:
             delta += step
             rest = rest.replace(seq, "", 1)
-    delta += rest.count("j") - rest.count("k")           # vim-style scroll
+    delta += keys.count("j") - keys.count("k")           # vim-style scroll
     if "?" in rest:
         show_help = not show_help
     # Key priority chain (one owner per pass):
@@ -4874,39 +4919,39 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
         pass   # a login is running; only Cancel (click) / esc / q dismiss it
     elif show_login:
         saved = list_saved_accounts()
-        digit = next((c for c in rest if c.isdigit() and c != "0"), None)
+        digit = next((c for c in keys if c.isdigit() and c != "0"), None)
         if digit and int(digit) <= len(saved):
             do_switch = saved[int(digit) - 1][0]
             show_login = False
-        elif "+" in rest:               # [+] add account
+        elif "+" in keys:               # [+] add account
             do_login = True
-        elif "r" in rest or "R" in rest:   # re-login current account, if saved
+        elif "r" in keys:                  # re-login current account, if saved
             do_switch = current_account_slug()
             do_login = True
-        elif "n" in rest or "N" in rest:
+        elif "n" in keys:
             show_login = False
-    elif "g" in rest or "G" in rest:
+    elif "g" in keys:
         show_login = True
         focus_sid = focus_bucket = panel_view = None
         show_uerr = show_help = False
     elif show_uerr:
-        if "r" in rest or "R" in rest:
+        if "r" in keys:
             do_retry = True
-        if ("l" in rest or "L" in rest) and _token_stale():
+        if "l" in keys and _token_stale():
             show_login = True         # confirm, then login → refetch
             show_uerr = False
     else:
         # Menu accelerators: H selects the History tab, L the Live tab (each
         # closes any open overlay/popup). Deterministic, mirroring the menu tabs.
-        if "H" in rest or "h" in rest:
+        if "h" in keys:
             show_history = True
             focus_sid = focus_bucket = panel_view = None
             show_uerr = False
-        if "L" in rest or "l" in rest:
+        if "l" in keys:
             show_history = False
             focus_sid = focus_bucket = panel_view = None
             show_uerr = False
-        if "P" in rest or "p" in rest:
+        if "p" in keys:
             do_prs = True
             focus_sid = focus_bucket = panel_view = None
             show_uerr = False
@@ -4931,7 +4976,7 @@ def process_input(data, mouse_re, hits, focus_sid, focus_bucket, panel_view,
             do_prs = nxt == "prs"
             focus_sid = focus_bucket = panel_view = None
             show_uerr = False
-        if "r" in rest:               # lowercase only: 'R' is re-login in the account modal
+        if "r" in keys:               # the account modal above owns R while open
             do_refresh = True
         # Panel popup toggles. In history: S = window SUMMARY, M = activity
         # heatmap (inline-fallback popups). In live: s/e/w = summary / sessions /
@@ -5048,6 +5093,7 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help,
         elif hit is None and any(v is not None for v in pr_ui.values()):   # click outside closes
             pr_ui = {"ci_idx": None, "comment_idx": None, "confirm": None, "err": None}
     rest = mouse_re.sub("", data)
+    keys = letter_keys(rest)
     if "?" in rest:
         show_help = not show_help
     bare_esc = any(rest[i] == "\x1b" and (i + 1 >= len(rest) or rest[i + 1] != "[")
@@ -5055,13 +5101,13 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help,
     if not action_running:
         if pr_ui["confirm"] is not None:
             kind, idx = pr_ui["confirm"]
-            if "y" in rest or "Y" in rest:
+            if "y" in keys:
                 if idx < len(pr_rows):
                     do_pr_run = (kind, pr_rows[idx])
                 pr_ui["confirm"] = None
-            elif "n" in rest or "N" in rest or "q" in rest or bare_esc:
+            elif "n" in keys or "q" in keys or bare_esc:
                 pr_ui["confirm"] = None
-        elif "q" in rest or bare_esc:
+        elif "q" in keys or bare_esc:
             if show_help:
                 show_help = False
             elif pr_ui["err"]:
@@ -5079,38 +5125,38 @@ def process_prs_input(data, mouse_re, hits, pr_ui, pr_rows, show_help,
     popup_open = any(pr_ui.get(k) is not None
                      for k in ("ci_idx", "comment_idx", "confirm", "err"))
     if pr_rows and not action_running and not popup_open and not show_help:
-        step = (rest.count("\x1b[B") + rest.count("j")
-                - rest.count("\x1b[A") - rest.count("k"))
+        step = (rest.count("\x1b[B") + keys.count("j")
+                - rest.count("\x1b[A") - keys.count("k"))
         if step:
             pr_sel = 0 if pr_sel is None else pr_sel + step
             pr_sel = max(0, min(pr_sel, len(pr_rows) - 1))
         if pr_sel is not None and pr_sel < len(pr_rows):
             row = pr_rows[pr_sel]
-            if "\r" in rest or "\n" in rest or "o" in rest:
+            if "\r" in rest or "\n" in rest or "o" in keys:
                 _open_url(row["url"])
-            elif "c" in rest and row["ci"] == "red":
+            elif "c" in keys and row["ci"] == "red":
                 pr_ui["ci_idx"] = pr_sel
-            elif "v" in rest and row["comment_full"]:
+            elif "v" in keys and row["comment_full"]:
                 pr_ui["comment_idx"] = pr_sel
             else:
                 kinds = {k for _lab, k in pr_row_buttons(row)}
                 for key, wanted in (("m", {"merge"}), ("d", {"draft", "ready"}),
                                     ("x", {"close", "delete"})):
-                    if key in rest and kinds & wanted:
+                    if key in keys and kinds & wanted:
                         pr_ui["confirm"] = ((kinds & wanted).pop(), pr_sel)
                         break
-    if "H" in rest or "h" in rest:
+    if "h" in keys:
         go_history = True
-    if "L" in rest or "l" in rest:
+    if "l" in keys:
         go_live = True
     if "\x1b[D" in rest:             # ← back to History
         go_history = True
     elif "\x1b[C" in rest:           # → wraps round to Live
         go_live = True
-    if "r" in rest and not action_running:
+    if "r" in keys and not action_running:
         do_pr_refresh = True
-    if "f" in rest:                  # cycle the view filter; no refetch
-        pr_filter = (pr_filter + rest.count("f")) % len(PR_FILTERS)
+    if "f" in keys:                  # cycle the view filter; no refetch
+        pr_filter = (pr_filter + keys.count("f")) % len(PR_FILTERS)
     pr_delta += 10 * (rest.count("\x1b[6~") - rest.count("\x1b[5~"))   # PgDn / PgUp
     return (pr_ui, show_help, go_live, go_history, quit_flag, do_pr_run,
             pr_hover, do_pr_refresh, pr_sel, pr_delta, pr_filter)
