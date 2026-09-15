@@ -2202,8 +2202,8 @@ def _pr_skeleton(repo, num, hit):
 
 
 def _branch_rows(repo, user, seen):
-    """Rows for this repo's branches that have no open PR and whose tip commit
-    is the signed-in user's."""
+    """Rows for this repo's branches that have no open PR, still carry commits
+    the default branch doesn't, and whose tip commit is the signed-in user's."""
     repo_obj = _gh_json(["api", f"repos/{repo}"], timeout=10) or {}
     if repo_obj.get("archived"):
         return []                    # read-only: a branch there is not actionable
@@ -2213,9 +2213,17 @@ def _branch_rows(repo, user, seen):
                        timeout=20) or [])[:BRANCH_LIMIT_PER_REPO]:
         name = b.get("name")
         sha = (b.get("commit") or {}).get("sha")
-        if not name or not sha or name == default_branch or (repo, name) in seen:
+        if (not name or not sha or not default_branch
+                or name == default_branch or (repo, name) in seen):
             continue
-        commit = _gh_json(["api", f"repos/{repo}/commits/{sha}"], timeout=10) or {}
+        # One compare call does the work of the old commit lookup and also says
+        # whether the branch still holds anything: ahead_by 0 means every commit
+        # is already on the default branch, i.e. a merged branch nobody deleted.
+        cmp = _gh_json(["api", f"repos/{repo}/compare/{default_branch}...{name}"],
+                       timeout=15) or {}
+        if not cmp.get("ahead_by"):
+            continue
+        commit = (cmp.get("commits") or [{}])[-1]
         if (commit.get("author") or {}).get("login") != user:
             continue
         c = commit.get("commit") or {}
