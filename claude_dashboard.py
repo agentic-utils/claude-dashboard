@@ -85,6 +85,7 @@ import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 TRANSCRIPT_GLOB = os.path.expanduser("~/.claude/projects/**/*.jsonl")
 # Full or partial cwd paths to leave out of every chart/panel entirely - e.g.
@@ -3486,15 +3487,42 @@ class _ArgumentParser(argparse.ArgumentParser):
         return shlex.split(line)
 
 
+TAP_FORMULA = "agentic-utils/tap/claude-dashboard"
+
+
+def install_method():
+    """How this copy was installed: "brew", "uv", "pipx", or None for a plain
+    checkout. Read off the install path, which is the thing each tool owns."""
+    if "/Cellar/" in os.path.realpath(__file__):
+        return "brew"
+    parts = tuple(p.lower() for p in Path(sys.prefix).parts)
+    pairs = list(zip(parts, parts[1:]))
+    if ("uv", "tools") in pairs:
+        return "uv"
+    if ("pipx", "venvs") in pairs:
+        return "pipx"
+    return None
+
+
 def self_upgrade():
-    """Update a Homebrew install in place; anything else is a git checkout."""
-    # ponytail: brew already knows the tap and reports "already installed"
-    here = os.path.realpath(__file__)
-    if "/Cellar/" in here:
-        return subprocess.call(
-            ["brew", "upgrade", "agentic-utils/tap/claude-dashboard"])
-    print(f"Not a Homebrew install ({here}) - run `git pull` in that checkout.")
+    """Upgrade this copy with whichever tool installed it."""
+    method = install_method()
+    if method == "brew":
+        # `brew upgrade` compares against the tap clone Homebrew already has.
+        # With HOMEBREW_NO_AUTO_UPDATE=1 set (common, it makes every brew
+        # command faster) that clone is never refreshed, so a new release is
+        # invisible and the upgrade silently does nothing. Fetch first.
+        print("Updating Homebrew…")
+        subprocess.call(["brew", "update", "--quiet"])
+        return subprocess.call(["brew", "upgrade", TAP_FORMULA])
+    if method == "uv":
+        return subprocess.call(["uv", "tool", "upgrade", "claude-dashboard"])
+    if method == "pipx":
+        return subprocess.call(["pipx", "upgrade", "claude-dashboard"])
+    print(f"Not an installed copy ({os.path.realpath(__file__)}) - "
+          "run `git pull` in that checkout.")
     return 1
+
 
 
 def main():
@@ -3540,7 +3568,7 @@ def main():
                          "host: ';' on Windows, ':' on POSIX). No default - "
                          "nothing is excluded unless given.")
     ap.add_argument("--upgrade", action="store_true",
-                    help="update this install in place (Homebrew) and exit")
+                    help="update this install in place (brew / uv / pipx) and exit")
     argv = (["@" + RC_PATH] if os.path.isfile(RC_PATH) else []) + sys.argv[1:]
     args = ap.parse_args(argv)
 

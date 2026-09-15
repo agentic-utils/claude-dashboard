@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[project]
+name = "claude-dashboard"
+description = "Live terminal dashboard for Claude Code cache-token usage"
+readme = "README.md"
+requires-python = ">=3.9"
+dynamic = ["version"]
+dependencies = []          # stdlib only, on purpose
+
+[project.urls]
+Homepage = "https://github.com/agentic-utils/claude-dashboard"
+
+[project.scripts]
+claude-dashboard = "claude_dashboard:main"
+
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "0.0.0"   # a clone without tags still builds
+
+[tool.hatch.build.targets.wheel]
+only-include = ["claude_dashboard.py"]
+sources = ["."]
