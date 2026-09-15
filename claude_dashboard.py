@@ -1056,8 +1056,12 @@ def panel(title, rows, inner, title_len=None):
         head, tl = rgb(ACCENT, title, bold=True), _visible_len(title)
     else:
         head, tl = title, title_len
-    fill = max(inner - 3 - tl, 0)
-    out = [rgb(DIM2, "╭─ ") + _clip(head, inner - 2) + rgb(DIM2, " " + "─" * fill + "╮")]
+    if not tl:                       # untitled: a plain rule, no "─  ─" gap
+        out = [rgb(DIM2, "╭" + "─" * inner + "╮")]
+    else:
+        fill = max(inner - 3 - tl, 0)
+        out = [rgb(DIM2, "╭─ ") + _clip(head, inner - 2)
+               + rgb(DIM2, " " + "─" * fill + "╮")]
     for r in rows:
         # Clip as well as pad: a content row wider than `inner` would otherwise
         # widen the whole block, push the right border off-screen, and desync
@@ -3354,8 +3358,12 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
         else:
             refresh_label = ""
         refresh_btn = "" if refreshing else "  [Refresh Now]"
-        title = f"PRS · {len(rows)} rows{refresh_label}{refresh_btn}"
-        panel_lines = panel(title, body, inner)
+        # A line of its own ABOVE the panel: in the border it read as floating
+        # text overlapping the table's top row.
+        status = f"PRS · {len(rows)} rows{refresh_label}{refresh_btn}"
+        status_row = len(out) + 1            # 1-based screen row
+        out.append("  " + rgb(ACCENT, _clip(status, total_width - 2), bold=True))
+        panel_lines = panel("", body, inner)
         panel_start = len(out)
         out += panel_lines
         # Translate body-relative row indices to screen coords: panel() adds one
@@ -3363,13 +3371,14 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
         # panel_start + 1 + r (0-based) -> screen row panel_start + 2 + r.
         hits = hits[:len(segs)] + [(panel_start + 2 + r, lo, hi, tok) for r, lo, hi, tok in hits[len(segs):]]
         tips = [(panel_start + 2 + r, lo, hi, full) for r, lo, hi, full in tips]
-        # Title row itself (panel_start + 1) sits above every body row, added
-        # after the translation above so it isn't swept up as a body offset.
-        # Hidden (not just unclickable) while refreshing — a stale button
-        # sitting there after the click already looks broken.
+        # The [Refresh Now] hit is on the status line, added after the body
+        # translation above so it isn't swept up as a body offset. Hidden (not
+        # just unclickable) while refreshing — a stale button sitting there
+        # after the click already looks broken.
         if not refreshing:
-            btn_off = title.index("[Refresh Now]")   # 0-based, plain-text offset within title
-            hits.append((panel_start + 1, 4 + btn_off, 4 + btn_off + len("[Refresh Now]") - 1,
+            # status line starts at screen column 3 (two spaces of indent)
+            btn_off = status.index("[Refresh Now]")
+            hits.append((status_row, 3 + btn_off, 3 + btn_off + len("[Refresh Now]") - 1,
                         "__pr_refresh_now__"))
 
     foot = ("click a row to open · click a red CI dot / a comment for detail · "
