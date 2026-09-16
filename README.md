@@ -118,6 +118,11 @@ Keys: `?` help · `r` refresh the open tab now · `L`/`H`/`P` (or `←`/`→`) l
 tab · click a tab/session/bar/PR row for detail · `Y`/`N` confirm a PRS action ·
 `Ctrl-C` (or click *"⌃C to exit"*) to quit.
 
+Offline, it keeps working: the PRS tab serves the last scan from disk and says
+`offline, showing cached rows`, the live footer reads `offline` in place of the
+refresh cadence, and the ALLOWANCE panel says `offline` rather than an error
+class. It picks up again on its own when the network returns.
+
 The PRS table pages when it outgrows the window: `↑`/`↓` scroll it via the cursor,
 `PgUp`/`PgDn` and the wheel scroll it directly, and a line under the table says how
 many rows sit above and below.
