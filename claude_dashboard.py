@@ -2250,25 +2250,39 @@ def _branch_rows(repo, user, seen):
     return out
 
 
-_net = {"online": True, "checked": 0.0, "since": None}
-NET_RECHECK = 20                    # seconds between connectivity probes
+NET_RECHECK = 20                    # seconds between probes while online
+NET_BACKOFF_MIN = 1                 # first retry after it goes offline
+NET_BACKOFF_MAX = 10                # and never longer than this between tries
+_net = {"online": True, "next_check": 0.0, "backoff": NET_BACKOFF_MIN,
+        "since": None, "recovered": False}
 
 
 def network_ok(force=False):
-    """Is api.github.com reachable? One short TCP connect, cached for a few
-    seconds: every fetch in here ends up there, so one answer serves them all
-    and a laptop off the network doesn't wait out a dozen timeouts."""
-    if not force and time.monotonic() - _net["checked"] < NET_RECHECK:
+    """Is api.github.com reachable? One short TCP connect (every fetch in here
+    ends up at that host, so a single answer serves them all). While online the
+    answer is reused for NET_RECHECK seconds. Once offline it retries after
+    NET_BACKOFF_MIN and doubles up to NET_BACKOFF_MAX, so a blip is caught
+    within a second and a long outage still costs only one probe every ten."""
+    if not force and time.monotonic() < _net["next_check"]:
         return _net["online"]
     try:
         socket.create_connection(("api.github.com", 443), timeout=3).close()
         online = True
     except OSError:
         online = False
-    if online != _net["online"]:
-        _net["since"] = time.time() if not online else None
-        log.info("network %s", "back" if online else "unreachable")
-    _net.update(online=online, checked=time.monotonic())
+    now = time.monotonic()
+    if online:
+        if not _net["online"]:
+            log.info("network back after %.0fs", time.time() - (_net["since"] or time.time()))
+            _net["recovered"] = True      # the loop refetches instead of waiting
+        _net.update(online=True, since=None, backoff=NET_BACKOFF_MIN,
+                    next_check=now + NET_RECHECK)
+    else:
+        if _net["online"]:
+            _net["since"] = time.time()
+            log.info("network unreachable")
+        _net.update(online=False, next_check=now + _net["backoff"],
+                    backoff=min(_net["backoff"] * 2, NET_BACKOFF_MAX))
     return online
 
 
@@ -4276,6 +4290,7 @@ def run_live(args):
         sys.stdout.write("\033[?1049h\033[?25l\033[?7l")
         set_term_title(TERM_TITLE)
         kick_update_check()
+        last_update_check = time.monotonic()
         # Enable SGR mouse reporting + cbreak input so clicks/keys arrive
         # immediately. cbreak (not raw) keeps ISIG, so ⌃C still raises.
         try:
@@ -4414,6 +4429,20 @@ def run_live(args):
             if due:
                 kick_usage()        # fetch_usage owns retry_at (sets/clears it)
                 last_usage = now
+
+            # Back from an outage: refetch now rather than sitting out the usage
+            # backoff and PR cadence that were set while the network was gone.
+            if _net["recovered"]:
+                _net["recovered"] = False
+                last_pr_collect = None
+                kick_usage()
+
+            # Re-check for a release while the session runs, so a dashboard left
+            # open for days still notices one.
+            if (not _update["latest"]
+                    and time.monotonic() - last_update_check >= UPDATE_CHECK_EVERY):
+                kick_update_check()
+                last_update_check = time.monotonic()
 
             # History view: collect its (longer, coarser) buckets on demand —
             # on entry, on --interval, and after a resize. Select which dataset
