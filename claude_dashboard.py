@@ -75,6 +75,7 @@ import re
 import select
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import termios
@@ -1980,7 +1981,9 @@ def fetch_usage(timeout=15):
         log.warning("fetch_usage: HTTPError %s after %.2fs, backoff %ss",
                     e.code, time.monotonic() - t0, secs)
     except Exception as e:
-        _usage_set(err=type(e).__name__, err_body=str(e)[:4000], retry_at=back(USAGE_BACKOFF))
+        offline = isinstance(e, (urllib.error.URLError, OSError)) and not network_ok(force=True)
+        _usage_set(err="offline" if offline else type(e).__name__,
+                   err_body=str(e)[:4000], retry_at=back(USAGE_BACKOFF))
         log.exception("fetch_usage: failed after %.2fs", time.monotonic() - t0)
 
 
@@ -2247,6 +2250,28 @@ def _branch_rows(repo, user, seen):
     return out
 
 
+_net = {"online": True, "checked": 0.0, "since": None}
+NET_RECHECK = 20                    # seconds between connectivity probes
+
+
+def network_ok(force=False):
+    """Is api.github.com reachable? One short TCP connect, cached for a few
+    seconds: every fetch in here ends up there, so one answer serves them all
+    and a laptop off the network doesn't wait out a dozen timeouts."""
+    if not force and time.monotonic() - _net["checked"] < NET_RECHECK:
+        return _net["online"]
+    try:
+        socket.create_connection(("api.github.com", 443), timeout=3).close()
+        online = True
+    except OSError:
+        online = False
+    if online != _net["online"]:
+        _net["since"] = time.time() if not online else None
+        log.info("network %s", "back" if online else "unreachable")
+    _net.update(online=online, checked=time.monotonic())
+    return online
+
+
 def rate_headroom():
     """(ok, message) from GitHub's rate-limit endpoint, which is itself free.
     A scan is a few hundred calls, so it must not be the thing that exhausts
@@ -2391,6 +2416,8 @@ def collect_prs(cached=None, publish=None):
     user = gh_username()
     if not user:
         return [], "gh not authenticated — run `gh auth login`"
+    if not network_ok():
+        return (cached or []), None      # offline: keep showing the cached rows
     ok, why = rate_headroom()
     if not ok:
         return (cached or []), why
@@ -3281,7 +3308,8 @@ def render_frame(now, buckets, sessions, anim=0, layout=None, summary_tab="win",
                 extra = "   ·   E sessions"
             else:
                 extra = ""
-            cadence = ("refreshing…" if _collect_inflight["live"].locked()
+            cadence = ("offline" if not _net["online"] else
+                       "refreshing…" if _collect_inflight["live"].locked()
                        else f"charts every {max(1, INTERVAL_SECONDS // 60)}m")
             foot = (f"plan {plan or '?'}   ·   allowance live, updated {stamp}   ·   "
                     f"{cadence}{extra}   ·   R refresh   ·   "
@@ -3585,6 +3613,8 @@ def render_prs_frame(now, rows, err, cols, term_rows, loading=False, elapsed=0,
         count = (f"{len(rows)} rows" if filter_mode == "all"
                  else f"{len(rows)} of {total if total is not None else len(rows)}"
                       f" rows · {filter_mode}")
+        if not _net["online"]:
+            refresh_label = " · offline, showing cached rows"
         status = f"PRS · {count}{refresh_label}{refresh_btn}"
         status_row = len(out) + 1            # 1-based screen row
         out.append("  " + rgb(ACCENT, _clip(status, total_width - 2), bold=True))
