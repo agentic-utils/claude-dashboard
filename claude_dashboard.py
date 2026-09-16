@@ -3859,11 +3859,13 @@ def install_method():
     return None
 
 
-UPDATE_CHECK_EVERY = 30 * 60        # re-check this often while running
+UPDATE_CHECK_EVERY = 60             # re-check this often while running
 # The disk cache exists only so a restart loop can't hammer the API; it must
 # NOT decide how fresh the answer is, or a release published minutes ago stays
 # invisible for the whole interval, which is exactly what happened with 0.17.1.
-UPDATE_CACHE_TTL = 60
+UPDATE_CACHE_TTL = 30               # shorter than the interval, so a due check
+                                    # always gets a live answer; it only stops a
+                                    # restart loop hammering the API
 UPDATE_CACHE = os.path.join(CONFIG_HOME, "dashboard-update.json")
 RELEASE_URL = ("https://api.github.com/repos/agentic-utils/claude-dashboard"
                "/releases/latest")
