@@ -20,6 +20,9 @@ SHIMMER = ["#ff2a6d", "#ff7b00", "#ffd300", "#05d9e8", "#7b61ff", "#d300c5"]
 STATUS_STYLE = {"live": "bold #00ff41", "stalled": "bold #ffd300", "starting": "#05d9e8",
                 "dead": "bold #ff2a6d", "parked": "#777777"}
 TITLE = " ▓▒░ CLAUDE·BOARD ░▒▓ "
+RUNNING = ("live", "stalled", "starting")
+END_REQUEST = ("The person pressed End on the board. Do the session-end memory save, "
+               "then call end_session.")
 
 
 def cylon(frame: int, width: int = 8) -> Text:
@@ -292,6 +295,11 @@ class BoardApp(App):
             self.notify("pick an item and type something first", severity="warning")
             return
         sid, ref = self.selected
+        if self.store.session(sid) is None:
+            self.notify(f"{ref}'s session has ended", severity="warning")
+            self.selected = None
+            self.paint_items()
+            return
         self.store.send(sid, text, ref)
         box.text = ""
         self.notify(f"sent to {ref}")
@@ -336,8 +344,8 @@ class BoardApp(App):
         if self.statuses.get(sid) not in ("dead", "parked"):
             self.notify("only dead or parked sessions can be restored", severity="warning")
             return
-        self.store.set_parked(sid, False)
-        self.open_tab(sid)
+        if self.open_tab(sid):
+            self.store.set_parked(sid, False)
 
     @on(Button.Pressed, "#restore-all")
     def restore_all_pressed(self) -> None:
@@ -364,11 +372,19 @@ class BoardApp(App):
         sid = self.current_session()
         if not sid:
             return
-        live = self.statuses.get(sid) in ("live", "stalled", "starting")
-        warn = " It is still running: prefer /board:end in its tab, so Claude saves memory first." if live else ""
+        s = self.store.session(sid)
+        label = f"{s['name'] or os.path.basename(s['cwd'])} ({short(sid)}, {s['cwd']})"
+        running = self.statuses.get(sid) in RUNNING
 
         def go(yes: bool) -> None:
-            if yes:
+            if not yes:
+                return
+            if running:   # Claude saves memory, then deletes the rows itself
+                self.store.send(sid, END_REQUEST)
+                self.notify("asked the session to save memory and end")
+            else:
                 self.store.end(sid)
-                self.refresh_data()
-        self.push_screen(Confirm(f"End this session and delete its board data?{warn}"), go)
+            self.refresh_data()
+        prompt = (f"End {label}? It is running: Claude will save memory, then delete its board data."
+                  if running else f"End {label} and delete its board data?")
+        self.push_screen(Confirm(prompt), go)
