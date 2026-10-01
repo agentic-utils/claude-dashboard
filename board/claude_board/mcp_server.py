@@ -48,8 +48,7 @@ def get_input(ref: str | None = None) -> str:
         lines = [f"{ref} [{item['status']}] {item['title']}", item["body"], ""]
         lines += [f"{m['author']} @ {m['created_at']}: {m['body']}" for m in s.thread(_sid, ref)]
         return "\n".join(lines)
-    msgs = s.pending(_sid)
-    s.mark_delivered([m["id"] for m in msgs])
+    msgs = s.take_pending(_sid)
     return "\n\n".join(f"[{m['item_ref'] or 'general'}] {m['body']}" for m in msgs) or "nothing new"
 
 

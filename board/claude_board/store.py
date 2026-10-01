@@ -7,6 +7,7 @@ never loses a change the caller was told about.
 
 import os
 import sqlite3
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -86,16 +87,27 @@ class Store:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript(SCHEMA)
+        # one connection, possibly many threads (the MCP server runs tools in worker threads)
+        self.lock = threading.RLock()
 
     @contextmanager
     def tx(self):
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            yield self.db
-        except BaseException:
-            self.db.execute("ROLLBACK")
-            raise
-        self.db.execute("COMMIT")
+        with self.lock:
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                yield self.db
+            except BaseException:
+                self.db.execute("ROLLBACK")
+                raise
+            self.db.execute("COMMIT")
+
+    def _all(self, sql: str, params=()) -> list[sqlite3.Row]:
+        with self.lock:
+            return self.db.execute(sql, params).fetchall()
+
+    def _one(self, sql: str, params=()) -> sqlite3.Row | None:
+        with self.lock:
+            return self.db.execute(sql, params).fetchone()
 
     # sessions
 
@@ -109,17 +121,17 @@ class Store:
         return sid
 
     def session(self, sid: str) -> sqlite3.Row | None:
-        return self.db.execute("SELECT * FROM sessions WHERE id = ?", (sid,)).fetchone()
+        return self._one("SELECT * FROM sessions WHERE id = ?", (sid,))
 
     def sessions(self) -> list[sqlite3.Row]:
-        return self.db.execute(
+        return self._all(
             """SELECT s.*,
                  (SELECT count(*) FROM items i WHERE i.session_id = s.id
                     AND i.kind = 'question' AND i.status = 'open') AS open_questions,
                  (SELECT count(*) FROM items i WHERE i.session_id = s.id
                     AND i.status = 'running') AS running
                FROM sessions s ORDER BY s.created_at"""
-        ).fetchall()
+        )
 
     def mark_launched(self, sid: str) -> None:
         with self.tx() as db:
@@ -183,12 +195,12 @@ class Store:
                 )
 
     def item(self, sid: str, ref: str) -> sqlite3.Row | None:
-        return self.db.execute("SELECT * FROM items WHERE session_id = ? AND ref = ?", (sid, ref)).fetchone()
+        return self._one("SELECT * FROM items WHERE session_id = ? AND ref = ?", (sid, ref))
 
     def items(self, sid: str | None = None, include_closed: bool = True) -> list[sqlite3.Row]:
         sql = """SELECT i.*, s.name AS session_name FROM items i JOIN sessions s ON s.id = i.session_id
                  WHERE (? IS NULL AND s.parked = 0) OR i.session_id = ?"""
-        rows = self.db.execute(sql, (sid, sid)).fetchall()
+        rows = self._all(sql, (sid, sid))
         if not include_closed:
             rows = [r for r in rows if r["status"] not in CLOSED]
         return sorted(rows, key=inbox_rank)
@@ -214,20 +226,24 @@ class Store:
             )
 
     def pending(self, sid: str) -> list[sqlite3.Row]:
-        return self.db.execute(
+        return self._all(
             "SELECT * FROM messages WHERE session_id = ? AND delivered_at IS NULL ORDER BY id", (sid,)
-        ).fetchall()
+        )
 
-    def mark_delivered(self, ids: list[int]) -> None:
-        if not ids:
-            return
+    def take_pending(self, sid: str) -> list[sqlite3.Row]:
+        """Read and mark delivered in one transaction, so the monitor and get_input()
+        can never both hand Claude the same message."""
         with self.tx() as db:
-            db.executemany("UPDATE messages SET delivered_at = ? WHERE id = ?", [(now(), i) for i in ids])
+            rows = db.execute(
+                """UPDATE messages SET delivered_at = ? WHERE session_id = ? AND delivered_at IS NULL
+                   RETURNING *""", (now(), sid)
+            ).fetchall()
+        return sorted(rows, key=lambda m: m["id"])   # RETURNING order is unspecified
 
     def thread(self, sid: str, ref: str) -> list[sqlite3.Row]:
-        return self.db.execute(
+        return self._all(
             "SELECT * FROM messages WHERE session_id = ? AND item_ref = ? ORDER BY id", (sid, ref)
-        ).fetchall()
+        )
 
 
 RANK = {"open": 0, "blocked": 1, "waiting": 1, "answered": 2, "running": 3, "todo": 4}

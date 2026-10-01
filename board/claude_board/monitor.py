@@ -21,10 +21,9 @@ def format_message(m) -> str:
 
 
 def poll_once(store: Store, sid: str, out=sys.stdout) -> int:
-    msgs = store.pending(sid)
+    msgs = store.take_pending(sid)
     for m in msgs:
         print(format_message(m), file=out, flush=True)
-    store.mark_delivered([m["id"] for m in msgs])
     return len(msgs)
 
 
