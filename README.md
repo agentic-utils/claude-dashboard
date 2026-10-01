@@ -157,3 +157,10 @@ re-login inside the account popup.
 - The script writes `claude-dashboard.log` next to itself, or in `$HOME` when
   that directory is read-only (a brew install). Diagnostics only, no secrets;
   it's gitignored.
+
+## Session board (prototype)
+
+`board/` holds **claude-board**, a separate Textual app for tracking tasks,
+questions and the lifecycle of several Claude Code sessions run in parallel. It has
+its own dependencies, so this dashboard stays a single stdlib-only file. See
+[board/README.md](board/README.md).

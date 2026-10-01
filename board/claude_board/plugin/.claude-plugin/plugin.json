@@ -1,0 +1,7 @@
+{
+  "name": "board",
+  "displayName": "Session board",
+  "version": "0.1.0",
+  "description": "Connects a session launched from claude-board: delivers the person's answers and adds /board:park and /board:end",
+  "author": { "name": "agentic-utils" }
+}
