@@ -9,13 +9,15 @@ WSL and Windows Terminal. Prototype: see `../.plan/session-board.md` for the des
 - **Sessions.** New session (directory, optional name, optional ticket, opening brief)
   opens a Windows Terminal tab running Claude. Restore brings back sessions that died
   (reboot, crash), one at a time or all at once; nothing restarts on its own. Park
-  hides a session until you restore it. End deletes its board data.
+  hides a session until you restore it. End deletes its board data. On a running
+  session, Park and End only ask the session to do it (press again to cancel or force);
+  the board never deletes anything by itself.
 - **Durable.** State is in SQLite at `~/.local/state/claude-board/board.db`
   (override with `BOARD_DB`), committed to disk on every change.
 
 Only sessions launched from the board are tracked. Nothing is installed into your
 Claude Code settings: each launched session gets the board's MCP server, monitor,
-protocol and `/board:park` / `/board:end` commands through its own launch flags.
+protocol and `/park` / `/end` commands through its own launch flags.
 
 ## Run
 

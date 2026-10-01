@@ -1,6 +1,6 @@
 ---
 name: end
-description: End this board session for good. Use only when the person runs /board:end.
+description: End this board session for good. Use only when the person runs /end (or /board:end).
 disable-model-invocation: true
 ---
 

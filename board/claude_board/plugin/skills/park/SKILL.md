@@ -1,6 +1,6 @@
 ---
 name: park
-description: Park this board session. Use only when the person runs /board:park.
+description: Park this board session. Use only when the person runs /park (or /board:park).
 disable-model-invocation: true
 ---
 

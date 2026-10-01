@@ -45,10 +45,14 @@ also standalone: it only tracks sessions it launched, needs no global hooks, set
 | starting | launched, not yet registered | no process recorded for this launch, launched under 90 s ago |
 | live | session process running | recorded Claude pid exists in `/proc` with the same start time, same boot id |
 | stalled | live, but quiet | live, heartbeat older than 120 s, and the board has not just woken from sleep. A hint only |
-| dead | process gone, not parked | anything else that is not parked |
-| parked | `/board:park` or the Park button | stored flag; hidden from the inbox, off Restore All |
-| ending | End pressed on a running session | `end_requested_at` set and the session is live, stalled or starting |
-| (ended) | `/board:end` or the End button | rows deleted |
+| dead | process gone | anything else |
+| parking / ending | Park or End pressed on a running session | `park_requested_at` or `end_requested_at` set and the session is live, stalled or starting |
+| (ended) | `/end`, or End on a dead session, or Force end | rows deleted |
+
+**Parked is a flag, not a state.** It is shown alongside the state ("dead · parked"),
+hides the session from the inbox and keeps it off Restore All. It never hides whether
+the process is running: a parked session that is still running is live, and Restore
+and End treat it as live.
 
 - **Life and death come from the process, not the heartbeat.** Sleep and hibernate keep
   the process, so the session stays live and the heartbeat resumes on wake. A reboot or
@@ -63,15 +67,23 @@ also standalone: it only tracks sessions it launched, needs no global hooks, set
   double press opens one tab. The launch wrapper then checks and registers in a single
   compare-and-set transaction before it execs Claude, so two tabs racing for the same
   session can't both start it.
-- **End** asks Claude to do its usual session-end memory save, then deletes the board's
-  rows. Claude Code's own transcript is untouched. The End button on a running session
-  (live, stalled or starting) sets `end_requested_at`; the session's monitor passes the
-  request on and Claude calls `end_session` itself. The confirm names the session. The
-  row shows as ending meanwhile. If the session dies or is parked before acting on it,
-  the board deletes the rows itself. If it stays alive but doesn't respond for 2 minutes
-  (stuck at the trust prompt, say), End offers a force end that deletes the rows without
-  the memory save. On a dead or parked session End just deletes the rows. Any launch
-  clears a leftover end request, so a restored session is never told to end itself.
+- **The board never deletes or hides a running session's data behind its back.** There
+  is no automatic clean-up of any kind; every deletion and every park comes from the
+  session itself or from a button the person pressed and confirmed.
+- **Park and End on a running session are requests.** The button (after a confirm that
+  names the session) sets `park_requested_at` or `end_requested_at`. The session's
+  monitor passes the request on, and Claude acts on it: for End it does its usual
+  session-end memory save, then calls `end_session`; for Park it brings its items up to
+  date, then calls `park_session`. The row shows parking or ending meanwhile. Pressing
+  the button again offers **Cancel** (clears the request and sends the session a "carry
+  on" message, in case it was already told) or **Force** (a second confirm naming the
+  session: Force end deletes the rows without the memory save, Force park sets the
+  flag). One request at a time: the other button says to cancel the first.
+- **Park and End on a dead session act straight away**, after a confirm that names the
+  session. Unpark is immediate. Any launch clears leftover requests, so a restored
+  session is never told to end or park itself.
+- **In-session `/park` and `/end`** are unchanged: the session saves what it needs, then
+  acts on itself. Claude Code's own transcript is untouched either way.
 
 ## Launching
 
@@ -124,15 +136,20 @@ A static plugin directory shipped in the package, loaded per session with `--plu
   "listener that exits to wake the session" and the `PostToolUse` hook from the design
   discussion, and it restarts with the session on resume, so no `SessionStart` hook is
   needed either.
-- **Skills**: `/board:park` and `/board:end`. Plugin skills are always namespaced by the
-  plugin name, so the bare `/park` and `/end` are not available this way.
+- **Skills**: `/park` and `/end`. A plugin skill whose frontmatter sets `name` answers to
+  the bare name as well as the namespaced one ("The bare `/fancy` also invokes the skill
+  unless another command already uses that name", code.claude.com/docs/en/skills).
+  Checked headless with `disable-model-invocation: true` as these skills use: `/park`
+  resolves. `/board:park` and `/board:end` remain as fallbacks if another command takes
+  the bare names.
 
 ## Data model
 
 ```
 sessions  id (uuid) PK, name, ticket, brief, cwd, parked (0/1),
           created_at, launched_at,
-          claude_pid, claude_start, boot_id, heartbeat_at, end_requested_at
+          claude_pid, claude_start, boot_id, heartbeat_at,
+          end_requested_at, park_requested_at
 items     id PK, session_id FK, ref ('T3' | 'Q1' | 'A2', unique per session),
           kind (task | question | agent), title, body, status,
           created_at, updated_at
@@ -140,7 +157,10 @@ messages  id PK, session_id FK, item_ref (nullable), author (claude | person),
           body, created_at, claimed_at, delivered_at
 ```
 
-Deleting a session cascades. Times are UTC ISO-8601.
+Deleting a session cascades. Times are UTC ISO-8601; claim and request stamps carry
+microseconds so one claim or request is never mistaken for the next. Columns added after
+the first release are added on start, inside one transaction, so processes starting
+together against an older database can't both add the same column.
 
 Statuses: task `todo running blocked waiting done dropped`; question
 `open answered closed`; agent `running done failed`. A person's message on an open
@@ -153,13 +173,16 @@ question marks it answered.
 | `post_item(kind, title, body, status?)` | creates T/Q/A item, returns its ref |
 | `update_item(ref, status?, title?, body?, note?)` | edits; a note is appended to the item's thread |
 | `get_input(ref?)` | undelivered messages from the person, or the full thread for one ref (whose undelivered messages then count as delivered) |
+| `list_items(include_closed?)` | this session's items |
+| `park_session()` / `end_session()` | lifecycle; `park_session` also settles a pending park request |
 
 Delivery is claim, show, confirm. A claim is one transaction, so the monitor and
 `get_input` never take the same message. The monitor confirms a message only after
 printing and flushing it; if stdout has closed it releases the rest for redelivery, and
-a claim abandoned by a monitor killed mid-print is retaken after 30 s.
-| `list_items(include_closed?)` | this session's items |
-| `park_session()` / `end_session()` | lifecycle |
+a claim abandoned by a monitor killed mid-print is retaken after 30 s. Confirm and
+release touch only messages still under the caller's own claim, so a monitor whose claim
+was retaken can't confirm someone else's. A thread shown by `get_input(ref)` leaves out
+messages the monitor has claimed and is printing, so they aren't shown twice.
 
 `claude_board run` registers the session's pid, start time and boot id just before it
 execs Claude, as a compare-and-set that fails if another live Claude holds the session.
@@ -176,16 +199,29 @@ serialises access to its one connection with a lock.
   Selecting a session filters; Esc clears. Detail on the right: body, thread, and an
   answer box. Ctrl+S sends (Ctrl+Enter where the terminal reports it).
 - **Sessions tab.** Every session with status, name, ticket, directory, open-question
-  and running counts. Restore on dead or parked rows (unparks only once the launch goes
-  through), Restore All, Park, End (with a confirm), New session.
+  and running counts. Restore on a dead row, parked or not (unparks only once the launch
+  goes through), Restore All (dead and not parked), Park / unpark, End, New session. Park
+  and End follow the lifecycle rules above.
 - **Look.** Matrix green inside panels; colour and a shimmering title bar on the chrome.
 
 ## Relationship to the cache dashboard
 
-`claude_dashboard.py` stays as it is: single file, stdlib only, because the Homebrew
-formula installs it by copying that file. The board is a separate project in `board/`
-with its own dependencies (Textual, the MCP SDK) and its own `claude-board` command.
-Bringing the cache view in as a tab of the board is a later decision.
+For the prototype, `claude_dashboard.py` stays as it is: single file, stdlib only,
+because the Homebrew formula installs it by copying that file. The board is a separate
+project in `board/` with its own dependencies (Textual, the MCP SDK) and its own
+`claude-board` command.
+
+## Path to a single tool
+
+The goal is one tool: the board, with the cache view as one of its tabs.
+
+1. Package the repo as one Python project with both commands (`claude-board`, and
+   `claude-dashboard` kept as an alias that opens the cache tab), installed with
+   `uv tool install` instead of the Homebrew single-file copy. Point the Homebrew formula
+   at the package, or retire it with a note in the README.
+2. Port the cache view into a Textual tab beside Inbox and Sessions, reusing its data
+   code; keep its terminal-only mode for anyone who wants it.
+3. Drop the separate single-file script once the tab matches it.
 
 ## Verified Claude Code facts (v2.1.287, `claude --help` and code.claude.com docs)
 
@@ -219,5 +255,5 @@ new tab (confirmed by `launch.log`).
    parked. Should Restore All only take sessions that were live in the last boot?
 2. Notification size: the monitor prints answers up to 1,500 characters inline and
    points to `get_input(ref)` for longer ones. Is that the right cut-off?
-3. Bringing the cache dashboard in as a tab: when, and is dropping the single-file
-   Homebrew install acceptable then?
+3. When to take the first step of "Path to a single tool": straight after the prototype
+   settles, or once the board has been in daily use for a while?
