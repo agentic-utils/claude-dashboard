@@ -39,7 +39,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     boot_id      TEXT,
     heartbeat_at TEXT,
     end_requested_at  TEXT,
-    park_requested_at TEXT
+    park_requested_at TEXT,
+    end_told_at  TEXT,
+    park_told_at TEXT
 );
 CREATE TABLE IF NOT EXISTS items (
     id         INTEGER PRIMARY KEY,
@@ -69,9 +71,21 @@ CREATE INDEX IF NOT EXISTS messages_pending
 
 # columns added after the first release: (table, column, type)
 ADDED_COLUMNS = [("sessions", "end_requested_at", "TEXT"), ("sessions", "park_requested_at", "TEXT"),
+                 ("sessions", "end_told_at", "TEXT"), ("sessions", "park_told_at", "TEXT"),
                  ("messages", "claimed_at", "TEXT")]
 REQUESTS = ("end", "park")   # what the board can ask a running session to do
 CLAIM_TIMEOUT = 30   # seconds before a claim from a monitor that died mid-print is retaken
+
+
+class SessionGone(LookupError):
+    """The session's row has gone: it ended itself, or was force-ended on the board."""
+
+    def __init__(self, sid: str = ""):
+        super().__init__(f"session {sid} no longer exists")
+
+
+GONE_TEXT = ("[board] This session was force-ended on the board (or has ended): its board data "
+             "is gone. Stop using board tools.")
 
 
 def now() -> str:
@@ -129,6 +143,13 @@ class Store:
         with self.lock:
             return self.db.execute(sql, params).fetchone()
 
+    @staticmethod
+    def _require(db, sid: str) -> None:
+        """Inside a write transaction (BEGIN IMMEDIATE holds the write lock), so the row
+        can't vanish between this check and the write that follows."""
+        if db.execute("SELECT 1 FROM sessions WHERE id = ?", (sid,)).fetchone() is None:
+            raise SessionGone(sid)
+
     # sessions
 
     def create_session(self, cwd: str, name: str = "", ticket: str = "", brief: str = "") -> str:
@@ -157,7 +178,8 @@ class Store:
         """A (re)launch also drops any request left over from the last run."""
         with self.tx() as db:
             db.execute("""UPDATE sessions SET launched_at = ?, end_requested_at = NULL,
-                          park_requested_at = NULL WHERE id = ?""", (now(), sid))
+                          park_requested_at = NULL, end_told_at = NULL, park_told_at = NULL
+                          WHERE id = ?""", (now(), sid))
 
     def register(self, sid: str, pid: int, start: int, boot_id: str) -> None:
         with self.tx() as db:
@@ -191,18 +213,35 @@ class Store:
         Nothing happens to the data until the session acts, or the person forces it."""
         assert what in REQUESTS
         with self.tx() as db:
+            self._require(db, sid)
             db.execute(f"UPDATE sessions SET {what}_requested_at = coalesce({what}_requested_at, ?) "
                        "WHERE id = ?", (stamp(), sid))
 
+    def tell_request(self, sid: str, what: str, asked: str) -> bool:
+        """The monitor is about to pass a request on: record that, only if it is still the
+        current request (a cancel may have just cleared it). Returns whether to print it."""
+        with self.tx() as db:
+            return db.execute(f"UPDATE sessions SET {what}_told_at = ? WHERE id = ? "
+                              f"AND {what}_requested_at = ?", (asked, sid, asked)).rowcount == 1
+
+    def untell_request(self, sid: str, what: str) -> None:
+        """Printing the request failed: it was never passed on after all."""
+        with self.tx() as db:
+            db.execute(f"UPDATE sessions SET {what}_told_at = NULL WHERE id = ?", (sid,))
+
     def cancel_request(self, sid: str, what: str) -> None:
-        """Clear a request and tell the session to carry on, in case it was already told."""
+        """Clear a request. Only a session that was told about it hears that it's cancelled."""
         assert what in REQUESTS
         with self.tx() as db:
-            db.execute(f"UPDATE sessions SET {what}_requested_at = NULL WHERE id = ?", (sid,))
-            db.execute(
-                "INSERT INTO messages (session_id, author, body, created_at) VALUES (?, 'person', ?, ?)",
-                (sid, f"The person cancelled the {what} request: carry on as before.", now()),
-            )
+            self._require(db, sid)
+            told = db.execute(f"SELECT {what}_told_at FROM sessions WHERE id = ?", (sid,)).fetchone()[0]
+            db.execute(f"UPDATE sessions SET {what}_requested_at = NULL, {what}_told_at = NULL "
+                       "WHERE id = ?", (sid,))
+            if told:
+                db.execute(
+                    "INSERT INTO messages (session_id, author, body, created_at) VALUES (?, 'person', ?, ?)",
+                    (sid, f"The person cancelled the {what} request: carry on as before.", now()),
+                )
 
     def heartbeat(self, sid: str) -> None:
         with self.tx() as db:
@@ -211,7 +250,9 @@ class Store:
     def set_parked(self, sid: str, parked: bool) -> None:
         """Parking (by the session or by force) also settles any pending park request."""
         with self.tx() as db:
-            db.execute("UPDATE sessions SET parked = ?, park_requested_at = NULL WHERE id = ?", (int(parked), sid))
+            self._require(db, sid)
+            db.execute("UPDATE sessions SET parked = ?, park_requested_at = NULL, park_told_at = NULL "
+                       "WHERE id = ?", (int(parked), sid))
 
     def end(self, sid: str) -> None:
         with self.tx() as db:
@@ -225,6 +266,7 @@ class Store:
         status = status or INITIAL_STATUS[kind]
         self._check_status(kind, status)
         with self.tx() as db:
+            self._require(db, sid)
             n = db.execute(
                 "SELECT count(*) FROM items WHERE session_id = ? AND kind = ?", (sid, kind)
             ).fetchone()[0]
@@ -237,12 +279,15 @@ class Store:
         return ref
 
     def update_item(self, sid: str, ref: str, *, status=None, title=None, body=None, note=None) -> None:
+        if self.session(sid) is None:
+            raise SessionGone(sid)
         item = self.item(sid, ref)
         if item is None:
             raise KeyError(f"no item {ref} in this session")
         if status is not None:
             self._check_status(item["kind"], status)
         with self.tx() as db:
+            self._require(db, sid)
             db.execute(
                 """UPDATE items SET status = coalesce(?, status), title = coalesce(?, title),
                    body = coalesce(?, body), updated_at = ? WHERE session_id = ? AND ref = ?""",
@@ -276,6 +321,7 @@ class Store:
     def send(self, sid: str, body: str, item_ref: str | None = None) -> None:
         """A message from the person; the session's monitor delivers it."""
         with self.tx() as db:
+            self._require(db, sid)
             db.execute(
                 "INSERT INTO messages (session_id, item_ref, author, body, created_at) VALUES (?, ?, 'person', ?, ?)",
                 (sid, item_ref, body, now()),

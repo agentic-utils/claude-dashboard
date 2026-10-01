@@ -4,13 +4,14 @@ It keeps a heartbeat going, which is only a 'stalled' hint; see liveness.py. The
 session's Claude process was registered by `claude_board run` before it exec'd Claude.
 """
 
+import functools
 import os
 import threading
 import time
 
 from mcp.server.mcpserver import MCPServer
 
-from .store import Store
+from .store import GONE_TEXT, SessionGone, Store
 
 HEARTBEAT_SECONDS = 30
 
@@ -20,14 +21,28 @@ _store: Store | None = None
 _sid = ""
 
 
-@server.tool()
+def board_tool(fn):
+    """Register a tool that answers plainly once the session's board data has gone,
+    instead of failing with a raw database error."""
+    @functools.wraps(fn)
+    def tool(*args, **kwargs):
+        if _store.session(_sid) is None:
+            return GONE_TEXT
+        try:
+            return fn(*args, **kwargs)
+        except SessionGone:
+            return GONE_TEXT
+    return server.tool()(tool)
+
+
+@board_tool
 def post_item(kind: str, title: str, body: str = "", status: str | None = None) -> str:
     """Create a task, question or agent item on the board. kind: task | question | agent.
     Returns the item's ref (T1, Q1, A1...). Write the full detail in body, once."""
     return _store.post_item(_sid, kind, title, body, status)
 
 
-@server.tool()
+@board_tool
 def update_item(ref: str, status: str | None = None, title: str | None = None,
                 body: str | None = None, note: str | None = None) -> str:
     """Change an item's status, title or body, and/or append a progress note to its thread."""
@@ -35,7 +50,7 @@ def update_item(ref: str, status: str | None = None, title: str | None = None,
     return f"{ref} updated"
 
 
-@server.tool()
+@board_tool
 def get_input(ref: str | None = None) -> str:
     """Without ref: the person's undelivered messages (marked delivered).
     With ref: that item's full body and thread (its messages count as delivered)."""
@@ -54,21 +69,21 @@ def get_input(ref: str | None = None) -> str:
     return "\n\n".join(f"[{m['item_ref'] or 'general'}] {m['body']}" for m in msgs) or "nothing new"
 
 
-@server.tool()
+@board_tool
 def list_items(include_closed: bool = False) -> str:
     """This session's items, one per line."""
     rows = _store.items(_sid, include_closed=include_closed)
     return "\n".join(f"{r['ref']} [{r['status']}] {r['title']}" for r in rows) or "no items"
 
 
-@server.tool()
+@board_tool
 def park_session() -> str:
     """Park this session: hidden from the inbox and off the restore list until resumed."""
     _store.set_parked(_sid, True)
     return "parked; the person can close this tab"
 
 
-@server.tool()
+@board_tool
 def end_session() -> str:
     """End this session for good: deletes all of its board data. Do the session-end memory save first."""
     _store.end(_sid)

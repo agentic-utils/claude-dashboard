@@ -5,9 +5,8 @@ person as one line. Claude Code delivers each printed line to Claude as a notifi
 import os
 import sys
 import time
-from dataclasses import dataclass, field
 
-from .store import Store
+from .store import GONE_TEXT, Store
 
 POLL_SECONDS = 2
 INLINE_LIMIT = 1500
@@ -29,22 +28,22 @@ REQUEST_TEXT = {
 }
 
 
-@dataclass
-class State:
-    told: dict = field(default_factory=dict)   # request -> the request stamp already passed on
-
-
-def poll_once(store: Store, sid: str, out=sys.stdout, state: State | None = None) -> int:
+def poll_once(store: Store, sid: str, out=sys.stdout) -> int | None:
     """Pass on new End or Park requests, then the person's messages: claim, print and flush,
     then confirm. If printing fails (stdout closed as the session dies), release the claim
-    so the messages are delivered next time."""
-    state = state or State()
+    so the messages are delivered next time. Returns None once the session has gone."""
     session = store.session(sid)
+    if session is None:
+        print(GONE_TEXT, file=out, flush=True)
+        return None
     for what, text in REQUEST_TEXT.items():
-        asked = session[f"{what}_requested_at"] if session is not None else None
-        if asked and state.told.get(what) != asked:
-            print(text, file=out, flush=True)
-        state.told[what] = asked
+        asked = session[f"{what}_requested_at"]
+        if asked and session[f"{what}_told_at"] != asked and store.tell_request(sid, what, asked):
+            try:
+                print(text, file=out, flush=True)
+            except BaseException:
+                store.untell_request(sid, what)
+                raise
     msgs = store.claim(sid)
     shown = 0
     try:
@@ -60,7 +59,5 @@ def poll_once(store: Store, sid: str, out=sys.stdout, state: State | None = None
 def main(sid: str | None = None) -> None:
     sid = sid or os.environ["BOARD_SESSION_ID"]
     store = Store()
-    state = State()
-    while store.session(sid) is not None:
-        poll_once(store, sid, state=state)
+    while poll_once(store, sid) is not None:
         time.sleep(POLL_SECONDS)

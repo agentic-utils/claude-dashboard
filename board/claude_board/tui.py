@@ -1,5 +1,6 @@
 """The board itself: a Textual app. It only reads and writes the database."""
 
+import functools
 import math
 import os
 import sqlite3
@@ -24,7 +25,7 @@ from textual.widgets import (
 )
 
 from . import launch, liveness
-from .store import Store
+from .store import SessionGone, Store
 
 MATRIX = "#00ff41"
 SHIMMER = ["#ff2a6d", "#ff7b00", "#ffd300", "#05d9e8", "#7b61ff", "#d300c5"]
@@ -51,6 +52,22 @@ def shimmer(frame: int) -> Text:
     for i, ch in enumerate(TITLE):
         t.append(ch, style=f"bold {SHIMMER[(i + frame) // 2 % len(SHIMMER)]}")
     return t
+
+
+def session_action(method):
+    """Every action on a session goes through here. A session can end itself (or be ended
+    from elsewhere) at any moment, including while one of our dialogs is open: then say
+    so and repaint, rather than crash."""
+    @functools.wraps(method)
+    def guarded(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except (SessionGone, sqlite3.IntegrityError):
+            self.notify("session no longer exists", severity="warning")
+            if self.selected and self.store.session(self.selected[0]) is None:
+                self.selected = None
+            self.refresh_data()
+    return guarded
 
 
 def short(sid: str) -> str:
@@ -341,6 +358,7 @@ class BoardApp(App):
         if not isinstance(self.focused, (TextArea, Input)):
             self.query_one(TabbedContent).active = tab
 
+    @session_action
     def action_send(self) -> None:
         box = self.answer
         text = box.text.strip()
@@ -348,15 +366,7 @@ class BoardApp(App):
             self.notify("pick an item and type something first", severity="warning")
             return
         sid, ref = self.selected
-        try:
-            if self.store.session(sid) is None:
-                raise sqlite3.IntegrityError
-            self.store.send(sid, text, ref)
-        except sqlite3.IntegrityError:   # the session ended, possibly between the check and the write
-            self.notify(f"{ref}'s session has ended", severity="warning")
-            self.selected = None
-            self.paint_items()
-            return
+        self.store.send(sid, text, ref)
         box.text = ""
         self.notify(f"sent to {ref}")
         self.paint_items()
@@ -392,11 +402,19 @@ class BoardApp(App):
     def new_pressed(self) -> None:
         self.push_screen(NewSession(), self.launch_new)
 
-    def label(self, sid: str) -> str:
+    def row(self, sid: str):
+        """The session's row, or SessionGone: it can end at any moment (in-session /end)."""
         s = self.store.session(sid)
+        if s is None:
+            raise SessionGone(sid)
+        return s
+
+    def label(self, sid: str) -> str:
+        s = self.row(sid)
         return f"{s['name'] or os.path.basename(s['cwd'])} ({short(sid)}, {s['cwd']})"
 
     @on(Button.Pressed, "#restore")
+    @session_action
     def restore_pressed(self) -> None:
         sid = self.current_session()
         if not sid:
@@ -421,11 +439,12 @@ class BoardApp(App):
         self.push_screen(Confirm(f"Restore {len(dead)} dead session(s) in new tabs?"), go)
 
     @on(Button.Pressed, "#park")
+    @session_action
     def park_pressed(self) -> None:
         sid = self.current_session()
         if not sid:
             return
-        if self.store.session(sid)["parked"]:
+        if self.row(sid)["parked"]:
             self.store.set_parked(sid, False)
             self.refresh_data()
             return
@@ -434,6 +453,7 @@ class BoardApp(App):
                        act=f"Park {self.label(sid)}? It drops off the inbox and Restore all.")
 
     @on(Button.Pressed, "#end")
+    @session_action
     def end_pressed(self) -> None:
         sid = self.current_session()
         if sid:
@@ -444,16 +464,11 @@ class BoardApp(App):
     def lifecycle(self, sid: str, what: str, ask: str, act: str) -> None:
         """Park or End. A running session is only asked; a dead one is acted on at once."""
         if not self.running(sid):
-            self.push_screen(Confirm(act), lambda yes: yes and self.force(sid, what))
+            self.push_screen(Confirm(act), lambda yes: yes and self.act_on_dead(sid, what))
             return
-        pending = self.pending(self.store.session(sid))
+        pending = self.pending(self.row(sid))
         if pending is None:
-            def go(yes: bool) -> None:
-                if yes:
-                    self.store.request(sid, what)
-                    self.notify(f"asked the session to {what}")
-                    self.refresh_data()
-            self.push_screen(Confirm(ask), go)
+            self.push_screen(Confirm(ask), lambda yes: yes and self.ask(sid, what))
         elif pending != what:
             self.notify(f"the session has already been asked to {pending}: cancel that first",
                         severity="warning")
@@ -462,6 +477,23 @@ class BoardApp(App):
                                     "Cancel the request, or force it?"),
                              lambda choice: self.settle(sid, what, choice))
 
+    @session_action
+    def ask(self, sid: str, what: str) -> None:
+        self.store.request(sid, what)
+        self.notify(f"asked the session to {what}")
+        self.refresh_data()
+
+    @session_action
+    def act_on_dead(self, sid: str, what: str) -> None:
+        """The confirm may have sat open while the session came back: check again."""
+        if liveness.status(self.row(sid), waking=self.waking) in RUNNING:
+            self.notify(f"the session is running again: press {what.capitalize()} to ask it instead",
+                        severity="warning")
+            self.refresh_data()
+            return
+        self.force(sid, what)
+
+    @session_action
     def settle(self, sid: str, what: str, choice: str) -> None:
         if choice == "cancel":
             self.store.cancel_request(sid, what)
@@ -473,6 +505,7 @@ class BoardApp(App):
             self.push_screen(Confirm(f"Force {what} {self.label(sid)}? {warning}"),
                              lambda yes: yes and self.force(sid, what))
 
+    @session_action
     def force(self, sid: str, what: str) -> None:
         if what == "end":
             self.store.end(sid)
