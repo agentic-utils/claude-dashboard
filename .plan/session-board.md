@@ -75,13 +75,19 @@ and End treat it as live.
   monitor passes the request on, and Claude acts on it: for End it does its usual
   session-end memory save, then calls `end_session`; for Park it brings its items up to
   date, then calls `park_session`. The row shows parking or ending meanwhile. Pressing
-  the button again offers **Cancel** (clears the request and sends the session a "carry
-  on" message, in case it was already told) or **Force** (a second confirm naming the
+  the button again offers **Cancel** (clears the request; if the monitor had already
+  passed it on, recorded as `end_told_at` / `park_told_at`, the session also gets a
+  "carry on" message) or **Force** (a second confirm naming the
   session: Force end deletes the rows without the memory save, Force park sets the
   flag). One request at a time: the other button says to cancel the first.
 - **Park and End on a dead session act straight away**, after a confirm that names the
   session. Unpark is immediate. Any launch clears leftover requests, so a restored
   session is never told to end or park itself.
+- **A session can vanish at any moment** (an in-session `/end`, or Force from another
+  board), including while one of the board's dialogs is open. Every session action in
+  the TUI goes through one guard (`session_action`): if the row has gone it says
+  "session no longer exists" and repaints. The dead-session path re-checks liveness when
+  the confirm is answered: if the session came back, it acts on nothing.
 - **In-session `/park` and `/end`** are unchanged: the session saves what it needs, then
   acts on itself. Claude Code's own transcript is untouched either way.
 
@@ -183,6 +189,17 @@ a claim abandoned by a monitor killed mid-print is retaken after 30 s. Confirm a
 release touch only messages still under the caller's own claim, so a monitor whose claim
 was retaken can't confirm someone else's. A thread shown by `get_input(ref)` leaves out
 messages the monitor has claimed and is printing, so they aren't shown twice.
+
+One duplicate window is left, by design: a monitor stuck in `print` for over 30 s (Claude
+Code not reading its stdout) has its claim retaken by `get_input`, so when the stuck
+print finally completes the message has been shown twice. The old claimer's confirm is
+ignored, so the database stays right; the cost is one repeated line, in a case that
+needs Claude Code itself to stall.
+
+Writes check the session inside their transaction (`BEGIN IMMEDIATE` holds the write
+lock, so the row can't vanish between check and write) and raise `SessionGone` if it
+has gone. Board tools then answer "this session was force-ended on the board (or has
+ended): stop using board tools", and the monitor prints the same once and exits.
 
 `claude_board run` registers the session's pid, start time and boot id just before it
 execs Claude, as a compare-and-set that fails if another live Claude holds the session.
