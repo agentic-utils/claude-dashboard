@@ -2,6 +2,8 @@
 
 import math
 import os
+import sqlite3
+from datetime import datetime, timezone
 
 from rich.text import Text
 from textual import on
@@ -18,11 +20,10 @@ from .store import Store
 MATRIX = "#00ff41"
 SHIMMER = ["#ff2a6d", "#ff7b00", "#ffd300", "#05d9e8", "#7b61ff", "#d300c5"]
 STATUS_STYLE = {"live": "bold #00ff41", "stalled": "bold #ffd300", "starting": "#05d9e8",
-                "dead": "bold #ff2a6d", "parked": "#777777"}
+                "dead": "bold #ff2a6d", "parked": "#777777", "ending": "bold #d300c5"}
 TITLE = " ▓▒░ CLAUDE·BOARD ░▒▓ "
 RUNNING = ("live", "stalled", "starting")
-END_REQUEST = ("The person pressed End on the board. Do the session-end memory save, "
-               "then call end_session.")
+END_TIMEOUT = 120   # seconds a running session gets to end itself before End offers a force end
 
 
 def cylon(frame: int, width: int = 8) -> Text:
@@ -198,8 +199,19 @@ class BoardApp(App):
         self.waking = self.wake.tick()
         self.sessions = self.store.sessions()
         self.statuses = {s["id"]: liveness.status(s, waking=self.waking) for s in self.sessions}
+        # End was pressed but the session is gone before acting on it: finish the job
+        gone = [s["id"] for s in self.sessions
+                if s["end_requested_at"] and self.statuses[s["id"]] in ("dead", "parked")]
+        for sid in gone:
+            self.store.end(sid)
+        if gone:
+            self.sessions = [s for s in self.sessions if s["id"] not in gone]
         self.paint_sessions()
         self.paint_items()
+
+    def shown_status(self, s) -> str:
+        st = self.statuses.get(s["id"], "dead")
+        return "ending" if s["end_requested_at"] and st in RUNNING else st
 
     def busy(self, s) -> bool:
         return bool(s["running"]) and self.statuses.get(s["id"]) in ("live", "stalled")
@@ -218,7 +230,7 @@ class BoardApp(App):
             keep = table.cursor_row
             table.clear()
             for s in self.sessions:
-                st = self.statuses.get(s["id"], "dead")
+                st = self.shown_status(s)
                 if compact and st == "parked":
                     continue
                 busy = cylon(self.frame) if self.busy(s) else Text("")
@@ -295,12 +307,15 @@ class BoardApp(App):
             self.notify("pick an item and type something first", severity="warning")
             return
         sid, ref = self.selected
-        if self.store.session(sid) is None:
+        try:
+            if self.store.session(sid) is None:
+                raise sqlite3.IntegrityError
+            self.store.send(sid, text, ref)
+        except sqlite3.IntegrityError:   # the session ended, possibly between the check and the write
             self.notify(f"{ref}'s session has ended", severity="warning")
             self.selected = None
             self.paint_items()
             return
-        self.store.send(sid, text, ref)
         box.text = ""
         self.notify(f"sent to {ref}")
         self.paint_items()
@@ -375,16 +390,27 @@ class BoardApp(App):
         s = self.store.session(sid)
         label = f"{s['name'] or os.path.basename(s['cwd'])} ({short(sid)}, {s['cwd']})"
         running = self.statuses.get(sid) in RUNNING
+        asked = s["end_requested_at"]
+        if running and asked:
+            waited = (datetime.now(timezone.utc) - datetime.fromisoformat(asked)).total_seconds()
+            if waited < END_TIMEOUT:
+                self.notify(f"waiting for {label} to end itself; force end is offered after "
+                            f"{END_TIMEOUT // 60} min", severity="warning")
+                return
+            prompt = (f"Force end {label}? It hasn't responded for {int(waited // 60)} min. "
+                      "Deletes its board data now, without the memory save.")
+        elif running:
+            prompt = f"End {label}? It is running: Claude will save memory, then delete its board data."
+        else:
+            prompt = f"End {label} and delete its board data?"
 
         def go(yes: bool) -> None:
             if not yes:
                 return
-            if running:   # Claude saves memory, then deletes the rows itself
-                self.store.send(sid, END_REQUEST)
+            if running and not asked:   # Claude saves memory, then deletes the rows itself
+                self.store.request_end(sid)
                 self.notify("asked the session to save memory and end")
             else:
                 self.store.end(sid)
             self.refresh_data()
-        prompt = (f"End {label}? It is running: Claude will save memory, then delete its board data."
-                  if running else f"End {label} and delete its board data?")
         self.push_screen(Confirm(prompt), go)
