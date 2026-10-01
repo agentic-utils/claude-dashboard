@@ -71,9 +71,17 @@ also standalone: it only tracks sessions it launched, needs no global hooks, set
 writes the session row, then opens a Windows Terminal tab:
 
 ```
-wt.exe -w 0 new-tab --title <name> wsl.exe -d <distro> -u <user> --cd <dir> -- \
+cmd.exe /c wt.exe -w 0 new-tab --title <name> wsl.exe -d <distro> -u <user> --cd <dir> -- \
     <python> -m claude_board run <session-id>
 ```
+
+`wt.exe` is a Windows execution alias that WSL can't execute directly (it resolves on
+the `PATH` but does nothing), so it goes through `cmd.exe /c` as Microsoft's docs say.
+cmd re-parses the line, so its metacharacters are stripped from the title and refused
+in the directory. Each tab start is appended to `launch.log` next to the database.
+
+A directory Claude Code doesn't trust yet shows its trust prompt in the new tab; answer
+it there.
 
 Everything else is read from the database by `claude_board run`, which then execs:
 
@@ -169,7 +177,16 @@ Bringing the cache view in as a tab of the board is a later decision.
 | plugin skills are namespaced | true: `/<plugin>:<skill>` |
 | plugin monitors run for the whole session and their output reaches Claude as notifications | true (docs, components page) |
 | `-n, --name` | exists; sets the display name and terminal title |
-| `wt.exe new-tab --title`, `-w 0` | true (Microsoft docs). The docs say to call it through `cmd.exe /c` from WSL; on this machine `wt.exe` resolves directly on the WSL `PATH` |
+| `wt.exe new-tab --title`, `-w 0` | true (Microsoft docs) |
+| `wt.exe` callable directly from WSL | false: it is a 2-byte execution alias; `cmd.exe /c wt.exe` works |
+
+## Verified end to end
+
+A real session launched through `claude_board run` (headless, in a pty) registered its
+Claude process, started the monitor, posted `T1` through the MCP server, received a
+board message through the monitor while idle, acted on it, and deleted its own data
+with `end_session`. A launch through Windows Terminal reached `claude_board run` in the
+new tab (confirmed by `launch.log`).
 
 ## Open questions
 
