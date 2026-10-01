@@ -38,12 +38,13 @@ def update_item(ref: str, status: str | None = None, title: str | None = None,
 @server.tool()
 def get_input(ref: str | None = None) -> str:
     """Without ref: the person's undelivered messages (marked delivered).
-    With ref: that item's full body and thread."""
+    With ref: that item's full body and thread (its messages count as delivered)."""
     s = _store
     if ref:
         item = s.item(_sid, ref)
         if item is None:
             return f"no item {ref}"
+        s.take_pending(_sid, ref)   # shown in the thread below, so the monitor mustn't repeat them
         lines = [f"{ref} [{item['status']}] {item['title']}", item["body"], ""]
         lines += [f"{m['author']} @ {m['created_at']}: {m['body']}" for m in s.thread(_sid, ref)]
         return "\n".join(lines)

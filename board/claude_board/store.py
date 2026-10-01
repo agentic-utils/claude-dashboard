@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DEFAULT_DB = Path.home() / ".local/state/claude-board/board.db"
@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     claude_pid   INTEGER,
     claude_start INTEGER,
     boot_id      TEXT,
-    heartbeat_at TEXT
+    heartbeat_at TEXT,
+    end_requested_at TEXT
 );
 CREATE TABLE IF NOT EXISTS items (
     id         INTEGER PRIMARY KEY,
@@ -58,11 +59,16 @@ CREATE TABLE IF NOT EXISTS messages (
     author       TEXT NOT NULL CHECK (author IN ('claude', 'person')),
     body         TEXT NOT NULL,
     created_at   TEXT NOT NULL,
+    claimed_at   TEXT,
     delivered_at TEXT
 );
 CREATE INDEX IF NOT EXISTS messages_pending
     ON messages (session_id) WHERE delivered_at IS NULL;
 """
+
+# columns added after the first release: (table, column, type)
+ADDED_COLUMNS = [("sessions", "end_requested_at", "TEXT"), ("messages", "claimed_at", "TEXT")]
+CLAIM_TIMEOUT = 30   # seconds before a claim from a monitor that died mid-print is retaken
 
 
 def now() -> str:
@@ -87,6 +93,9 @@ class Store:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript(SCHEMA)
+        for table, column, kind in ADDED_COLUMNS:
+            if column not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
         # one connection, possibly many threads (the MCP server runs tools in worker threads)
         self.lock = threading.RLock()
 
@@ -134,15 +143,36 @@ class Store:
         )
 
     def mark_launched(self, sid: str) -> None:
+        """A (re)launch also drops any end request left over from the last run."""
         with self.tx() as db:
-            db.execute("UPDATE sessions SET launched_at = ? WHERE id = ?", (now(), sid))
+            db.execute("UPDATE sessions SET launched_at = ?, end_requested_at = NULL WHERE id = ?", (now(), sid))
 
     def register(self, sid: str, pid: int, start: int, boot_id: str) -> None:
         with self.tx() as db:
-            db.execute(
-                "UPDATE sessions SET claude_pid = ?, claude_start = ?, boot_id = ?, heartbeat_at = ? WHERE id = ?",
-                (pid, start, boot_id, now(), sid),
-            )
+            self._register(db, sid, pid, start, boot_id)
+
+    def register_if_free(self, sid: str, pid: int, start: int, boot_id: str, is_alive) -> bool:
+        """Compare-and-set: register only if no live Claude holds the session. One
+        transaction, so two tabs racing to start the same session can't both win."""
+        with self.tx() as db:
+            s = db.execute("SELECT claude_pid, claude_start, boot_id FROM sessions WHERE id = ?", (sid,)).fetchone()
+            if s is None or is_alive(s["claude_pid"], s["claude_start"], s["boot_id"]):
+                return False
+            self._register(db, sid, pid, start, boot_id)
+        return True
+
+    @staticmethod
+    def _register(db, sid, pid, start, boot_id) -> None:
+        db.execute(
+            "UPDATE sessions SET claude_pid = ?, claude_start = ?, boot_id = ?, heartbeat_at = ? WHERE id = ?",
+            (pid, start, boot_id, now(), sid),
+        )
+
+    def request_end(self, sid: str) -> None:
+        """The person pressed End on a running session; its monitor passes this on."""
+        with self.tx() as db:
+            db.execute("UPDATE sessions SET end_requested_at = coalesce(end_requested_at, ?) WHERE id = ?",
+                       (now(), sid))
 
     def heartbeat(self, sid: str) -> None:
         with self.tx() as db:
@@ -230,15 +260,37 @@ class Store:
             "SELECT * FROM messages WHERE session_id = ? AND delivered_at IS NULL ORDER BY id", (sid,)
         )
 
-    def take_pending(self, sid: str) -> list[sqlite3.Row]:
-        """Read and mark delivered in one transaction, so the monitor and get_input()
-        can never both hand Claude the same message."""
+    def claim(self, sid: str, item_ref: str | None = None) -> list[sqlite3.Row]:
+        """Claim undelivered messages in one transaction, so the monitor and get_input()
+        never both hand Claude the same one. The claimer confirms or releases them; a claim
+        left by a monitor that died mid-print is retaken after CLAIM_TIMEOUT."""
+        stale = (datetime.now(timezone.utc) - timedelta(seconds=CLAIM_TIMEOUT)).isoformat(timespec="seconds")
         with self.tx() as db:
             rows = db.execute(
-                """UPDATE messages SET delivered_at = ? WHERE session_id = ? AND delivered_at IS NULL
-                   RETURNING *""", (now(), sid)
+                """UPDATE messages SET claimed_at = ? WHERE session_id = ? AND delivered_at IS NULL
+                   AND (claimed_at IS NULL OR claimed_at < ?) AND (? IS NULL OR item_ref = ?)
+                   RETURNING *""", (now(), sid, stale, item_ref, item_ref)
             ).fetchall()
         return sorted(rows, key=lambda m: m["id"])   # RETURNING order is unspecified
+
+    def confirm(self, ids) -> None:
+        self._mark(ids, "delivered_at = ?", (now(),))
+
+    def release(self, ids) -> None:
+        self._mark(ids, "claimed_at = NULL", ())
+
+    def _mark(self, ids, assignment: str, params) -> None:
+        ids = list(ids)
+        if ids:
+            with self.tx() as db:
+                db.execute(f"UPDATE messages SET {assignment} WHERE id IN ({','.join('?' * len(ids))})",
+                           (*params, *ids))
+
+    def take_pending(self, sid: str, item_ref: str | None = None) -> list[sqlite3.Row]:
+        """Claim and confirm in one go, for a caller that can't fail to show them."""
+        rows = self.claim(sid, item_ref)
+        self.confirm(m["id"] for m in rows)
+        return rows
 
     def thread(self, sid: str, ref: str) -> list[sqlite3.Row]:
         return self._all(

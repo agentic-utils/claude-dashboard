@@ -5,6 +5,7 @@ person as one line. Claude Code delivers each printed line to Claude as a notifi
 import os
 import sys
 import time
+from dataclasses import dataclass
 
 from .store import Store
 
@@ -20,16 +21,39 @@ def format_message(m) -> str:
     return f"[board] from the person {where}: {body}"
 
 
-def poll_once(store: Store, sid: str, out=sys.stdout) -> int:
-    msgs = store.take_pending(sid)
-    for m in msgs:
-        print(format_message(m), file=out, flush=True)
-    return len(msgs)
+END_REQUEST = ("[board] The person pressed End on the board. Do the session-end memory save, "
+               "then call end_session.")
+
+
+@dataclass
+class State:
+    told_end: bool = False
+
+
+def poll_once(store: Store, sid: str, out=sys.stdout, state: State | None = None) -> int:
+    """Claim, print and flush, then confirm. If printing fails (stdout closed as the
+    session dies), release the claim so the messages are delivered next time."""
+    state = state or State()
+    session = store.session(sid)
+    if session is not None and session["end_requested_at"] and not state.told_end:
+        print(END_REQUEST, file=out, flush=True)
+        state.told_end = True
+    msgs = store.claim(sid)
+    shown = 0
+    try:
+        for m in msgs:
+            print(format_message(m), file=out, flush=True)
+            shown += 1
+    finally:
+        store.confirm(m["id"] for m in msgs[:shown])
+        store.release(m["id"] for m in msgs[shown:])
+    return shown
 
 
 def main(sid: str | None = None) -> None:
     sid = sid or os.environ["BOARD_SESSION_ID"]
     store = Store()
+    state = State()
     while store.session(sid) is not None:
-        poll_once(store, sid)
+        poll_once(store, sid, state=state)
         time.sleep(POLL_SECONDS)
