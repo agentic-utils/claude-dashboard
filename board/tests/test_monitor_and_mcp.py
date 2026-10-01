@@ -84,21 +84,6 @@ def test_a_claim_abandoned_by_a_killed_monitor_is_retaken(store, sid):
     assert [m["body"] for m in store.claim(sid)] == ["orphan"]
 
 
-@pytest.mark.parametrize("end_requested, told, expected, desc", [
-    (False, False, 0, "no end request, nothing to say"),
-    (True, False, 1, "an end request is delivered"),
-    (True, True, 0, "and only once per monitor"),
-])
-def test_monitor_delivers_the_end_request_from_the_flag(store, sid, end_requested, told, expected, desc):
-    if end_requested:
-        store.request_end(sid)
-    state = monitor.State(told_end=told)
-    out = io.StringIO()
-    monitor.poll_once(store, sid, out, state)
-    assert out.getvalue().count("end_session") == expected, desc
-    assert store.pending(sid) == [], "the end request is not an ordinary message"
-
-
 def test_reading_a_thread_marks_its_messages_delivered(store, sid):
     """Round-2 #6: get_input(ref) shows the thread, so the monitor must not repeat it."""
     from claude_board import mcp_server

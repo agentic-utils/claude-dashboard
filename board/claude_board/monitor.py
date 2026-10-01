@@ -5,7 +5,7 @@ person as one line. Claude Code delivers each printed line to Claude as a notifi
 import os
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .store import Store
 
@@ -21,23 +21,30 @@ def format_message(m) -> str:
     return f"[board] from the person {where}: {body}"
 
 
-END_REQUEST = ("[board] The person pressed End on the board. Do the session-end memory save, "
-               "then call end_session.")
+REQUEST_TEXT = {
+    "end": "[board] The person pressed End on the board. Do the session-end memory save, "
+           "then call end_session.",
+    "park": "[board] The person pressed Park on the board. Bring your board items up to date, "
+            "then call park_session.",
+}
 
 
 @dataclass
 class State:
-    told_end: bool = False
+    told: dict = field(default_factory=dict)   # request -> the request stamp already passed on
 
 
 def poll_once(store: Store, sid: str, out=sys.stdout, state: State | None = None) -> int:
-    """Claim, print and flush, then confirm. If printing fails (stdout closed as the
-    session dies), release the claim so the messages are delivered next time."""
+    """Pass on new End or Park requests, then the person's messages: claim, print and flush,
+    then confirm. If printing fails (stdout closed as the session dies), release the claim
+    so the messages are delivered next time."""
     state = state or State()
     session = store.session(sid)
-    if session is not None and session["end_requested_at"] and not state.told_end:
-        print(END_REQUEST, file=out, flush=True)
-        state.told_end = True
+    for what, text in REQUEST_TEXT.items():
+        asked = session[f"{what}_requested_at"] if session is not None else None
+        if asked and state.told.get(what) != asked:
+            print(text, file=out, flush=True)
+        state.told[what] = asked
     msgs = store.claim(sid)
     shown = 0
     try:
@@ -45,8 +52,8 @@ def poll_once(store: Store, sid: str, out=sys.stdout, state: State | None = None
             print(format_message(m), file=out, flush=True)
             shown += 1
     finally:
-        store.confirm(m["id"] for m in msgs[:shown])
-        store.release(m["id"] for m in msgs[shown:])
+        store.confirm(msgs[:shown])
+        store.release(msgs[shown:])
     return shown
 
 

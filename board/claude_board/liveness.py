@@ -37,10 +37,9 @@ def is_alive(pid, start, boot, proc: Path = PROC) -> bool:
 
 
 def status(session, *, now: datetime | None = None, waking: bool = False, proc: Path = PROC) -> str:
-    """One of: parked, live, stalled, starting, dead."""
+    """One of: live, stalled, starting, dead. Always from the process: being parked is
+    a separate flag and never hides whether a session is running."""
     now = now or datetime.now(timezone.utc)
-    if session["parked"]:
-        return "parked"
     if is_alive(session["claude_pid"], session["claude_start"], session["boot_id"], proc):
         beat = session["heartbeat_at"]
         if not waking and beat and (now - datetime.fromisoformat(beat)).total_seconds() > STALLED_AFTER:

@@ -36,7 +36,7 @@ def session(**over):
     ({}, False, "live", "process running, fresh heartbeat"),
     ({"heartbeat_at": ago(600)}, False, "stalled", "running but quiet"),
     ({"heartbeat_at": ago(600)}, True, "live", "quiet just after waking from sleep"),
-    ({"parked": 1}, False, "parked", "parked wins"),
+    ({"parked": 1}, False, "live", "a parked flag never hides a running process"),
     ({"claude_start": 999}, False, "dead", "pid reused by another process"),
     ({"boot_id": "boot-old"}, False, "dead", "machine rebooted"),
     ({"claude_pid": 9999}, False, "dead", "process gone"),

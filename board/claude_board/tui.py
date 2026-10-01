@@ -3,7 +3,6 @@
 import math
 import os
 import sqlite3
-from datetime import datetime, timezone
 
 from rich.text import Text
 from textual import on
@@ -11,8 +10,18 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import (Button, DataTable, Footer, Input, Label, Markdown, Static,
-                             TabbedContent, TabPane, TextArea)
+from textual.widgets import (
+    Button,
+    DataTable,
+    Footer,
+    Input,
+    Label,
+    Markdown,
+    Static,
+    TabbedContent,
+    TabPane,
+    TextArea,
+)
 
 from . import launch, liveness
 from .store import Store
@@ -20,10 +29,10 @@ from .store import Store
 MATRIX = "#00ff41"
 SHIMMER = ["#ff2a6d", "#ff7b00", "#ffd300", "#05d9e8", "#7b61ff", "#d300c5"]
 STATUS_STYLE = {"live": "bold #00ff41", "stalled": "bold #ffd300", "starting": "#05d9e8",
-                "dead": "bold #ff2a6d", "parked": "#777777", "ending": "bold #d300c5"}
+                "dead": "bold #ff2a6d", "ending": "bold #d300c5", "parking": "bold #d300c5"}
 TITLE = " ▓▒░ CLAUDE·BOARD ░▒▓ "
 RUNNING = ("live", "stalled", "starting")
-END_TIMEOUT = 120   # seconds a running session gets to end itself before End offers a force end
+PENDING = {"end": "ending", "park": "parking"}
 
 
 def cylon(frame: int, width: int = 8) -> Text:
@@ -98,6 +107,32 @@ class Confirm(ModalScreen):
         self.dismiss(event.button.id == "yes")
 
 
+class Choice(ModalScreen):
+    """A pending request: cancel it, force it, or leave it be."""
+
+    def __init__(self, prompt: str):
+        super().__init__()
+        self.prompt = prompt
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog"):
+            yield Label(self.prompt)
+            with Horizontal(classes="buttons"):
+                yield Button("[C]ancel request", variant="success", id="cancel")
+                yield Button("[F]orce", variant="error", id="force")
+                yield Button("Leave it [Esc]", id="leave")
+
+    def on_key(self, event) -> None:
+        keys = {"c": "cancel", "f": "force", "escape": "leave"}
+        if event.key in keys:
+            event.stop()
+            self.dismiss(keys[event.key])
+
+    @on(Button.Pressed)
+    def pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id)
+
+
 class BoardApp(App):
     CSS = f"""
     Screen {{ background: #0a0a12; }}
@@ -120,7 +155,7 @@ class BoardApp(App):
     .dialog-title {{ color: #ffd300; text-style: bold; }}
     #dialog TextArea {{ height: 8; }}
     .buttons {{ height: 3; }}
-    NewSession, Confirm {{ align: center middle; }}
+    NewSession, Confirm, Choice {{ align: center middle; }}
     """
 
     BINDINGS = [
@@ -198,20 +233,23 @@ class BoardApp(App):
     def refresh_data(self) -> None:
         self.waking = self.wake.tick()
         self.sessions = self.store.sessions()
+        # liveness only: the board never deletes or parks anything by itself
         self.statuses = {s["id"]: liveness.status(s, waking=self.waking) for s in self.sessions}
-        # End was pressed but the session is gone before acting on it: finish the job
-        gone = [s["id"] for s in self.sessions
-                if s["end_requested_at"] and self.statuses[s["id"]] in ("dead", "parked")]
-        for sid in gone:
-            self.store.end(sid)
-        if gone:
-            self.sessions = [s for s in self.sessions if s["id"] not in gone]
         self.paint_sessions()
         self.paint_items()
 
+    def running(self, sid: str) -> bool:
+        return self.statuses.get(sid) in RUNNING
+
+    @staticmethod
+    def pending(s) -> str | None:
+        """The request (end or park) a session has been asked to act on, if any."""
+        return next((what for what in PENDING if s[f"{what}_requested_at"]), None)
+
     def shown_status(self, s) -> str:
         st = self.statuses.get(s["id"], "dead")
-        return "ending" if s["end_requested_at"] and st in RUNNING else st
+        what = self.pending(s)
+        return PENDING[what] if what and st in RUNNING else st
 
     def busy(self, s) -> bool:
         return bool(s["running"]) and self.statuses.get(s["id"]) in ("live", "stalled")
@@ -231,16 +269,19 @@ class BoardApp(App):
             table.clear()
             for s in self.sessions:
                 st = self.shown_status(s)
-                if compact and st == "parked":
+                if compact and s["parked"]:
                     continue
                 busy = cylon(self.frame) if self.busy(s) else Text("")
                 dot = Text("●", style=STATUS_STYLE[st])
+                label = Text(st, style=STATUS_STYLE[st])
+                if s["parked"]:
+                    label.append(" · parked", style="#777777")
                 name = s["name"] or os.path.basename(s["cwd"]) or short(s["id"])
                 if compact:
                     q = Text(str(s["open_questions"]), style="bold #ffd300 blink") if s["open_questions"] else ""
                     table.add_row(dot, name, q, busy, key=s["id"])
                 else:
-                    table.add_row(Text(st, style=STATUS_STYLE[st]), name, s["ticket"], s["cwd"],
+                    table.add_row(label, name, s["ticket"], s["cwd"],
                                   str(s["open_questions"]), str(s["running"]), busy, key=s["id"])
             if table.row_count:
                 table.move_cursor(row=min(keep, table.row_count - 1), animate=False)
@@ -351,20 +392,24 @@ class BoardApp(App):
     def new_pressed(self) -> None:
         self.push_screen(NewSession(), self.launch_new)
 
+    def label(self, sid: str) -> str:
+        s = self.store.session(sid)
+        return f"{s['name'] or os.path.basename(s['cwd'])} ({short(sid)}, {s['cwd']})"
+
     @on(Button.Pressed, "#restore")
     def restore_pressed(self) -> None:
         sid = self.current_session()
         if not sid:
             return
-        if self.statuses.get(sid) not in ("dead", "parked"):
-            self.notify("only dead or parked sessions can be restored", severity="warning")
+        if self.statuses.get(sid) != "dead":
+            self.notify("only a dead session can be restored", severity="warning")
             return
         if self.open_tab(sid):
             self.store.set_parked(sid, False)
 
     @on(Button.Pressed, "#restore-all")
     def restore_all_pressed(self) -> None:
-        dead = [s["id"] for s in self.sessions if self.statuses.get(s["id"]) == "dead"]
+        dead = [s["id"] for s in self.sessions if self.statuses.get(s["id"]) == "dead" and not s["parked"]]
         if not dead:
             self.notify("nothing to restore")
             return
@@ -378,39 +423,59 @@ class BoardApp(App):
     @on(Button.Pressed, "#park")
     def park_pressed(self) -> None:
         sid = self.current_session()
-        if sid:
-            self.store.set_parked(sid, self.statuses.get(sid) != "parked")
+        if not sid:
+            return
+        if self.store.session(sid)["parked"]:
+            self.store.set_parked(sid, False)
             self.refresh_data()
+            return
+        self.lifecycle(sid, "park",
+                       ask=f"Ask {self.label(sid)} to park? It brings its items up to date, then parks.",
+                       act=f"Park {self.label(sid)}? It drops off the inbox and Restore all.")
 
     @on(Button.Pressed, "#end")
     def end_pressed(self) -> None:
         sid = self.current_session()
-        if not sid:
-            return
-        s = self.store.session(sid)
-        label = f"{s['name'] or os.path.basename(s['cwd'])} ({short(sid)}, {s['cwd']})"
-        running = self.statuses.get(sid) in RUNNING
-        asked = s["end_requested_at"]
-        if running and asked:
-            waited = (datetime.now(timezone.utc) - datetime.fromisoformat(asked)).total_seconds()
-            if waited < END_TIMEOUT:
-                self.notify(f"waiting for {label} to end itself; force end is offered after "
-                            f"{END_TIMEOUT // 60} min", severity="warning")
-                return
-            prompt = (f"Force end {label}? It hasn't responded for {int(waited // 60)} min. "
-                      "Deletes its board data now, without the memory save.")
-        elif running:
-            prompt = f"End {label}? It is running: Claude will save memory, then delete its board data."
-        else:
-            prompt = f"End {label} and delete its board data?"
+        if sid:
+            self.lifecycle(sid, "end",
+                           ask=f"Ask {self.label(sid)} to end? Claude saves memory, then deletes its board data.",
+                           act=f"End {self.label(sid)} and delete its board data?")
 
-        def go(yes: bool) -> None:
-            if not yes:
-                return
-            if running and not asked:   # Claude saves memory, then deletes the rows itself
-                self.store.request_end(sid)
-                self.notify("asked the session to save memory and end")
-            else:
-                self.store.end(sid)
+    def lifecycle(self, sid: str, what: str, ask: str, act: str) -> None:
+        """Park or End. A running session is only asked; a dead one is acted on at once."""
+        if not self.running(sid):
+            self.push_screen(Confirm(act), lambda yes: yes and self.force(sid, what))
+            return
+        pending = self.pending(self.store.session(sid))
+        if pending is None:
+            def go(yes: bool) -> None:
+                if yes:
+                    self.store.request(sid, what)
+                    self.notify(f"asked the session to {what}")
+                    self.refresh_data()
+            self.push_screen(Confirm(ask), go)
+        elif pending != what:
+            self.notify(f"the session has already been asked to {pending}: cancel that first",
+                        severity="warning")
+        else:
+            self.push_screen(Choice(f"{self.label(sid)} has been asked to {what} and hasn't yet. "
+                                    "Cancel the request, or force it?"),
+                             lambda choice: self.settle(sid, what, choice))
+
+    def settle(self, sid: str, what: str, choice: str) -> None:
+        if choice == "cancel":
+            self.store.cancel_request(sid, what)
+            self.notify(f"{what} request cancelled")
             self.refresh_data()
-        self.push_screen(Confirm(prompt), go)
+        elif choice == "force":
+            warning = ("Deletes its board data now, without the memory save." if what == "end"
+                       else "Parks it now; it is still running.")
+            self.push_screen(Confirm(f"Force {what} {self.label(sid)}? {warning}"),
+                             lambda yes: yes and self.force(sid, what))
+
+    def force(self, sid: str, what: str) -> None:
+        if what == "end":
+            self.store.end(sid)
+        else:
+            self.store.set_parked(sid, True)
+        self.refresh_data()

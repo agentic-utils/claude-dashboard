@@ -46,7 +46,9 @@ def get_input(ref: str | None = None) -> str:
             return f"no item {ref}"
         s.take_pending(_sid, ref)   # shown in the thread below, so the monitor mustn't repeat them
         lines = [f"{ref} [{item['status']}] {item['title']}", item["body"], ""]
-        lines += [f"{m['author']} @ {m['created_at']}: {m['body']}" for m in s.thread(_sid, ref)]
+        # leave out what the monitor has claimed and is printing right now
+        lines += [f"{m['author']} @ {m['created_at']}: {m['body']}"
+                  for m in s.thread(_sid, ref, in_flight=False)]
         return "\n".join(lines)
     msgs = s.take_pending(_sid)
     return "\n\n".join(f"[{m['item_ref'] or 'general'}] {m['body']}" for m in msgs) or "nothing new"

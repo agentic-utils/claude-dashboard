@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     claude_start INTEGER,
     boot_id      TEXT,
     heartbeat_at TEXT,
-    end_requested_at TEXT
+    end_requested_at  TEXT,
+    park_requested_at TEXT
 );
 CREATE TABLE IF NOT EXISTS items (
     id         INTEGER PRIMARY KEY,
@@ -67,12 +68,19 @@ CREATE INDEX IF NOT EXISTS messages_pending
 """
 
 # columns added after the first release: (table, column, type)
-ADDED_COLUMNS = [("sessions", "end_requested_at", "TEXT"), ("messages", "claimed_at", "TEXT")]
+ADDED_COLUMNS = [("sessions", "end_requested_at", "TEXT"), ("sessions", "park_requested_at", "TEXT"),
+                 ("messages", "claimed_at", "TEXT")]
+REQUESTS = ("end", "park")   # what the board can ask a running session to do
 CLAIM_TIMEOUT = 30   # seconds before a claim from a monitor that died mid-print is retaken
 
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def stamp() -> str:
+    """A precise timestamp: tells one claim or request from the next within a second."""
+    return datetime.now(timezone.utc).isoformat(timespec="microseconds")
 
 
 def db_path() -> Path:
@@ -92,12 +100,15 @@ class Store:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.executescript(SCHEMA)
-        for table, column, kind in ADDED_COLUMNS:
-            if column not in {r[1] for r in self.db.execute(f"PRAGMA table_info({table})")}:
-                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
         # one connection, possibly many threads (the MCP server runs tools in worker threads)
         self.lock = threading.RLock()
+        with self.tx() as db:   # one transaction, so processes starting together can't both migrate
+            for statement in SCHEMA.split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            for table, column, kind in ADDED_COLUMNS:
+                if column not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
+                    db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
 
     @contextmanager
     def tx(self):
@@ -143,9 +154,10 @@ class Store:
         )
 
     def mark_launched(self, sid: str) -> None:
-        """A (re)launch also drops any end request left over from the last run."""
+        """A (re)launch also drops any request left over from the last run."""
         with self.tx() as db:
-            db.execute("UPDATE sessions SET launched_at = ?, end_requested_at = NULL WHERE id = ?", (now(), sid))
+            db.execute("""UPDATE sessions SET launched_at = ?, end_requested_at = NULL,
+                          park_requested_at = NULL WHERE id = ?""", (now(), sid))
 
     def register(self, sid: str, pid: int, start: int, boot_id: str) -> None:
         with self.tx() as db:
@@ -169,18 +181,37 @@ class Store:
         )
 
     def request_end(self, sid: str) -> None:
-        """The person pressed End on a running session; its monitor passes this on."""
+        self.request(sid, "end")
+
+    def request_park(self, sid: str) -> None:
+        self.request(sid, "park")
+
+    def request(self, sid: str, what: str) -> None:
+        """The person pressed End or Park on a running session; its monitor passes this on.
+        Nothing happens to the data until the session acts, or the person forces it."""
+        assert what in REQUESTS
         with self.tx() as db:
-            db.execute("UPDATE sessions SET end_requested_at = coalesce(end_requested_at, ?) WHERE id = ?",
-                       (now(), sid))
+            db.execute(f"UPDATE sessions SET {what}_requested_at = coalesce({what}_requested_at, ?) "
+                       "WHERE id = ?", (stamp(), sid))
+
+    def cancel_request(self, sid: str, what: str) -> None:
+        """Clear a request and tell the session to carry on, in case it was already told."""
+        assert what in REQUESTS
+        with self.tx() as db:
+            db.execute(f"UPDATE sessions SET {what}_requested_at = NULL WHERE id = ?", (sid,))
+            db.execute(
+                "INSERT INTO messages (session_id, author, body, created_at) VALUES (?, 'person', ?, ?)",
+                (sid, f"The person cancelled the {what} request: carry on as before.", now()),
+            )
 
     def heartbeat(self, sid: str) -> None:
         with self.tx() as db:
             db.execute("UPDATE sessions SET heartbeat_at = ? WHERE id = ?", (now(), sid))
 
     def set_parked(self, sid: str, parked: bool) -> None:
+        """Parking (by the session or by force) also settles any pending park request."""
         with self.tx() as db:
-            db.execute("UPDATE sessions SET parked = ? WHERE id = ?", (int(parked), sid))
+            db.execute("UPDATE sessions SET parked = ?, park_requested_at = NULL WHERE id = ?", (int(parked), sid))
 
     def end(self, sid: str) -> None:
         with self.tx() as db:
@@ -264,37 +295,42 @@ class Store:
         """Claim undelivered messages in one transaction, so the monitor and get_input()
         never both hand Claude the same one. The claimer confirms or releases them; a claim
         left by a monitor that died mid-print is retaken after CLAIM_TIMEOUT."""
-        stale = (datetime.now(timezone.utc) - timedelta(seconds=CLAIM_TIMEOUT)).isoformat(timespec="seconds")
+        stale = (datetime.now(timezone.utc) - timedelta(seconds=CLAIM_TIMEOUT)).isoformat(timespec="microseconds")
         with self.tx() as db:
             rows = db.execute(
                 """UPDATE messages SET claimed_at = ? WHERE session_id = ? AND delivered_at IS NULL
                    AND (claimed_at IS NULL OR claimed_at < ?) AND (? IS NULL OR item_ref = ?)
-                   RETURNING *""", (now(), sid, stale, item_ref, item_ref)
+                   RETURNING *""", (stamp(), sid, stale, item_ref, item_ref)
             ).fetchall()
         return sorted(rows, key=lambda m: m["id"])   # RETURNING order is unspecified
 
-    def confirm(self, ids) -> None:
-        self._mark(ids, "delivered_at = ?", (now(),))
+    def confirm(self, claimed) -> None:
+        """Mark claimed messages delivered. Only touches a message still under this claim:
+        if it was retaken as stale, the new claimer confirms it."""
+        self._mark(claimed, "delivered_at = ?", (now(),))
 
-    def release(self, ids) -> None:
-        self._mark(ids, "claimed_at = NULL", ())
+    def release(self, claimed) -> None:
+        self._mark(claimed, "claimed_at = NULL", ())
 
-    def _mark(self, ids, assignment: str, params) -> None:
-        ids = list(ids)
-        if ids:
-            with self.tx() as db:
-                db.execute(f"UPDATE messages SET {assignment} WHERE id IN ({','.join('?' * len(ids))})",
-                           (*params, *ids))
+    def _mark(self, claimed, assignment: str, params) -> None:
+        with self.tx() as db:
+            for m in claimed:
+                db.execute(f"UPDATE messages SET {assignment} WHERE id = ? AND claimed_at = ?",
+                           (*params, m["id"], m["claimed_at"]))
 
     def take_pending(self, sid: str, item_ref: str | None = None) -> list[sqlite3.Row]:
         """Claim and confirm in one go, for a caller that can't fail to show them."""
         rows = self.claim(sid, item_ref)
-        self.confirm(m["id"] for m in rows)
+        self.confirm(rows)
         return rows
 
-    def thread(self, sid: str, ref: str) -> list[sqlite3.Row]:
+    def thread(self, sid: str, ref: str, in_flight: bool = True) -> list[sqlite3.Row]:
+        """An item's messages. in_flight=False leaves out ones another reader has claimed
+        but not yet delivered: the monitor is printing those."""
         return self._all(
-            "SELECT * FROM messages WHERE session_id = ? AND item_ref = ? ORDER BY id", (sid, ref)
+            """SELECT * FROM messages WHERE session_id = ? AND item_ref = ?
+               AND (? OR delivered_at IS NOT NULL OR claimed_at IS NULL) ORDER BY id""",
+            (sid, ref, in_flight),
         )
 
 
