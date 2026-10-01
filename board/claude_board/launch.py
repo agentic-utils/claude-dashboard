@@ -62,7 +62,9 @@ def opening_prompt(session) -> str:
     if session["ticket"]:
         lines.append(f"Ticket: {session['ticket']}")
     lines.append(session["brief"] or "Session started from the board. Wait for instructions.")
-    return "\n\n".join(lines)
+    prompt = "\n\n".join(lines)
+    # claude reads a leading "-" as an option ("unknown option"), e.g. a pasted bullet list
+    return f"Brief:\n{prompt}" if prompt.startswith("-") else prompt
 
 
 def open_tab(store: Store, sid: str) -> None:
@@ -75,9 +77,12 @@ def open_tab(store: Store, sid: str) -> None:
     argv = wt_argv(session, python=sys.executable,
                    distro=os.environ.get("WSL_DISTRO_NAME", "Ubuntu"), user=getpass.getuser())
     store.mark_launched(sid)
-    # cmd.exe warns about (and ignores) a \\wsl$ working directory, so start it from C:
-    subprocess.Popen(argv, cwd="/mnt/c", stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
+    # cmd.exe or wt.exe failing would otherwise be invisible: keep their output
+    with open(store.path.parent / "launch.log", "a") as log:
+        print(now(), sid, "launching", " ".join(argv), file=log, flush=True)
+        # cmd.exe warns about (and ignores) a \\wsl$ working directory, so start it from C:
+        subprocess.Popen(argv, cwd="/mnt/c", stdin=subprocess.DEVNULL, stdout=log,
+                         stderr=subprocess.STDOUT, start_new_session=True)
 
 
 def run(sid: str) -> None:
@@ -94,4 +99,8 @@ def run(sid: str) -> None:
     argv = claude_argv(session, python=sys.executable, resume=resume)
     with open(store.path.parent / "launch.log", "a") as log:   # a tab that dies on start leaves this behind
         print(now(), sid, "resume" if resume else "new", session["cwd"], file=log)
+    # exec keeps this pid, so it is Claude's: registering now leaves no window (trust prompt,
+    # slow MCP start) in which a live session looks dead and could be restored twice
+    pid = os.getpid()
+    store.register(sid, pid, liveness.start_time(pid), liveness.boot_id())
     os.execvpe("claude", argv, env)

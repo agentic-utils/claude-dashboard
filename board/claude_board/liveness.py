@@ -30,30 +30,6 @@ def start_time(pid: int, proc: Path = PROC) -> int | None:
     return int(stat.rsplit(")", 1)[1].split()[19])
 
 
-def comm(pid: int, proc: Path = PROC) -> str:
-    try:
-        return (proc / str(pid) / "comm").read_text().strip()
-    except OSError:
-        return ""
-
-
-def parent(pid: int, proc: Path = PROC) -> int | None:
-    try:
-        stat = (proc / str(pid) / "stat").read_text()
-    except OSError:
-        return None
-    return int(stat.rsplit(")", 1)[1].split()[1])
-
-
-def find_claude(pid: int, proc: Path = PROC) -> int | None:
-    """Walk up from pid to the nearest ancestor that is the Claude Code process."""
-    while pid and pid > 1:
-        if comm(pid, proc).startswith("claude"):
-            return pid
-        pid = parent(pid, proc)
-    return None
-
-
 def is_alive(pid, start, boot, proc: Path = PROC) -> bool:
     if not pid or start is None or boot != boot_id(proc):
         return False

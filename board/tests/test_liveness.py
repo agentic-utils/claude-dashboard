@@ -49,10 +49,6 @@ def test_status(proc, over, waking, expected, desc):
     assert liveness.status(session(**over), now=NOW, waking=waking, proc=proc) == expected, desc
 
 
-def test_find_claude_walks_up_to_the_claude_process(proc):
-    assert liveness.find_claude(4243, proc) == 4242
-
-
 @pytest.mark.parametrize("steps, expected, desc", [
     ([(1, 1)], False, "clocks agree"),
     ([(3600, 1)], True, "wall clock jumped an hour: slept"),

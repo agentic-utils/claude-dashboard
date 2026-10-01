@@ -33,6 +33,7 @@ def test_poll_once_delivers_each_message_once(store, sid):
 
 def test_mcp_server_round_trip(store, sid, db_file):
     """Start the real stdio server and drive it like Claude Code would."""
+    store.register(sid, 999999, 1, "boot-x")   # as `claude_board run` would, before exec
     params = StdioServerParameters(command=sys.executable, args=["-m", "claude_board", "mcp"],
                                    env=dict(os.environ, BOARD_SESSION_ID=sid, BOARD_DB=str(db_file)))
 
@@ -51,4 +52,6 @@ def test_mcp_server_round_trip(store, sid, db_file):
     ref, got = anyio.run(drive)
     assert ref == "Q1"
     assert got == "[Q1] postgres"
-    assert store.session(sid)["claude_pid"], "server registered the session's process"
+    row = store.session(sid)
+    assert row["claude_pid"] == 999999, "server leaves the pid registered by run() alone (review #4)"
+    assert row["heartbeat_at"], "server beats once on start"

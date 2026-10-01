@@ -1,7 +1,7 @@
 """The board's MCP server, one per launched session (stdio).
 
-On start it registers the session's Claude process for liveness checks, then keeps
-a heartbeat going. The heartbeat is only a 'stalled' hint; see liveness.py.
+It keeps a heartbeat going, which is only a 'stalled' hint; see liveness.py. The
+session's Claude process was registered by `claude_board run` before it exec'd Claude.
 """
 
 import os
@@ -10,7 +10,6 @@ import time
 
 from mcp.server.mcpserver import MCPServer
 
-from . import liveness
 from .store import Store
 
 HEARTBEAT_SECONDS = 30
@@ -87,7 +86,6 @@ def main() -> None:
     global _store, _sid
     _sid = os.environ["BOARD_SESSION_ID"]
     _store = Store()
-    pid = liveness.find_claude(os.getppid()) or os.getppid()
-    _store.register(_sid, pid, liveness.start_time(pid), liveness.boot_id())
+    _store.heartbeat(_sid)
     threading.Thread(target=_heartbeat, daemon=True).start()
     server.run("stdio")

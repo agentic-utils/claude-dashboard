@@ -57,3 +57,38 @@ def test_open_tab_refuses_a_running_session(store, sid, monkeypatch):
     monkeypatch.setattr(launch.liveness, "is_alive", lambda *a: True)
     with pytest.raises(RuntimeError, match="already running"):
         launch.open_tab(store, sid)
+
+
+def test_a_brief_starting_with_a_dash_is_not_read_as_an_option():
+    """`claude "-x"` fails with "unknown option" (review #3)."""
+    argv = launch.claude_argv(row(ticket="", brief="- first\n- second"), python="/py", resume=False)
+    assert not argv[-1].startswith("-") and argv[-1].endswith("- first\n- second")
+
+
+def test_run_registers_its_own_pid_before_exec(store, sid, tmp_path, monkeypatch):
+    """The pid survives exec, so it is Claude's: no gap before the MCP server starts (review #1)."""
+    class Exec(Exception):
+        pass
+
+    def fake_exec(*a):
+        raise Exec
+    monkeypatch.setattr(launch.os, "execvpe", fake_exec)
+    monkeypatch.setattr(launch, "transcript_exists", lambda sid: False)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(Exec):
+        launch.run(sid)
+    row_ = store.session(sid)
+    assert row_["claude_pid"] == launch.os.getpid()
+    assert launch.liveness.is_alive(row_["claude_pid"], row_["claude_start"], row_["boot_id"])
+
+
+def test_open_tab_logs_the_launcher_output(store, sid, monkeypatch):
+    """A failing cmd.exe or wt.exe must leave a trace (review #11)."""
+    calls = []
+    monkeypatch.setattr(launch.liveness, "is_alive", lambda *a: False)
+    monkeypatch.setattr(launch.subprocess, "Popen", lambda argv, **kw: calls.append((argv, kw)))
+    launch.open_tab(store, sid)
+    (argv, kw), = calls
+    assert kw["stdout"].name == str(store.path.parent / "launch.log")
+    assert kw["stderr"] == launch.subprocess.STDOUT
+    assert "wt.exe" in (store.path.parent / "launch.log").read_text()
