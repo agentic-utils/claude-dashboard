@@ -42,7 +42,7 @@ also standalone: it only tracks sessions it launched, needs no global hooks, set
 
 | State | Meaning | How it is derived |
 |---|---|---|
-| starting | launched, not yet registered | no process recorded, launched under 90 s ago |
+| starting | launched, not yet registered | no process recorded for this launch, launched under 90 s ago |
 | live | session process running | recorded Claude pid exists in `/proc` with the same start time, same boot id |
 | stalled | live, but quiet | live, heartbeat older than 120 s, and the board has not just woken from sleep. A hint only |
 | dead | process gone, not parked | anything else that is not parked |
@@ -61,8 +61,10 @@ also standalone: it only tracks sessions it launched, needs no global hooks, set
   wrapper checks again before it execs Claude, so a slow-to-wake session is never run
   twice.
 - **End** asks Claude to do its usual session-end memory save, then deletes the board's
-  rows. Claude Code's own transcript is untouched. The End button on a dead session just
-  deletes the rows.
+  rows. Claude Code's own transcript is untouched. The End button on a running session
+  (live, stalled or starting) sends the session a message asking for exactly that, and
+  Claude calls `end_session` itself; the confirm names the session. On a dead or parked
+  session it just deletes the rows.
 
 ## Launching
 
@@ -78,7 +80,10 @@ cmd.exe /c wt.exe -w 0 new-tab --title <name> wsl.exe -d <distro> -u <user> --cd
 `wt.exe` is a Windows execution alias that WSL can't execute directly (it resolves on
 the `PATH` but does nothing), so it goes through `cmd.exe /c` as Microsoft's docs say.
 cmd re-parses the line, so its metacharacters are stripped from the title and refused
-in the directory. Each tab start is appended to `launch.log` next to the database.
+in the directory. Each tab start is appended to `launch.log` next to the database,
+along with any output from cmd.exe or wt.exe, so a launch that fails leaves a trace.
+A brief starting with `-` gets a `Brief:` header, because claude reads a leading `-` as
+an option.
 
 A directory Claude Code doesn't trust yet shows its trust prompt in the new tab; answer
 it there.
@@ -140,22 +145,26 @@ question marks it answered.
 |---|---|
 | `post_item(kind, title, body, status?)` | creates T/Q/A item, returns its ref |
 | `update_item(ref, status?, title?, body?, note?)` | edits; a note is appended to the item's thread |
-| `get_input(ref?)` | undelivered messages from the person (marks them delivered), or the full thread for one ref |
+| `get_input(ref?)` | undelivered messages from the person (read and marked delivered in one transaction, so the monitor never repeats them), or the full thread for one ref |
 | `list_items(include_closed?)` | this session's items |
 | `park_session()` / `end_session()` | lifecycle |
 
-The server registers the session on start (Claude pid found by walking up from its own
-parent, plus start time and boot id) and writes a heartbeat every 30 s.
+`claude_board run` registers the session's pid, start time and boot id just before it
+execs Claude. exec keeps the pid, so the registered pid is Claude's, and a session at
+the trust prompt or with a slow MCP server never looks dead. The server only writes a
+heartbeat, on start and every 30 s. Tool calls run in worker threads, so the store
+serialises access to its one connection with a lock.
 
 ## TUI
 
-- **Inbox tab.** Sessions on the left (name, ticket, open-question count, running
-  count, status, a Cylon scanner while anything is running). Items in the centre from
+- **Inbox tab.** Sessions on the left (a status dot, the name, the open-question count,
+  and a Cylon scanner while anything is running; parked sessions are left out). Items in the centre from
   every session, ordered: open questions, blocked or waiting tasks, running, the rest.
   Selecting a session filters; Esc clears. Detail on the right: body, thread, and an
   answer box. Ctrl+S sends (Ctrl+Enter where the terminal reports it).
-- **Sessions tab.** Every session with status, Restore on dead rows, Restore All, Park,
-  End (with a confirm), New session.
+- **Sessions tab.** Every session with status, name, ticket, directory, open-question
+  and running counts. Restore on dead or parked rows (unparks only once the launch goes
+  through), Restore All, Park, End (with a confirm), New session.
 - **Look.** Matrix green inside panels; colour and a shimmering title bar on the chrome.
 
 ## Relationship to the cache dashboard
