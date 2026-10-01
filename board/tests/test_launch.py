@@ -92,3 +92,43 @@ def test_open_tab_logs_the_launcher_output(store, sid, monkeypatch):
     assert kw["stdout"].name == str(store.path.parent / "launch.log")
     assert kw["stderr"] == launch.subprocess.STDOUT
     assert "wt.exe" in (store.path.parent / "launch.log").read_text()
+
+
+def test_open_tab_refuses_a_session_that_is_still_starting(store, sid, monkeypatch):
+    """Round-2 #5: a double press must not open two tabs before the first registers."""
+    calls = []
+    monkeypatch.setattr(launch.liveness, "is_alive", lambda *a: False)
+    monkeypatch.setattr(launch.subprocess, "Popen", lambda argv, **kw: calls.append(argv))
+    launch.open_tab(store, sid)
+    with pytest.raises(RuntimeError, match="starting"):
+        launch.open_tab(store, sid)
+    assert len(calls) == 1
+
+
+def test_two_runs_racing_exec_claude_once(store, sid, tmp_path, monkeypatch):
+    """Round-2 #5: run()'s check and register are one compare-and-set."""
+    import threading
+    import time
+    execs, exits = [], []
+    real_alive = launch.liveness.is_alive
+
+    def slow_alive(*a):
+        alive = real_alive(*a)
+        time.sleep(0.3)   # widen the window between check and register
+        return alive
+    monkeypatch.setattr(launch.liveness, "is_alive", slow_alive)
+    monkeypatch.setattr(launch.os, "execvpe", lambda *a: execs.append(a))
+    monkeypatch.setattr(launch.os, "chdir", lambda d: None)
+    monkeypatch.setattr(launch, "transcript_exists", lambda sid: False)
+
+    def go():
+        try:
+            launch.run(sid)
+        except SystemExit as e:
+            exits.append(str(e))
+    threads = [threading.Thread(target=go) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(execs) == 1 and len(exits) == 1 and "already running" in exits[0]

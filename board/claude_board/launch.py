@@ -74,6 +74,8 @@ def open_tab(store: Store, sid: str) -> None:
         raise KeyError(sid)
     if liveness.is_alive(session["claude_pid"], session["claude_start"], session["boot_id"]):
         raise RuntimeError(f"session {session['name'] or sid} is already running")
+    if liveness.status(session) == "starting":   # a tab is opening but hasn't registered yet
+        raise RuntimeError(f"session {session['name'] or sid} is still starting")
     argv = wt_argv(session, python=sys.executable,
                    distro=os.environ.get("WSL_DISTRO_NAME", "Ubuntu"), user=getpass.getuser())
     store.mark_launched(sid)
@@ -91,8 +93,6 @@ def run(sid: str) -> None:
     session = store.session(sid)
     if session is None:
         sys.exit(f"claude-board: no session {sid} (ended?)")
-    if liveness.is_alive(session["claude_pid"], session["claude_start"], session["boot_id"]):
-        sys.exit(f"claude-board: session {session['name'] or sid} is already running in another tab")
     env = dict(os.environ, BOARD_SESSION_ID=sid, BOARD_DB=str(store.path), BOARD_PYTHON=sys.executable)
     os.chdir(session["cwd"])
     resume = transcript_exists(sid)
@@ -100,7 +100,9 @@ def run(sid: str) -> None:
     with open(store.path.parent / "launch.log", "a") as log:   # a tab that dies on start leaves this behind
         print(now(), sid, "resume" if resume else "new", session["cwd"], file=log)
     # exec keeps this pid, so it is Claude's: registering now leaves no window (trust prompt,
-    # slow MCP start) in which a live session looks dead and could be restored twice
+    # slow MCP start) in which a live session looks dead and could be restored twice.
+    # Check-and-register is one transaction, so two tabs racing can't both get here.
     pid = os.getpid()
-    store.register(sid, pid, liveness.start_time(pid), liveness.boot_id())
+    if not store.register_if_free(sid, pid, liveness.start_time(pid), liveness.boot_id(), liveness.is_alive):
+        sys.exit(f"claude-board: session {session['name'] or sid} is already running in another tab")
     os.execvpe("claude", argv, env)
