@@ -47,6 +47,7 @@ also standalone: it only tracks sessions it launched, needs no global hooks, set
 | stalled | live, but quiet | live, heartbeat older than 120 s, and the board has not just woken from sleep. A hint only |
 | dead | process gone, not parked | anything else that is not parked |
 | parked | `/board:park` or the Park button | stored flag; hidden from the inbox, off Restore All |
+| ending | End pressed on a running session | `end_requested_at` set and the session is live, stalled or starting |
 | (ended) | `/board:end` or the End button | rows deleted |
 
 - **Life and death come from the process, not the heartbeat.** Sleep and hibernate keep
@@ -57,14 +58,20 @@ also standalone: it only tracks sessions it launched, needs no global hooks, set
   over 30 s means the machine slept, and the stalled hint is suppressed for 60 s while
   everything catches up.
 - **Never respawn automatically.** The Sessions page has Restore on each dead row and
-  Restore All. Both re-check the process immediately before launching, and the launch
-  wrapper checks again before it execs Claude, so a slow-to-wake session is never run
-  twice.
+  Restore All. Both re-check the process immediately before launching and refuse a
+  session that is still starting (launched under 90 s ago, not yet registered), so a
+  double press opens one tab. The launch wrapper then checks and registers in a single
+  compare-and-set transaction before it execs Claude, so two tabs racing for the same
+  session can't both start it.
 - **End** asks Claude to do its usual session-end memory save, then deletes the board's
   rows. Claude Code's own transcript is untouched. The End button on a running session
-  (live, stalled or starting) sends the session a message asking for exactly that, and
-  Claude calls `end_session` itself; the confirm names the session. On a dead or parked
-  session it just deletes the rows.
+  (live, stalled or starting) sets `end_requested_at`; the session's monitor passes the
+  request on and Claude calls `end_session` itself. The confirm names the session. The
+  row shows as ending meanwhile. If the session dies or is parked before acting on it,
+  the board deletes the rows itself. If it stays alive but doesn't respond for 2 minutes
+  (stuck at the trust prompt, say), End offers a force end that deletes the rows without
+  the memory save. On a dead or parked session End just deletes the rows. Any launch
+  clears a leftover end request, so a restored session is never told to end itself.
 
 ## Launching
 
@@ -125,12 +132,12 @@ A static plugin directory shipped in the package, loaded per session with `--plu
 ```
 sessions  id (uuid) PK, name, ticket, brief, cwd, parked (0/1),
           created_at, launched_at,
-          claude_pid, claude_start, boot_id, heartbeat_at
+          claude_pid, claude_start, boot_id, heartbeat_at, end_requested_at
 items     id PK, session_id FK, ref ('T3' | 'Q1' | 'A2', unique per session),
           kind (task | question | agent), title, body, status,
           created_at, updated_at
 messages  id PK, session_id FK, item_ref (nullable), author (claude | person),
-          body, created_at, delivered_at
+          body, created_at, claimed_at, delivered_at
 ```
 
 Deleting a session cascades. Times are UTC ISO-8601.
@@ -145,13 +152,19 @@ question marks it answered.
 |---|---|
 | `post_item(kind, title, body, status?)` | creates T/Q/A item, returns its ref |
 | `update_item(ref, status?, title?, body?, note?)` | edits; a note is appended to the item's thread |
-| `get_input(ref?)` | undelivered messages from the person (read and marked delivered in one transaction, so the monitor never repeats them), or the full thread for one ref |
+| `get_input(ref?)` | undelivered messages from the person, or the full thread for one ref (whose undelivered messages then count as delivered) |
+
+Delivery is claim, show, confirm. A claim is one transaction, so the monitor and
+`get_input` never take the same message. The monitor confirms a message only after
+printing and flushing it; if stdout has closed it releases the rest for redelivery, and
+a claim abandoned by a monitor killed mid-print is retaken after 30 s.
 | `list_items(include_closed?)` | this session's items |
 | `park_session()` / `end_session()` | lifecycle |
 
 `claude_board run` registers the session's pid, start time and boot id just before it
-execs Claude. exec keeps the pid, so the registered pid is Claude's, and a session at
-the trust prompt or with a slow MCP server never looks dead. The server only writes a
+execs Claude, as a compare-and-set that fails if another live Claude holds the session.
+exec keeps the pid, so the registered pid is Claude's, and a session at the trust prompt
+or with a slow MCP server never looks dead. The server only writes a
 heartbeat, on start and every 30 s. Tool calls run in worker threads, so the store
 serialises access to its one connection with a lock.
 
@@ -194,7 +207,10 @@ Bringing the cache view in as a tab of the board is a later decision.
 A real session launched through `claude_board run` (headless, in a pty) registered its
 Claude process, started the monitor, posted `T1` through the MCP server, received a
 board message through the monitor while idle, acted on it, and deleted its own data
-with `end_session`. A launch through Windows Terminal reached `claude_board run` in the
+with `end_session`. A second headless run checked the registered pid directly: it was
+the forked pid, `/proc/<pid>/comm` was `claude` with the `--session-id` command line,
+and it was still the running process (with the board's MCP server and monitor as
+children) after the trust prompt and the brief. A launch through Windows Terminal reached `claude_board run` in the
 new tab (confirmed by `launch.log`).
 
 ## Open questions
