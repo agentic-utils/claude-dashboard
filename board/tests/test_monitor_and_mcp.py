@@ -145,3 +145,33 @@ def test_a_failed_confirm_is_retried_not_left_for_the_claim_timeout(store, sid, 
     assert monitor.poll_once(store, sid, out) == 1
     assert store.pending(sid) == []
     assert out.getvalue().count("delete the branch") == 1
+
+
+def test_the_monitor_survives_a_locked_start_and_reports_each_error_once(sid, monkeypatch, capsys):
+    """R6: a lock while opening the store must not kill the monitor, and a repeating error
+    is reported once on stderr rather than every poll."""
+    import sqlite3
+    opens, polls = [], []
+
+    def store():
+        opens.append(1)
+        if len(opens) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return object()
+
+    def poll(store, sid):
+        polls.append(1)
+        if len(polls) < 3:
+            raise sqlite3.OperationalError("database is locked")
+        if len(polls) == 3:
+            raise sqlite3.OperationalError("disk I/O error")
+        return None
+
+    monkeypatch.setattr(monitor, "Store", store)
+    monkeypatch.setattr(monitor, "poll_once", poll)
+    monkeypatch.setattr(monitor.time, "sleep", lambda s: None)
+    monitor.main(sid)
+    assert len(opens) == 2 and len(polls) == 4
+    err = capsys.readouterr().err
+    assert err.count("database is locked") == 1, err
+    assert err.count("disk I/O error") == 1, err

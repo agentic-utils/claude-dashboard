@@ -75,11 +75,15 @@ def poll_once(store: Store, sid: str, out=sys.stdout) -> int | None:
 
 def main(sid: str | None = None) -> None:
     sid = sid or os.environ["BOARD_SESSION_ID"]
-    store = Store()
+    store, reported = None, set()
     while True:
         try:
+            store = store or Store()
             if poll_once(store, sid) is None:
                 return
-        except sqlite3.OperationalError:
-            pass   # e.g. "database is locked": anything unsent is still queued, so try again
+        except sqlite3.OperationalError as e:
+            # e.g. "database is locked": anything unsent is still queued, so try again
+            if str(e) not in reported:
+                reported.add(str(e))
+                print(f"[board monitor] {e}: retrying", file=sys.stderr, flush=True)
         time.sleep(POLL_SECONDS)
