@@ -102,6 +102,11 @@ class NewSession(ModalScreen):
     def cancel(self) -> None:
         self.dismiss(None)
 
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            event.stop()
+            self.dismiss(None)
+
 
 class Confirm(ModalScreen):
     def __init__(self, prompt: str):

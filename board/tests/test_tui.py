@@ -135,3 +135,16 @@ async def test_enter_on_a_destructive_confirm_declines(store, sid):
         await pilot.pause()
         assert [type(s).__name__ for s in app.screen_stack] == ["Screen"]
     assert store.session(sid) is not None
+
+
+@pytest.mark.anyio
+async def test_escape_closes_new_session(store, sid):
+    """R6: Escape closes New session, as it does Confirm and Choice."""
+    app = BoardApp(store)
+    async with app.run_test(size=(160, 40)) as pilot:
+        await pilot.press("n")
+        await pilot.pause()
+        assert [type(s).__name__ for s in app.screen_stack] == ["Screen", "NewSession"]
+        await pilot.press("escape")
+        await pilot.pause()
+        assert [type(s).__name__ for s in app.screen_stack] == ["Screen"]
