@@ -3,15 +3,16 @@
 Issue: #57. Status: design, for review before any code moves.
 
 claude-wheelhouse is a small suite of terminal tools for running many Claude
-Code sessions at once. Each tool is useful on its own; a thin shell puts them
-side by side so one window shows everything that needs attention.
+Code sessions at once. Each tool is useful on its own; a thin combined app,
+the wheelhouse app, puts them side by side so one window shows everything that
+needs attention.
 
 ## Goals
 
 1. **Standalone modules.** Each tool installs, runs and is useful without the
    others. Someone can adopt the board and ignore the rest.
-2. **A thin shell.** The shell hosts the modules' panes and owns no data of
-   its own. If it starts holding state, it has become the monolith we are
+2. **A thin app.** The wheelhouse app hosts the modules' panes and owns no
+   data of its own. If it starts holding state, it has become the monolith we are
    avoiding.
 3. **Surface-agnostic content.** Modules serve their content through a
    service layer, so a browser surface can be added later without touching
@@ -28,7 +29,7 @@ access; anything that spans Linux users (one instance per user, as today).
 | `claude-wheelhouse-dash` | Cache-token dashboard | `claude_dashboard.py` live/history views |
 | `claude-wheelhouse-review` | Open PRs and unopened branches, with merge/draft/close actions | The PR tab inside `claude_dashboard.py` |
 | `claude-wheelhouse-board` | Tasks, questions, session launch and lifecycle | `board/` (PR #56) |
-| `claude-wheelhouse` | The shell: discovers installed panes, nothing else | New |
+| `claude-wheelhouse` | The wheelhouse app: discovers installed panes, nothing else | New |
 
 PyPI names checked on 2026-10-02: `claude-wheelhouse` and
 `claude-wheelhouse-core` are free. `claude-board`, `claude-review` and
@@ -53,20 +54,21 @@ claude-wheelhouse/
       src/wheelhouse_review/
     board/                  claude-wheelhouse-board
       src/wheelhouse_board/
-    shell/                  claude-wheelhouse
+    app/                    claude-wheelhouse
       src/wheelhouse/
 ```
 
 Each package has its own `pyproject.toml`, tests and version. Module packages
-depend on `claude-wheelhouse-core` and nothing else in the workspace. The shell
+depend on `claude-wheelhouse-core` and nothing else in the workspace. The app
 depends only on core; it finds modules at runtime (below), so installing the
-shell does not drag every module in.
+app does not drag every module in.
 
-Install, until we publish to PyPI:
+Install with `uv tool install` (Python 3.12+), from git until we publish to
+PyPI:
 
 ```
 uv tool install "claude-wheelhouse-board @ git+https://github.com/agentic-utils/claude-wheelhouse#subdirectory=packages/board"
-uv tool install "claude-wheelhouse @ git+...#subdirectory=packages/shell" \
+uv tool install "claude-wheelhouse @ git+...#subdirectory=packages/app" \
     --with "claude-wheelhouse-board @ git+...#subdirectory=packages/board" \
     --with "claude-wheelhouse-review @ git+...#subdirectory=packages/review"
 ```
@@ -131,14 +133,14 @@ A surface package picks the key it knows. Each surface hand-writes its own
 views against the same service. The duplication is real but cheap and
 readable, which a generic renderer would not be.
 
-**Free browser stopgap.** `textual-serve` runs the whole Textual shell in a
+**Free browser stopgap.** `textual-serve` runs the whole wheelhouse app in a
 browser tab with no extra code. It is not a web surface (it streams the
 terminal UI), but it answers "I want this in a browser tab" until there is
 demand for a real one.
 
 ## Pane contract
 
-Core defines the protocol the shell consumes:
+Core defines the protocol the wheelhouse app consumes:
 
 ```python
 class Pane(Protocol):
@@ -157,12 +159,12 @@ Modules register a factory under the entry-point group
 board = "wheelhouse_board:pane"
 ```
 
-**Badges are the point of the shell.** The tab bar reads
+**Badges are the point of the app.** The tab bar reads
 `Board 3 . Review 1 . Dash !` so the user sees where attention is needed
 without visiting each tab. `badge()` is a cheap query on the service and is
 called on the change-feed tick, never on every frame.
 
-**Pane isolation.** The shell constructs each pane inside a guard and wraps
+**Pane isolation.** The app constructs each pane inside a guard and wraps
 its widget in a container that catches exceptions from that subtree
 (Textual's default is to tear down the whole app). A failed pane shows an
 error card with the traceback summary and a retry key; the other panes keep
@@ -190,14 +192,27 @@ publishing convention:
 So the review pane can show "opened by session *Rare caper*" by reading the
 board's `wh_sessions_board` view, without importing the board package.
 
-## The `wheelhouse` CLI
+## The `wheelhouse` CLI and the slash commands
 
-*Interpretation for review.* Doug said the commands follow Q19 ("the commands
-can just be `/wheelhouse xxx`"). This doc reads that as one CLI, owned by
-core, mirroring the slash command:
+There are two entry points, and they live in different places:
+
+- **The `wheelhouse` CLI** runs from a plain terminal. It is how a user opens
+  the tools, and how they restart the app if it fails.
+- **The `/wheelhouse` slash commands** exist only inside Claude Code sessions
+  that wheelhouse launched. They are how a session talks to the board about
+  its own lifecycle.
+
+Sessions start only from the board's New session button (or an Adopt, below),
+because launching is what injects the slash commands and the session
+protocol. So the CLI starts the app, the app starts sessions, and sessions
+carry the slash commands.
+
+### The CLI
+
+One CLI, owned by core:
 
 ```
-wheelhouse              the shell (if installed), else a list of modules
+wheelhouse              the wheelhouse app (if installed), else a list of modules
 wheelhouse board        the board on its own
 wheelhouse review       the review pane on its own
 wheelhouse dash         the cache dashboard on its own
@@ -205,14 +220,12 @@ wheelhouse board new    module subcommands pass through
 ```
 
 Modules register subcommands via a second entry-point group,
-`claude_wheelhouse.commands`. Each module may also keep a short alias script
-(`claude-board`) for muscle memory; that is optional and can be dropped.
+`claude_wheelhouse.commands`. There are no `claude-*` alias scripts.
 
-## Slash commands in sessions
+### Slash commands in sessions
 
 The board injects its lifecycle commands into the sessions it launches (via
-`--plugin-dir`, as now). PR #56 ships two skills, `/park` and `/end`. The
-suite replaces them with **one skill** whose frontmatter `name:` is
+`--plugin-dir`, as now) as **one skill** whose frontmatter `name:` is
 `wheelhouse`, reading `$ARGUMENTS`:
 
 ```
@@ -221,7 +234,9 @@ suite replaces them with **one skill** whose frontmatter `name:` is
 ```
 
 One skill leaves room for `/wheelhouse status` and friends without another
-plugin entry each time.
+plugin entry each time. PR #56 makes this switch with the fixed name
+`wheelhouse`; the clash check and the templated protocol come in the
+restructure, because they need core.
 
 **Clash check.** Before each launch the board looks for anything else that
 would answer to `/wheelhouse`, best effort:
@@ -237,6 +252,24 @@ template filled with the chosen name, so Claude is told the command that
 actually exists in that session. The check is best effort: a plugin installed
 after launch can still clash, and the fallback applies on the next launch or
 restore.
+
+## Adopting a running session
+
+A session started outside wheelhouse has no injected commands or protocol.
+Wheelhouse adopts it by handoff:
+
+1. The board finds the session's id from its transcript under
+   `~/.claude/projects/` and lists it with an **Adopt** button.
+2. Adopt asks the user to type `/exit` in that session.
+3. Once the session has exited, wheelhouse opens a new terminal tab running
+   `claude --resume <id>` with the usual injected flags, and the board tracks
+   it from then on.
+
+The conversation carries over intact; only the process is replaced.
+
+**Deferred: hot adoption.** Attaching to a session without restarting it
+(through a CLI the session calls, plus the Monitor tool) would avoid the
+`/exit`, but is not designed or spiked yet.
 
 ## What moves where
 
@@ -299,20 +332,19 @@ The rewrite:
 
 ### Dash (rest of `claude_dashboard.py` to `packages/dash`)
 
-The dashboard is a 5,200-line, stdlib-only, raw-terminal (termios) program,
-installed via a Homebrew tap with its own self-updater. It is not a Textual
-app, so it cannot simply be hosted as a pane. Proposed order:
+The dashboard is a 5,200-line, stdlib-only, raw-terminal (termios) program.
+It is not a Textual app, so it cannot simply be hosted as a pane. The order:
 
 1. Move the file into `packages/dash` unchanged, runnable as `wheelhouse dash`.
-   In the shell it appears as a launcher card ("opens in its own tab") rather
-   than an embedded pane.
+   In the wheelhouse app it appears as a card that opens it in its own
+   terminal tab, rather than an embedded pane.
 2. Split its scan and usage logic into a service (it is already largely
    separate from rendering).
-3. Port the views to Textual when the shell is in daily use and the port is
-   worth it.
+3. Port the views to Textual so the cache view embeds as a real pane. This is
+   a near-term follow-up, to revisit soon after the app is in daily use.
 
-This drops the stdlib-only and Python 3.9 constraints for the suite; see open
-questions.
+The suite targets Python 3.12+ with Textual, so the dashboard's stdlib-only
+and Python 3.9 constraints go.
 
 ## Packaging and licence
 
@@ -326,46 +358,31 @@ questions.
   community tool for people who use Claude Code. It is not affiliated with,
   endorsed by or supported by Anthropic. "Claude" is a trademark of
   Anthropic, PBC.
-- **Distribution:** install from git now. Publish to PyPI once the module
-  boundaries have settled; no name reservation in the meantime.
+- **Distribution:** `uv tool install` from git now, Python 3.12+. Publish to
+  PyPI once the module boundaries have settled; no name reservation in the
+  meantime.
+- **Homebrew tap retired.** The `agentic-utils/tap` formula and the
+  dashboard's self-updater are replaced by `uv tool install` (and
+  `uv tool upgrade`). The last tap release points existing users at the new
+  install command.
 
 ## Migration order
 
 Each step is its own issue and PR, so every review covers one kind of change.
 
-1. **Finish PR #56 (board prototype).** Round-5 review of the round-4 fixes,
-   find the flaky test. Recommendation: also switch `/park` and `/end` to the
-   single `/wheelhouse park|end` skill here, with a static name, so the
-   review covers the command surface the suite will actually ship. The clash
-   check and templated `protocol.md` come in step 2, because they need core.
+1. **Finish PR #56 (board prototype).** Switch `/park` and `/end` to the
+   single `/wheelhouse park|end` skill with the fixed name, then the
+   round-5 review, then find the flaky test.
 2. **Restructure into the workspace.** Create core (theme, protocols, state
    dirs, CLI, session views), move the board in as a module, move the
    dashboard file in unchanged, add LICENSE, README disclaimer, the clash
-   check. Move the board logic out of `tui.py` into its service.
+   check and the templated `protocol.md`. Move the board logic out of
+   `tui.py` into its service. Retire the Homebrew tap.
 3. **Review module.** Lift the PR tab out of the dashboard into
    `packages/review` as a Textual module, with the GraphQL refresher.
-4. **Shell.** Pane discovery, tab bar with badges, pane isolation, the dash
-   launcher card.
-5. **Later:** dash service split and Textual port; a web surface; PyPI.
+4. **The wheelhouse app.** Pane discovery, tab bar with badges, pane
+   isolation, the dash card.
+5. **Dash Textual port** (near-term follow-up).
 
-The Homebrew tap and release workflow keep working through the rename
-(`github.repository` in `release.yaml` follows it, and GitHub redirects the
-old URL), but the formula still names `claude-dashboard`; decide its fate in
-step 2.
-
-## Open questions for Doug
-
-1. **Stdlib-only and the Homebrew tap.** The dashboard is stdlib-only for
-   Python 3.9+ on purpose and ships via `agentic-utils/tap` with a
-   self-updater. The suite needs Textual and Python 3.12+ (the board's
-   floor). Keep the tap (formula installs `claude-wheelhouse-dash` with its
-   dependencies), or retire it in favour of `uv tool install` and point
-   existing users at the move?
-2. **The `wheelhouse` CLI reading** above (one CLI with subcommands, optional
-   `claude-*` aliases) is an interpretation of "see Q19". Right, or did you
-   mean something else?
-3. **Dash in the shell.** Is a launcher card acceptable until the Textual
-   port, or is having the cache view embedded from day one part of what
-   makes the shell worth using?
-4. **`/park` and `/end` in PR #56.** Switch to `/wheelhouse park|end` in #56
-   (recommended) or leave it to the restructure?
+Adoption by handoff is a board feature and can land any time after step 2.
+Later: hot adoption, a web surface, PyPI.
