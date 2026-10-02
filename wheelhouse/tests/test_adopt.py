@@ -2,6 +2,8 @@ import json
 import os
 import time
 
+from datetime import datetime
+
 import pytest
 
 from claude_wheelhouse import adopt, launch, liveness
@@ -77,9 +79,28 @@ def test_cwd(projects, records, folder, cwd, desc):
 @pytest.mark.parametrize("records, desc", [
     ([record(entrypoint="sdk-cli")], "headless claude -p runs"),
     ([{"type": "summary", "summary": "x"}], "no cwd or entrypoint"),
+    ([record(type="system", message=None), {"type": "last-prompt"}], "never prompted"),
+    ([record(message={"content": "<command-name>/resume</command-name>"}), {"type": "last-prompt", "lastPrompt": "/resume"}],
+     "only slash commands"),
 ])
 def test_not_offered(projects, records, desc):
     assert adopt.read_transcript(transcript(projects, records=records)) is None, desc
+
+
+T1, T2 = "2026-10-02T12:18:49.000Z", "2026-10-02T12:20:00.000Z"
+
+
+@pytest.mark.parametrize("records, active, desc", [
+    ([record(timestamp=T1), {"type": "mode"}, {"type": "permission-mode"}], T1,
+     "idle records appended later don't count"),
+    ([record(timestamp=T1), record(type="assistant", timestamp=T2), {"type": "system", "timestamp": "2026-10-03T00:00:00Z"}],
+     T2, "the last prompt or reply, not other timestamped records"),
+    ([record()], None, "no timestamps: the file's mtime"),
+])
+def test_last_active(projects, records, active, desc):
+    p = transcript(projects, records=records)
+    expected = datetime.fromisoformat(active).timestamp() if active else p.stat().st_mtime
+    assert adopt.read_transcript(p).active == expected, desc
 
 
 def test_reads_both_ends_of_a_big_transcript(projects, monkeypatch):
@@ -91,16 +112,21 @@ def test_reads_both_ends_of_a_big_transcript(projects, monkeypatch):
 
 
 def test_candidates(store, projects, sessions, proc):
+    (proc / "sys/kernel/random").mkdir(parents=True)
+    (proc / "sys/kernel/random/boot_id").write_text("boot-1")
     transcript(projects, "old", age=30 * 86400)
-    transcript(projects, "newer", age=10)
-    transcript(projects, "older", age=100)
+    transcript(projects, "newer", records=[record(timestamp=T1)], age=10)   # touched lately, active earlier
+    transcript(projects, "older", records=[record(timestamp=T2)], age=100)
+    transcript(projects, "open", age=5)
     transcript(projects, "headless", records=[record(entrypoint="sdk-cli")])
     (projects / adopt.project_folder(REPO) / "newer" / "subagents").mkdir(parents=True)
     (projects / adopt.project_folder(REPO) / "newer/subagents/agent-1.jsonl").write_text(json.dumps(record()))
-    store.create_session(REPO, sid="older")   # already in the wheelhouse
+    store.create_session(REPO, name="Rare caper", sid="older")   # tracked, its tab failed: offered again
+    store.create_session(REPO, sid="open")
+    store.register("open", 4242, 1000, "boot-1")                  # open in a wheelhouse tab: not offered
     running(sessions, "newer")
     found = adopt.candidates(store, projects, sessions, proc)
-    assert [(c.id, c.running_pid) for c in found] == [("newer", 4242)]
+    assert [(c.id, c.running_pid, c.name) for c in found] == [("older", None, "Rare caper"), ("newer", 4242, "")]
 
 
 @pytest.mark.parametrize("start, expected, desc", [
@@ -132,6 +158,18 @@ def test_adopt_registers_and_opens_the_same_session(store, sessions, proc):
     assert sid == SID and opened == [SID]
     s = store.session(SID)
     assert (s["cwd"], s["name"], s["adopted"]) == (REPO, "LG", 1)
+
+
+@pytest.mark.parametrize("name, expected, desc", [
+    ("", "Rare caper", "keeps its name"),
+    ("LG", "LG", "renamed when asked"),
+])
+def test_adopting_a_tracked_session_reuses_its_row(store, sessions, proc, name, expected, desc):
+    store.create_session(REPO, name="Rare caper", sid=SID)
+    opened = []
+    adopt.adopt(store, candidate(), name, sessions, proc, open_tab=lambda s, sid: opened.append(sid))
+    assert opened == [SID] and len(store.sessions()) == 1, desc
+    assert store.session(SID)["name"] == expected, desc
 
 
 def test_a_failed_launch_leaves_no_row(store, sessions, proc):

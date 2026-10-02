@@ -178,6 +178,10 @@ class Store:
                FROM sessions s ORDER BY s.created_at"""
         )
 
+    def rename(self, sid: str, name: str) -> None:
+        with self.tx() as db:
+            db.execute("UPDATE sessions SET name = ? WHERE id = ?", (name, sid))
+
     def mark_launched(self, sid: str) -> None:
         """A (re)launch also drops any request left over from the last run."""
         with self.tx() as db:

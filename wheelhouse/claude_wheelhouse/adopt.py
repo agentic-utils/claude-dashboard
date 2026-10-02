@@ -1,6 +1,7 @@
-"""Adopt a Claude Code sessiin the wheelhouse did not launch, by handoff.
+"""Adopt a Claude Code session into the wheelhouse, by handoff.
 
-The wheelhouse lists recent transcripts from ~/.claude/projects. If the chosen session is
+The wheelhouse lists recent transcripts from ~/.claude/projects, plus sessions it already
+tracks whose process has gone (e.g. an adoption whose tab failed). If the chosen session is
 still running, the person types /exit in its tab first; the wheelhouse never kills it. Then
 the wheelhouse registers the session under its own id and opens it in a new tab like any
 restore: `claude --resume <id>` with the wheelhouse's MCP server, monitor, protocol and
@@ -11,6 +12,7 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from . import launch, liveness
@@ -34,8 +36,9 @@ class Candidate:
     id: str
     cwd: str
     title: str
-    modified: float       # transcript mtime, epoch seconds
+    active: float         # last prompt or reply, epoch seconds
     running_pid: int | None
+    name: str = ""        # its name in the wheelhouse, if it is already tracked there
 
 
 def project_folder(cwd: str) -> str:
@@ -62,6 +65,18 @@ def _prompt_text(rec) -> str:
         content = " ".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text")
     text = (content or "").strip() if isinstance(content, str) else ""
     return "" if text.startswith("<") else text
+
+
+def _last_active(recs, path: Path) -> float:
+    """The last prompt or reply. Not the file's mtime: an open but idle session keeps
+    appending untimestamped mode and permission records."""
+    for rec in reversed(recs):
+        if rec.get("type") in ("user", "assistant") and rec.get("timestamp"):
+            try:
+                return datetime.fromisoformat(rec["timestamp"]).timestamp()
+            except (TypeError, ValueError):
+                continue
+    return path.stat().st_mtime
 
 
 def _one_line(text: str) -> str:
@@ -92,14 +107,19 @@ def read_transcript(path: Path) -> Candidate | None:
             if rec.get(key):
                 found[key] = rec[key]
     first = next((t for t in map(_prompt_text, head_recs) if t), "")
-    title = found.get("customTitle") or found.get("aiTitle") or first or found.get("lastPrompt") or ""
-    return Candidate(path.stem, cwd, _one_line(title), path.stat().st_mtime, None)
+    last = found.get("lastPrompt", "")
+    title = found.get("customTitle") or found.get("aiTitle") or first or ("" if last.startswith("/") else last)
+    if not title:   # never prompted, e.g. opened to /resume something else and cancelled
+        return None
+    return Candidate(path.stem, cwd, _one_line(title), _last_active(tail_recs or head_recs, path), None)
 
 
 def candidates(store: Store, projects: Path = PROJECTS, sessions: Path = liveness.SESSIONS,
                proc: Path = liveness.PROC, now: float | None = None) -> list[Candidate]:
-    """Recent interactive sessions the wheelhouse doesn't track yet, newest first."""
-    tracked = {s["id"] for s in store.sessions()}
+    """Recent interactive sessions not open in a wheelhouse tab, most recently active first.
+    Tracked ones whose process has gone are offered again, keeping their name."""
+    tracked = {s["id"]: s for s in store.sessions()}
+    busy = {sid for sid, s in tracked.items() if liveness.status(s, proc=proc) != "dead"}
     cutoff = (now or time.time()) - WINDOW_DAYS * 86400
     paths = []
     for p in projects.glob("*/*.jsonl"):   # subagent transcripts sit a level deeper
@@ -107,7 +127,7 @@ def candidates(store: Store, projects: Path = PROJECTS, sessions: Path = livenes
             mtime = p.stat().st_mtime
         except OSError:
             continue
-        if p.stem not in tracked and mtime >= cutoff:
+        if p.stem not in busy and mtime >= cutoff:
             paths.append((mtime, p))
     alive = liveness.running_sessions(sessions, proc)
     found = []
@@ -118,22 +138,31 @@ def candidates(store: Store, projects: Path = PROJECTS, sessions: Path = livenes
             continue
         if c:
             c.running_pid = alive.get(c.id)
+            c.name = tracked[c.id]["name"] if c.id in tracked else ""
             found.append(c)
             if len(found) == LIMIT:
                 break
-    return found
+    return sorted(found, key=lambda c: c.active, reverse=True)
 
 
 def adopt(store: Store, c: Candidate, name: str, sessions: Path = liveness.SESSIONS,
           proc: Path = liveness.PROC, open_tab=launch.open_tab) -> str:
-    """Register the session and open it in a new tab. Refuses while it is still running."""
+    """Register the session and open it in a new tab. Refuses while it is still running.
+    A session the wheelhouse already tracks keeps its row (and its items), renamed if asked."""
     pid = liveness.running_pid(c.id, sessions, proc)
     if pid:
         raise StillRunning(pid)
+    if store.session(c.id):
+        if name:
+            store.rename(c.id, name)
+        open_tab(store, c.id)
+        return c.id
     sid = store.create_session(c.cwd, name=name, sid=c.id)
     try:
         open_tab(store, sid)
     except BaseException:
-        store.end(sid)   # nothing was launched: don't leave a half-adopted row behind
+        # wt.exe never started: don't leave a half-adopted row behind. A tab that starts
+        # and then fails can't be seen from here; its row stays and is offered again.
+        store.end(sid)
         raise
     return sid

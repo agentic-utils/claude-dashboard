@@ -17,7 +17,8 @@ Windows Terminal. Prototype: see `../.plan/wheelhouse-sessions.md` for the desig
   session, Park and End only ask the session to do it (press again to cancel or force);
   the wheelhouse never deletes anything by itself.
 - **Adopt.** Brings a session the wheelhouse didn't launch into the wheelhouse: pick it
-  from the recent sessions in `~/.claude/projects`. If it's still running, type `/exit` in
+  from the recent sessions in `~/.claude/projects` (one whose adoption failed is offered
+  again). If it's still running, type `/exit` in
   its tab first (the wheelhouse never kills it), then press Adopt; it reopens in a new tab
   with `claude --resume` and the wheelhouse's flags.
 - **Durable.** State is in SQLite at `~/.local/state/claude-wheelhouse/wheelhouse.db`

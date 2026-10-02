@@ -115,7 +115,7 @@ def ago(epoch: float, now: float | None = None) -> str:
 
 
 class AdoptSession(ModalScreen):
-    """Pick a sessiin the wheelhouse didn't launch. A running one must be /exit-ed first:
+    """Pick a session to bring into the wheelhouse. A running one must be /exit-ed first:
     the wheelhouse never kills it, and only launches once it has gone."""
 
     def __init__(self, candidates: list):
@@ -137,7 +137,7 @@ class AdoptSession(ModalScreen):
         table.add_columns("", "last active", "dir", "title")
         for c in self.candidates.values():
             table.add_row(Text("● running", style="bold #ffd300") if c.running_pid else "",
-                          ago(c.modified), c.cwd, c.title or short(c.id), key=c.id)
+                          ago(c.active), c.cwd, c.title or short(c.id), key=c.id)
         if not self.candidates:
             self.query_one("#adopt-hint", Label).update("No recent sessions to adopt.")
         table.focus()
@@ -151,7 +151,7 @@ class AdoptSession(ModalScreen):
     @on(DataTable.RowHighlighted, "#adopt-list")
     def highlighted(self, event: DataTable.RowHighlighted) -> None:
         c = self.candidates[event.row_key.value]
-        self.query_one("#adopt-name", Input).value = c.title[:40]
+        self.query_one("#adopt-name", Input).value = c.name or c.title[:40]
         self.query_one("#adopt-hint", Label).update(
             "Still running: type /exit in its tab, then press Adopt." if c.running_pid else "")
 

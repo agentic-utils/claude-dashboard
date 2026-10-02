@@ -219,14 +219,20 @@ serialises access to its one connection with a lock.
 
 ## Adopting a session
 
-Adopt brings a sessiin the wheelhouse didn't launch into the wheelhouse, by handoff. Hot adoption
+Adopt brings a session the wheelhouse didn't launch into the wheelhouse, by handoff. Hot adoption
 (attaching to a session without restarting it) is deferred.
 
 - **Candidates.** Transcripts under `~/.claude/projects/*/*.jsonl` touched in the last
-  14 days and not already in the wheelhouse, newest first, at most 40. Subagent transcripts
-  sit a level deeper and are never offered; headless runs (`entrypoint` other than
-  `cli`) are skipped. The title is the session's custom title, else its AI title, else
-  its first typed prompt. Only the first and last 256 KB of each file are read.
+  14 days, at most 40, most recently active first. Subagent transcripts sit a level
+  deeper and are never offered; headless runs (`entrypoint` other than `cli`) and
+  sessions never prompted (only slash commands, e.g. a cancelled `/resume`) are skipped.
+  Sessions the wheelhouse already tracks are offered only while not open in a wheelhouse
+  tab (status dead), keeping their name: an adoption whose tab failed stays adoptable.
+  The title is the session's custom title, else its AI title, else its first typed
+  prompt. Only the first and last 256 KB of each file are read.
+- **Last active.** The timestamp of the last prompt or reply, else the file's mtime. Not
+  the mtime first: an open but idle session keeps appending untimestamped mode and
+  permission records, which made it look active.
 - **Directory.** The cwd whose encoded form matches the transcript's folder (where
   `--resume` finds it), not the latest cwd, since a session may have moved since.
 - **Still running?** Claude Code writes `~/.claude/sessions/<pid>.json` (pid,
@@ -237,7 +243,10 @@ Adopt brings a sessiin the wheelhouse didn't launch into the wheelhouse, by hand
   is running elsewhere, which covers Restore as well.
 - **Launch.** The session is registered under its own Claude session id with
   `adopted = 1`, then opened like a restore: `claude --resume <id>` with the wheelhouse's
-  plugin, MCP server and protocol. A launch that fails removes the row again.
+  plugin, MCP server and protocol. If `wt.exe` fails to start, the row is removed
+  again; a tab that starts and then fails can't be seen from the wheelhouse, so its row
+  stays and the session is offered again. Adopting a tracked session reuses its row,
+  renamed if a new name was given.
 - **The protocol needs `--system-prompt-snapshot off`.** Claude records the system
   prompt at a conversation's first request and replays it on every resume, so an
   adopted session never sees `--append-system-prompt`. Checked on 2.1.287: with the
