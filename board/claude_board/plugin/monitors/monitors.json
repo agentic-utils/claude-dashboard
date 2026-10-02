@@ -1,7 +1,0 @@
-[
-  {
-    "name": "board-inbox",
-    "command": "\"${BOARD_PYTHON}\" -m claude_board monitor",
-    "description": "Answers and hints from the session board"
-  }
-]

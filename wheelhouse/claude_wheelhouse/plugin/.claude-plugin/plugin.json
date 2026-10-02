@@ -1,0 +1,7 @@
+{
+  "name": "wheelhouse",
+  "displayName": "Wheelhouse",
+  "version": "0.1.0",
+  "description": "Connects a session launched from claude-wheelhouse: delivers the person's answers and adds /wheelhouse park and /wheelhouse end",
+  "author": { "name": "agentic-utils" }
+}

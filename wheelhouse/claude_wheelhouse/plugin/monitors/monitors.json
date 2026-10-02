@@ -1,0 +1,7 @@
+[
+  {
+    "name": "wheelhouse-inbox",
+    "command": "\"${WHEELHOUSE_PYTHON}\" -m claude_wheelhouse monitor",
+    "description": "Answers and hints from the wheelhouse"
+  }
+]
