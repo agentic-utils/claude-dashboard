@@ -122,3 +122,16 @@ async def test_confirm_keys_stay_in_the_dialog(store, sid, key, expected, desc):
         await pilot.pause()
         assert answers == [expected], desc
         assert [type(s).__name__ for s in app.screen_stack] == ["Screen"], desc
+
+
+@pytest.mark.anyio
+async def test_enter_on_a_destructive_confirm_declines(store, sid):
+    """R6: Confirm opens on No, so a reflex Enter on "Force end" keeps the board data."""
+    app = BoardApp(store)
+    async with app.run_test(size=(160, 40)) as pilot:
+        app.settle(sid, "end", "force")
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert [type(s).__name__ for s in app.screen_stack] == ["Screen"]
+    assert store.session(sid) is not None

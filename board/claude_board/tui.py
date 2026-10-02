@@ -115,6 +115,9 @@ class Confirm(ModalScreen):
                 yield Button("[Y]es", variant="error", id="yes")
                 yield Button("[N]o", id="no")
 
+    def on_mount(self) -> None:
+        self.query_one("#no", Button).focus()   # a reflex Enter must not confirm
+
     def on_key(self, event) -> None:
         if event.key in ("y", "n", "escape"):
             event.stop()
