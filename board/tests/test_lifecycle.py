@@ -306,7 +306,10 @@ async def test_a_button_on_a_vanished_row_does_not_crash(store, sid, monkeypatch
         seen = notices(app, monkeypatch)
         await pilot.press("s")
         await pilot.pause()
-        store.end(sid)   # the row is still on screen
+        stale = store.sessions()
+        store.end(sid)
+        # the row is still on screen: keep the 1 s repaint from removing it before the click
+        monkeypatch.setattr(store, "sessions", lambda: stale)
         await pilot.click(button)
         await pilot.pause()
         assert app.is_running, desc
