@@ -3,6 +3,7 @@ person as one line. Claude Code delivers each printed line to Claude as a notifi
 """
 
 import os
+import sqlite3
 import sys
 import time
 
@@ -61,5 +62,10 @@ def poll_once(store: Store, sid: str, out=sys.stdout) -> int | None:
 def main(sid: str | None = None) -> None:
     sid = sid or os.environ["BOARD_SESSION_ID"]
     store = Store()
-    while poll_once(store, sid) is not None:
+    while True:
+        try:
+            if poll_once(store, sid) is None:
+                return
+        except sqlite3.OperationalError:
+            pass   # e.g. "database is locked": anything unsent is still queued, so try again
         time.sleep(POLL_SECONDS)

@@ -107,3 +107,20 @@ def test_a_cancel_then_a_fresh_request_arrive_in_order(store, sid):
     monitor.poll_once(store, sid, out)
     text = out.getvalue()
     assert text.index("cancelled the end request") < text.index("pressed End"), text
+
+
+def test_the_monitor_survives_a_locked_database(sid, monkeypatch):
+    """R5 #3: one "database is locked" must not end delivery for the rest of the session."""
+    import sqlite3
+    calls = []
+
+    def poll(store, sid):
+        calls.append(sid)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return None if len(calls) == 3 else 0
+
+    monkeypatch.setattr(monitor, "poll_once", poll)
+    monkeypatch.setattr(monitor.time, "sleep", lambda s: None)
+    monitor.main(sid)
+    assert len(calls) == 3
