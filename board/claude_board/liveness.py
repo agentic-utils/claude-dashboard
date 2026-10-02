@@ -5,11 +5,13 @@ WSL shutdown changes the boot id, so it is dead. The process start time guards
 against pid reuse. The heartbeat only feeds the 'stalled' hint.
 """
 
+import json
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 PROC = Path("/proc")
+SESSIONS = Path.home() / ".claude/sessions"   # Claude Code's record of each running session
 STARTING_GRACE = 90      # seconds a launched session may take to register
 STALLED_AFTER = 120      # heartbeat age that suggests a stalled session
 CLOCK_JUMP = 30          # wall clock ahead of monotonic by this much means we slept
@@ -52,6 +54,27 @@ def status(session, *, now: datetime | None = None, waking: bool = False, proc: 
             and (now - datetime.fromisoformat(launched)).total_seconds() < STARTING_GRACE:
         return "starting"
     return "dead"
+
+
+def running_sessions(sessions: Path = SESSIONS, proc: Path = PROC) -> dict[str, int]:
+    """Session id -> pid for every Claude process alive now, launched by the board or not.
+    Claude Code writes ~/.claude/sessions/<pid>.json per running session; records of dead
+    sessions linger, so one counts only while /proc agrees on the process start time."""
+    alive = {}
+    for f in sessions.glob("*.json"):
+        try:
+            rec = json.loads(f.read_text())
+            pid, start = int(rec["pid"]), int(rec["procStart"])
+            sid = rec["sessionId"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if start_time(pid, proc) == start:
+            alive[sid] = pid
+    return alive
+
+
+def running_pid(sid: str, sessions: Path = SESSIONS, proc: Path = PROC) -> int | None:
+    return running_sessions(sessions, proc).get(sid)
 
 
 class WakeDetector:

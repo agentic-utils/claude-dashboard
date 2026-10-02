@@ -50,6 +50,11 @@ def claude_argv(session, *, python: str, resume: bool) -> list[str]:
             "--plugin-dir", str(PLUGIN_DIR),
             "--mcp-config", json.dumps(mcp),
             "--append-system-prompt", PROTOCOL]
+    if session["adopted"]:
+        # Claude records the system prompt at a conversation's first request and replays it
+        # on every resume, so an adopted session would never see the protocol. "off" renders
+        # it fresh each request; it has to stay off, since the old record outlives one launch.
+        argv += ["--system-prompt-snapshot", "off"]
     if session["name"]:
         argv += ["-n", session["name"]]
     if not resume:
@@ -102,6 +107,10 @@ def run(sid: str) -> None:
     # exec keeps this pid, so it is Claude's: registering now leaves no window (trust prompt,
     # slow MCP start) in which a live session looks dead and could be restored twice.
     # Check-and-register is one transaction, so two tabs racing can't both get here.
+    other = liveness.running_pid(sid)   # e.g. adopted, but its old tab never ran /exit
+    if other:
+        sys.exit(f"claude-board: session {session['name'] or sid} is still running (pid {other}): "
+                 "type /exit in its tab, then restore it from the board")
     pid = os.getpid()
     if not store.register_if_free(sid, pid, liveness.start_time(pid), liveness.boot_id(), liveness.is_alive):
         sys.exit(f"claude-board: session {session['name'] or sid} is already running in another tab")

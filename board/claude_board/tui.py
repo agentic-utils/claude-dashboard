@@ -4,6 +4,7 @@ import functools
 import math
 import os
 import sqlite3
+import time
 
 from rich.text import Text
 from textual import on
@@ -24,7 +25,7 @@ from textual.widgets import (
     TextArea,
 )
 
-from . import launch, liveness
+from . import adopt, launch, liveness
 from .store import SessionGone, Store
 
 MATRIX = "#00ff41"
@@ -97,6 +98,75 @@ class NewSession(ModalScreen):
         self.dismiss({"cwd": cwd, "name": self.query_one("#name", Input).value.strip(),
                       "ticket": self.query_one("#ticket", Input).value.strip(),
                       "brief": self.query_one("#brief", TextArea).text.strip()})
+
+    @on(Button.Pressed, "#cancel")
+    def cancel(self) -> None:
+        self.dismiss(None)
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            event.stop()
+            self.dismiss(None)
+
+
+def ago(epoch: float, now: float | None = None) -> str:
+    mins = int(((now or time.time()) - epoch) // 60)
+    return f"{mins}m ago" if mins < 60 else f"{mins // 60}h ago" if mins < 48 * 60 else f"{mins // 1440}d ago"
+
+
+class AdoptSession(ModalScreen):
+    """Pick a session the board didn't launch. A running one must be /exit-ed first:
+    the board never kills it, and only launches once it has gone."""
+
+    def __init__(self, candidates: list):
+        super().__init__()
+        self.candidates = {c.id: c for c in candidates}
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog", classes="wide"):
+            yield Label("ADOPT A SESSION", classes="dialog-title")
+            yield DataTable(id="adopt-list", cursor_type="row")
+            yield Input(placeholder="name on the board", id="adopt-name")
+            yield Label("", id="adopt-hint")
+            with Horizontal(classes="buttons"):
+                yield Button("Adopt", variant="success", id="adopt")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        table = self.query_one("#adopt-list", DataTable)
+        table.add_columns("", "last active", "dir", "title")
+        for c in self.candidates.values():
+            table.add_row(Text("● running", style="bold #ffd300") if c.running_pid else "",
+                          ago(c.modified), c.cwd, c.title or short(c.id), key=c.id)
+        if not self.candidates:
+            self.query_one("#adopt-hint", Label).update("No recent sessions to adopt.")
+        table.focus()
+
+    def chosen(self):
+        table = self.query_one("#adopt-list", DataTable)
+        if not table.row_count:
+            return None
+        return self.candidates[table.coordinate_to_cell_key((table.cursor_row, 0)).row_key.value]
+
+    @on(DataTable.RowHighlighted, "#adopt-list")
+    def highlighted(self, event: DataTable.RowHighlighted) -> None:
+        c = self.candidates[event.row_key.value]
+        self.query_one("#adopt-name", Input).value = c.title[:40]
+        self.query_one("#adopt-hint", Label).update(
+            "Still running: type /exit in its tab, then press Adopt." if c.running_pid else "")
+
+    @on(DataTable.RowSelected, "#adopt-list")
+    @on(Button.Pressed, "#adopt")
+    def go(self) -> None:
+        c = self.chosen()
+        if c is None:
+            return
+        pid = liveness.running_pid(c.id)   # check again: it may have exited, or come back
+        if pid:
+            self.query_one("#adopt-hint", Label).update(
+                f"Still running (pid {pid}): type /exit in its tab, then press Adopt.")
+            return
+        self.dismiss({"candidate": c, "name": self.query_one("#adopt-name", Input).value.strip()})
 
     @on(Button.Pressed, "#cancel")
     def cancel(self) -> None:
@@ -181,13 +251,17 @@ class BoardApp(App):
     .dialog-title {{ color: #ffd300; text-style: bold; }}
     #dialog TextArea {{ height: 8; }}
     .buttons {{ height: 3; }}
-    NewSession, Confirm, Choice {{ align: center middle; }}
+    #dialog.wide {{ width: 120; }}
+    #adopt-list {{ height: 16; }}
+    #adopt-hint {{ color: #ffd300; }}
+    NewSession, Confirm, Choice, AdoptSession {{ align: center middle; }}
     """
 
     BINDINGS = [
         Binding("ctrl+s", "send", "Send"),
         Binding("ctrl+enter", "send", "Send", show=False),
         Binding("n", "new_session", "New session"),
+        Binding("a", "adopt", "Adopt"),
         Binding("escape", "clear_filter", "All sessions"),
         Binding("i", "show_tab('inbox')", "Inbox"),
         Binding("s", "show_tab('sessions')", "Sessions"),
@@ -224,6 +298,7 @@ class BoardApp(App):
                     yield DataTable(id="session-table", cursor_type="row")
                     with Horizontal(id="session-buttons"):
                         yield Button("New session", id="new", variant="success")
+                        yield Button("Adopt", id="adopt-open")
                         yield Button("Restore", id="restore")
                         yield Button("Restore all", id="restore-all", variant="warning")
                         yield Button("Park / unpark", id="park")
@@ -398,6 +473,26 @@ class BoardApp(App):
             return
         sid = self.store.create_session(**form)
         self.open_tab(sid)
+
+    def action_adopt(self) -> None:
+        if isinstance(self.focused, (TextArea, Input)):
+            return
+        self.push_screen(AdoptSession(adopt.candidates(self.store)), self.launch_adopted)
+
+    @on(Button.Pressed, "#adopt-open")
+    def adopt_pressed(self) -> None:
+        self.action_adopt()
+
+    def launch_adopted(self, form) -> None:
+        if not form:
+            return
+        try:
+            adopt.adopt(self.store, form["candidate"], form["name"])
+        except Exception as e:   # came back to life, wt.exe missing...
+            self.notify(str(e), severity="error")
+            return
+        self.notify(f"adopting {form['name'] or short(form['candidate'].id)} in a new tab")
+        self.refresh_data()
 
     def open_tab(self, sid: str) -> bool:
         try:

@@ -148,3 +148,45 @@ async def test_escape_closes_new_session(store, sid):
         await pilot.press("escape")
         await pilot.pause()
         assert [type(s).__name__ for s in app.screen_stack] == ["Screen"]
+
+
+def adoptable(sid="adopt-me", pid=None):
+    from claude_board.adopt import Candidate
+    return Candidate(sid, "/home/u/repo", "LG plugin fix", 0.0, pid)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("alive_on_adopt, launched, stack, desc", [
+    (None, [("adopt-me", "LG plugin fix")], ["Screen"], "an exited session is adopted at once"),
+    (4242, [], ["Screen", "AdoptSession"], "a running one stays in the dialog until /exit"),
+])
+async def test_adopt(store, monkeypatch, alive_on_adopt, launched, stack, desc):
+    from claude_board import adopt, liveness
+    monkeypatch.setattr(adopt, "candidates", lambda store: [adoptable(pid=4242)])
+    monkeypatch.setattr(liveness, "running_pid", lambda sid, *a: alive_on_adopt)
+    got = []
+    monkeypatch.setattr(adopt, "adopt", lambda store, c, name: got.append((c.id, name)))
+    app = BoardApp(store)
+    async with app.run_test(size=(160, 40)) as pilot:
+        await pilot.press("a")
+        await pilot.pause()
+        assert "Still running" in str(app.screen.query_one("#adopt-hint").render()), desc
+        await pilot.press("n")   # app keys stay out of the dialog
+        await pilot.pause()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert got == launched, desc
+        assert [type(s).__name__ for s in app.screen_stack] == stack, desc
+
+
+@pytest.mark.anyio
+async def test_escape_closes_adopt(store, monkeypatch):
+    from claude_board import adopt
+    monkeypatch.setattr(adopt, "candidates", lambda store: [])
+    app = BoardApp(store)
+    async with app.run_test(size=(160, 40)) as pilot:
+        await pilot.press("a")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        assert [type(s).__name__ for s in app.screen_stack] == ["Screen"]

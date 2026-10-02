@@ -6,7 +6,7 @@ from claude_board import launch
 
 
 def row(**over):
-    return {"id": "abc-123", "name": "demo", "ticket": "#7", "brief": "fix it", "cwd": "/home/u/repo"} | over
+    return {"id": "abc-123", "name": "demo", "ticket": "#7", "brief": "fix it", "cwd": "/home/u/repo", "adopted": 0} | over
 
 
 @pytest.mark.parametrize("over, title, cwd, desc", [
@@ -27,6 +27,8 @@ def test_wt_argv(over, title, cwd, desc):
     ({}, True, ["--resume", "-n"], ["--session-id"], None, "restore resumes without the brief"),
     ({"name": "", "ticket": "", "brief": ""}, False, ["--session-id"], ["-n"],
      "Session started from the board. Wait for instructions.", "bare launch"),
+    ({"adopted": 1}, True, ["--resume", "--system-prompt-snapshot"], ["--session-id"], None,
+     "an adopted session renders the prompt fresh, so it sees the protocol"),
 ])
 def test_claude_argv(over, resume, has, lacks, last, desc):
     argv = launch.claude_argv(row(**over), python="/py", resume=resume)
@@ -34,6 +36,7 @@ def test_claude_argv(over, resume, has, lacks, last, desc):
         assert flag in argv, desc
     for flag in lacks:
         assert flag not in argv, desc
+    assert ("--system-prompt-snapshot" in argv) == bool(over.get("adopted")), desc
     if last:
         assert argv[-1] == last, desc
     mcp = json.loads(argv[argv.index("--mcp-config") + 1])["mcpServers"]["board"]

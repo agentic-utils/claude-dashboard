@@ -41,7 +41,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     end_requested_at  TEXT,
     park_requested_at TEXT,
     end_told_at  TEXT,
-    park_told_at TEXT
+    park_told_at TEXT,
+    adopted      INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS items (
     id         INTEGER PRIMARY KEY,
@@ -72,7 +73,7 @@ CREATE INDEX IF NOT EXISTS messages_pending
 # columns added after the first release: (table, column, type)
 ADDED_COLUMNS = [("sessions", "end_requested_at", "TEXT"), ("sessions", "park_requested_at", "TEXT"),
                  ("sessions", "end_told_at", "TEXT"), ("sessions", "park_told_at", "TEXT"),
-                 ("messages", "claimed_at", "TEXT")]
+                 ("messages", "claimed_at", "TEXT"), ("sessions", "adopted", "INTEGER NOT NULL DEFAULT 0")]
 REQUESTS = ("end", "park")   # what the board can ask a running session to do
 CLAIM_TIMEOUT = 30   # seconds before a claim from a monitor that died mid-print is retaken
 
@@ -152,12 +153,15 @@ class Store:
 
     # sessions
 
-    def create_session(self, cwd: str, name: str = "", ticket: str = "", brief: str = "") -> str:
-        sid = str(uuid.uuid4())
+    def create_session(self, cwd: str, name: str = "", ticket: str = "", brief: str = "",
+                       sid: str | None = None) -> str:
+        """A new session, or (with sid) an adopted one keeping its Claude session id."""
+        adopted = sid is not None
+        sid = sid or str(uuid.uuid4())
         with self.tx() as db:
             db.execute(
-                "INSERT INTO sessions (id, name, ticket, brief, cwd, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (sid, name, ticket, brief, cwd, now()),
+                "INSERT INTO sessions (id, name, ticket, brief, cwd, created_at, adopted) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (sid, name, ticket, brief, cwd, now(), int(adopted)),
             )
         return sid
 
