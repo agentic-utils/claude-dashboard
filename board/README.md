@@ -17,7 +17,7 @@ WSL and Windows Terminal. Prototype: see `../.plan/session-board.md` for the des
 
 Only sessions launched from the board are tracked. Nothing is installed into your
 Claude Code settings: each launched session gets the board's MCP server, monitor,
-protocol and `/park` / `/end` commands through its own launch flags.
+protocol and `/wheelhouse park` / `/wheelhouse end` commands through its own launch flags.
 
 ## Run
 

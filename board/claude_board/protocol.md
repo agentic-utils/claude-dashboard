@@ -17,6 +17,6 @@ instead of restating things in chat.
 - The person's answers and hints arrive as notifications from the board monitor, marked
   `[board]`. Act on them as if typed in chat. If a notification says it was cut short,
   call `get_input(ref)` for the full text.
-- `/park` and `/end` handle the session's lifecycle (also `/board:park` and `/board:end`).
+- `/wheelhouse park` and `/wheelhouse end` handle the session's lifecycle (also `/board:wheelhouse`).
   The board may ask you to park or end, in a `[board]` notification; do it as the
   notification says. If a later one says the request was cancelled, carry on as before.

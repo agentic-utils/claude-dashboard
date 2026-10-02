@@ -258,7 +258,7 @@ def test_concurrent_first_start_on_an_old_database(tmp_path, monkeypatch):
         assert errors == [], f"attempt {n}: {errors}"
 
 
-# round 4: the session can vanish (in-session /end, or another board) while a dialog is open
+# round 4: the session can vanish (in-session /wheelhouse end, or another board) while a dialog is open
 
 def notices(app, monkeypatch):
     seen = []

@@ -47,7 +47,7 @@ also standalone: it only tracks sessions it launched, needs no global hooks, set
 | stalled | live, but quiet | live, heartbeat older than 120 s, and the board has not just woken from sleep. A hint only |
 | dead | process gone | anything else |
 | parking / ending | Park or End pressed on a running session | `park_requested_at` or `end_requested_at` set and the session is live, stalled or starting |
-| (ended) | `/end`, or End on a dead session, or Force end | rows deleted |
+| (ended) | `/wheelhouse end`, or End on a dead session, or Force end | rows deleted |
 
 **Parked is a flag, not a state.** It is shown alongside the state ("dead · parked"),
 hides the session from the inbox and keeps it off Restore All. It never hides whether
@@ -83,12 +83,12 @@ and End treat it as live.
 - **Park and End on a dead session act straight away**, after a confirm that names the
   session. Unpark is immediate. Any launch clears leftover requests, so a restored
   session is never told to end or park itself.
-- **A session can vanish at any moment** (an in-session `/end`, or Force from another
+- **A session can vanish at any moment** (an in-session `/wheelhouse end`, or Force from another
   board), including while one of the board's dialogs is open. Every session action in
   the TUI goes through one guard (`session_action`): if the row has gone it says
   "session no longer exists" and repaints. The dead-session path re-checks liveness when
   the confirm is answered: if the session came back, it acts on nothing.
-- **In-session `/park` and `/end`** are unchanged: the session saves what it needs, then
+- **In-session `/wheelhouse park` and `/wheelhouse end`** are unchanged: the session saves what it needs, then
   acts on itself. Claude Code's own transcript is untouched either way.
 
 ## Launching
@@ -142,12 +142,13 @@ A static plugin directory shipped in the package, loaded per session with `--plu
   "listener that exits to wake the session" and the `PostToolUse` hook from the design
   discussion, and it restarts with the session on resume, so no `SessionStart` hook is
   needed either.
-- **Skills**: `/park` and `/end`. A plugin skill whose frontmatter sets `name` answers to
-  the bare name as well as the namespaced one ("The bare `/fancy` also invokes the skill
-  unless another command already uses that name", code.claude.com/docs/en/skills).
-  Checked headless with `disable-model-invocation: true` as these skills use: `/park`
-  resolves. `/board:park` and `/board:end` remain as fallbacks if another command takes
-  the bare names.
+- **Skill**: one `wheelhouse` skill, run as `/wheelhouse park` or `/wheelhouse end`; it
+  reads `$ARGUMENTS` and replies with usage for anything else. A plugin skill whose
+  frontmatter sets `name` answers to the bare name as well as the namespaced one ("The
+  bare `/fancy` also invokes the skill unless another command already uses that name",
+  code.claude.com/docs/en/skills). Checked headless with `disable-model-invocation: true`
+  on the earlier `/park` skill: the bare name resolves. `/board:wheelhouse` remains as a
+  fallback if another command takes the bare name.
 
 ## Data model
 

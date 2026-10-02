@@ -403,7 +403,7 @@ class BoardApp(App):
         self.push_screen(NewSession(), self.launch_new)
 
     def row(self, sid: str):
-        """The session's row, or SessionGone: it can end at any moment (in-session /end)."""
+        """The session's row, or SessionGone: it can end at any moment (in-session /wheelhouse end)."""
         s = self.store.session(sid)
         if s is None:
             raise SessionGone(sid)
