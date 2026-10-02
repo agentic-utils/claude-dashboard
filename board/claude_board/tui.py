@@ -116,7 +116,8 @@ class Confirm(ModalScreen):
                 yield Button("[N]o", id="no")
 
     def on_key(self, event) -> None:
-        if event.key in ("y", "n"):
+        if event.key in ("y", "n", "escape"):
+            event.stop()
             self.dismiss(event.key == "y")
 
     @on(Button.Pressed)

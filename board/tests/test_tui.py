@@ -103,3 +103,22 @@ async def test_a_send_racing_an_end_does_not_crash(store, sid, monkeypatch):
         app.query_one("#answer", TextArea).text = "too late"
         await pilot.press("ctrl+s")
         await pilot.pause()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("key, expected, desc", [
+    ("n", False, "N declines without opening New session"),
+    ("y", True, "Y confirms"),
+    ("escape", False, "Escape declines instead of clearing the filter underneath"),
+])
+async def test_confirm_keys_stay_in_the_dialog(store, sid, key, expected, desc):
+    """R5 #1: Confirm's keys must not also reach the app bindings."""
+    app = BoardApp(store)
+    answers = []
+    async with app.run_test(size=(160, 40)) as pilot:
+        app.push_screen(Confirm("sure?"), answers.append)
+        await pilot.pause()
+        await pilot.press(key)
+        await pilot.pause()
+        assert answers == [expected], desc
+        assert [type(s).__name__ for s in app.screen_stack] == ["Screen"], desc
