@@ -219,9 +219,15 @@ One `Context` object, passed to `start`, `cli` and every surface factory:
 Nothing else. If a module needs more, the protocol grows (with an API bump if
 it breaks anyone).
 
+The hub alone decides what goes into the sessions it launches: the MCP
+server, the monitor, the protocol text and the `/wheelhouse` skill. In v1 a
+module does not add MCP tools, skills or protocol text to a session. This
+slot opens when a real module needs it.
+
 ### Compatibility and isolation
 
-The hub declares `WHEELHOUSE_API`, a single integer. A module whose `api`
+The hub declares `WHEELHOUSE_API`, a single integer, bumped on any breaking
+change and matched exactly (no version ranges). A module whose `api`
 differs is not started: its tab shows an error card saying which version it
 needs and which the hub has. A module that fails to import, raises in
 `start`, or raises inside its widget subtree gets the same treatment: an error
@@ -240,18 +246,8 @@ app on an uncaught exception is overridden by a container around each pane.
   `badge()` returns quickly without network, published views match `wh_<id>_*`.
 - Review and dashboard are written against the same protocol and pass the
   same tests, which keeps the protocol honest.
-
-### Open questions
-
-- **Q28 session contributions.** Should a module be able to add MCP tools,
-  skills or protocol text to the sessions the wheelhouse launches?
-  Recommendation: not in v1. The hub keeps sole ownership of what is
-  injected into a session; revisit when a real module needs it.
-- **Q29 versioning.** Recommendation: one integer API version, bumped on any
-  breaking change, matched exactly. No semver ranges.
-- **Q30 scaffolding.** Recommendation: the example module and the conformance
-  tests now; no `claude-wheelhouse new-module` scaffold command until a second
-  outside contributor appears.
+- A contributor starts by copying the example module. A scaffold command
+  (`claude-wheelhouse new-module`) waits until copying stops being enough.
 
 ## Data ownership
 
