@@ -19,6 +19,23 @@ it as panes, so one window shows everything that needs attention.
 3. **Surface-agnostic content.** Every package serves its content through a
    service layer, so a browser surface can be added later without touching
    module logic. The browser surface itself is not in scope.
+4. **Wheelhouse reports, never directs.** Everything wheelhouse injects into a
+   session (`protocol.md`, the MCP tool descriptions, the `/wheelhouse` skill)
+   tells the model where and how to report, and nothing about how to work.
+   The user's own instructions (CLAUDE.md and the like) stay the only source
+   of working practice; wheelhouse never overrides them or adds to them. In
+   Doug's words: "Wheelhouse must NEVER override a user's instructions in
+   CLAUDE.md. It does not dictate that certain practices will be followed; it
+   ONLY indicates how to report practices of a certain type, should the
+   user's CLAUDE.md instruct it to behave in that way."
+   - Where wheelhouse defines a kind of report, such as autonomous decisions
+     (claude-wheelhouse issue #61), the injected text says explicitly that it
+     applies only when the user's instructions already have the model work
+     that way, and otherwise there is nothing to report.
+   - Naming a way of working in context nudges the model towards it, so any
+     such section is checked for that before it ships: A/B headless runs of
+     the same tasks with and without the section, comparing how the model
+     behaves, not just what it reports.
 
 Non-goals: a generic, schema-driven UI that renders on both surfaces; remote
 access; anything that spans Linux users (one instance per user, as today).
