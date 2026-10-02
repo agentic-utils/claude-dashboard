@@ -1,5 +1,9 @@
 # claude-dashboard
 
+> This repository (claude-wheelhouse) is an independent open-source productivity tool. It
+> is not affiliated with, endorsed by or supported by Anthropic. "Claude" is a trademark
+> of Anthropic. MIT licensed, see [LICENSE](LICENSE).
+
 A live terminal dashboard for **Claude Code cache-token usage**. Pure Python
 stdlib, single file, 24-bit truecolour. It scans your Claude Code transcripts
 under `~/.claude/projects/**/*.jsonl`, reads the per-response `usage` data, and
@@ -158,9 +162,9 @@ re-login inside the account popup.
   that directory is read-only (a brew install). Diagnostics only, no secrets;
   it's gitignored.
 
-## Session board (prototype)
+## claude-wheelhouse (prototype)
 
-`board/` holds **claude-board**, a separate Textual app for tracking tasks,
+`wheelhouse/` holds **claude-wheelhouse**, a separate Textual app for tracking tasks,
 questions and the lifecycle of several Claude Code sessions run in parallel. It has
 its own dependencies, so this dashboard stays a single stdlib-only file. See
-[board/README.md](board/README.md).
+[wheelhouse/README.md](wheelhouse/README.md).

@@ -1,4 +1,4 @@
-# Session board
+# Wheelhouse sessions (prototype)
 
 Issue: #55
 
@@ -8,23 +8,23 @@ Run several Claude Code sessions in parallel and keep track of them from one pla
 Every task, question and subagent status lives in a store with a stable id and a full
 detail body, so Claude writes it once and refers to it by id (`Q3`), and the person
 reads it in one inbox instead of scrolling back through several terminals. Answers and
-hints typed into the board reach the right session, and wake it if it is idle.
+hints typed into the wheelhouse reach the right session, and wake it if it is idle.
 
-The board is a sidecar: conversation still happens in the Claude Code terminal. It is
+The wheelhouse is a sidecar: conversation still happens in the Claude Code terminal. It is
 also standalone: it only tracks sessions it launched, needs no global hooks, settings or
 `CLAUDE.md` changes, and leaves every other session alone.
 
 ## Shape
 
 ```
-  claude-board (Textual TUI)            one per Linux user
+  claude-wheelhouse (Textual TUI)            one per Linux user
         |  reads / writes
         v
-  ~/.local/state/claude-board/board.db  SQLite, WAL, synchronous=FULL
+  ~/.local/state/claude-wheelhouse/wheelhouse.db  SQLite, WAL, synchronous=FULL
         ^                     ^
         | MCP tools           | polls every 2 s
-  board MCP server      board monitor            both started per session by the
-  (per session)         (per session)            board plugin / launch flags
+  wheelhouse MCP server wheelhouse monitor       both started per session by the
+  (per session)         (per session)            wheelhouse plugin / launch flags
         \                     /
          Claude Code session in a Windows Terminal tab
 ```
@@ -33,7 +33,7 @@ also standalone: it only tracks sessions it launched, needs no global hooks, set
   transaction before the call returns. The TUI, MCP servers and monitors are separate
   processes that only talk through the database, so any of them can die without the
   others noticing. The TUI is a window onto the data, nothing more.
-- **Location.** `~/.local/state/claude-board/board.db`, overridable with `BOARD_DB`.
+- **Location.** `~/.local/state/claude-wheelhouse/wheelhouse.db`, overridable with `WHEELHOUSE_DB`.
   Paths under `/mnt/` are refused: SQLite locking on the Windows drive mount is not
   reliable.
 - **One instance per Linux user.** Each user has their own database in their own home.
@@ -44,7 +44,7 @@ also standalone: it only tracks sessions it launched, needs no global hooks, set
 |---|---|---|
 | starting | launched, not yet registered | no process recorded for this launch, launched under 90 s ago |
 | live | session process running | recorded Claude pid exists in `/proc` with the same start time, same boot id |
-| stalled | live, but quiet | live, heartbeat older than 120 s, and the board has not just woken from sleep. A hint only |
+| stalled | live, but quiet | live, heartbeat older than 120 s, and the wheelhouse has not just woken from sleep. A hint only |
 | dead | process gone | anything else |
 | parking / ending | Park or End pressed on a running session | `park_requested_at` or `end_requested_at` set and the session is live, stalled or starting |
 | (ended) | `/wheelhouse end`, or End on a dead session, or Force end | rows deleted |
@@ -69,7 +69,7 @@ inbox too, by design: parking is your own signal to set it aside.
   double press opens one tab. The launch wrapper then checks and registers in a single
   compare-and-set transaction before it execs Claude, so two tabs racing for the same
   session can't both start it.
-- **The board never deletes or hides a running session's data behind its back.** There
+- **The wheelhouse never deletes or hides a running session's data behind its back.** There
   is no automatic clean-up of any kind; every deletion and every park comes from the
   session itself or from a button the person pressed and confirmed.
 - **Park and End on a running session are requests.** The button (after a confirm that
@@ -86,7 +86,7 @@ inbox too, by design: parking is your own signal to set it aside.
   session. Unpark is immediate. Any launch clears leftover requests, so a restored
   session is never told to end or park itself.
 - **A session can vanish at any moment** (an in-session `/wheelhouse end`, or Force from another
-  board), including while one of the board's dialogs is open. Every session action in
+  wheelhouse), including while one of the wheelhouse's dialogs is open. Every session action in
   the TUI goes through one guard (`session_action`): if the row has gone it says
   "session no longer exists" and repaints. The dead-session path re-checks liveness when
   the confirm is answered: if the session came back, it acts on nothing.
@@ -101,7 +101,7 @@ writes the session row, then opens a Windows Terminal tab:
 
 ```
 cmd.exe /c wt.exe -w 0 new-tab --title <name> wsl.exe -d <distro> -u <user> --cd <dir> -- \
-    <python> -m claude_board run <session-id>
+    <python> -m claude_wheelhouse run <session-id>
 ```
 
 `wt.exe` is a Windows execution alias that WSL can't execute directly (it resolves on
@@ -115,29 +115,29 @@ an option.
 A directory Claude Code doesn't trust yet shows its trust prompt in the new tab; answer
 it there.
 
-Everything else is read from the database by `claude_board run`, which then execs:
+Everything else is read from the database by `claude_wheelhouse run`, which then execs:
 
 ```
 claude --session-id <id> | --resume <id>
-       --plugin-dir <board plugin>
-       --mcp-config <inline JSON: the board MCP server for this session>
-       --append-system-prompt <board protocol>
+       --plugin-dir <wheelhouse plugin>
+       --mcp-config <inline JSON: the wheelhouse MCP server for this session>
+       --append-system-prompt <wheelhouse protocol>
        -n <name>
        [opening brief, first launch only]
 ```
 
-with `BOARD_SESSION_ID`, `BOARD_DB` and `BOARD_PYTHON` in the environment. Keeping the
+with `WHEELHOUSE_SESSION_ID`, `WHEELHOUSE_DB` and `WHEELHOUSE_PYTHON` in the environment. Keeping the
 brief out of the `wt.exe` command line avoids its `;` command separator and Windows
 quoting entirely.
 
 `--resume` is used when a transcript for the id already exists under
 `~/.claude/projects/`, otherwise `--session-id` and the brief.
 
-## The board plugin
+## The wheelhouse plugin
 
 A static plugin directory shipped in the package, loaded per session with `--plugin-dir`:
 
-- **Monitor** (`monitors/monitors.json`): runs `claude_board monitor` for the whole
+- **Monitor** (`monitors/monitors.json`): runs `claude_wheelhouse monitor` for the whole
   session. It polls the database every 2 s and prints one line per new message from the
   person. Plugin monitors deliver each printed line to Claude as a notification and
   Claude interjects when one arrives, idle or mid-task. This replaces both the
@@ -150,7 +150,7 @@ A static plugin directory shipped in the package, loaded per session with `--plu
   bare `/fancy` also invokes the skill unless another command already uses that name",
   code.claude.com/docs/en/skills). Checked headless on `/wheelhouse` itself (claude
   2.1.287, `disable-model-invocation: true`): the session lists the skill as
-  `board:wheelhouse`, and `/wheelhouse bogus` returns the usage line. `/board:wheelhouse`
+  `wheelhouse:wheelhouse`, and `/wheelhouse bogus` returns the usage line. `/wheelhouse:wheelhouse`
   remains as a fallback if another command takes the bare name.
 
 ## Data model
@@ -176,7 +176,7 @@ Statuses: task `todo running blocked waiting done dropped`; question
 `open answered closed`; agent `running done failed`. A person's message on an open
 question marks it answered.
 
-## MCP tools (server name `board`)
+## MCP tools (server name `wheelhouse`)
 
 | Tool | Does |
 |---|---|
@@ -202,10 +202,10 @@ needs Claude Code itself to stall.
 
 Writes check the session inside their transaction (`BEGIN IMMEDIATE` holds the write
 lock, so the row can't vanish between check and write) and raise `SessionGone` if it
-has gone. Board tools then answer "this session was force-ended on the board (or has
-ended): stop using board tools", and the monitor prints the same once and exits.
+has gone. Wheelhouse tools then answer "this session was force-ended in the wheelhouse (or has
+ended): stop using wheelhouse tools", and the monitor prints the same once and exits.
 
-`claude_board run` registers the session's pid, start time and boot id just before it
+`claude_wheelhouse run` registers the session's pid, start time and boot id just before it
 execs Claude, as a compare-and-set that fails if another live Claude holds the session.
 exec keeps the pid, so the registered pid is Claude's, and a session at the trust prompt
 or with a slow MCP server never looks dead. The server only writes a
@@ -214,11 +214,11 @@ serialises access to its one connection with a lock.
 
 ## Adopting a session
 
-Adopt brings a session the board didn't launch onto the board, by handoff. Hot adoption
+Adopt brings a sessiin the wheelhouse didn't launch into the wheelhouse, by handoff. Hot adoption
 (attaching to a session without restarting it) is deferred.
 
 - **Candidates.** Transcripts under `~/.claude/projects/*/*.jsonl` touched in the last
-  14 days and not already on the board, newest first, at most 40. Subagent transcripts
+  14 days and not already in the wheelhouse, newest first, at most 40. Subagent transcripts
   sit a level deeper and are never offered; headless runs (`entrypoint` other than
   `cli`) are skipped. The title is the session's custom title, else its AI title, else
   its first typed prompt. Only the first and last 256 KB of each file are read.
@@ -228,10 +228,10 @@ Adopt brings a session the board didn't launch onto the board, by handoff. Hot a
   `sessionId`, `procStart`) for each running session. Records of dead sessions linger,
   so one counts only while `/proc/<pid>/stat` agrees on the start time. A running
   session is never launched: the dialog says to type `/exit` in its tab, and Adopt checks
-  again when pressed. `claude_board run` also refuses inside the new tab if the session
+  again when pressed. `claude_wheelhouse run` also refuses inside the new tab if the session
   is running elsewhere, which covers Restore as well.
 - **Launch.** The session is registered under its own Claude session id with
-  `adopted = 1`, then opened like a restore: `claude --resume <id>` with the board's
+  `adopted = 1`, then opened like a restore: `claude --resume <id>` with the wheelhouse's
   plugin, MCP server and protocol. A launch that fails removes the row again.
 - **The protocol needs `--system-prompt-snapshot off`.** Claude records the system
   prompt at a conversation's first request and replays it on every resume, so an
@@ -255,15 +255,15 @@ Adopt brings a session the board didn't launch onto the board, by handoff. Hot a
 ## Relationship to the cache dashboard
 
 For the prototype, `claude_dashboard.py` stays as it is: single file, stdlib only,
-because the Homebrew formula installs it by copying that file. The board is a separate
-project in `board/` with its own dependencies (Textual, the MCP SDK) and its own
-`claude-board` command.
+because the Homebrew formula installs it by copying that file. The wheelhouse is a separate
+project in `wheelhouse/` with its own dependencies (Textual, the MCP SDK) and its own
+`claude-wheelhouse` command.
 
 ## Path to a single tool
 
-The goal is one tool: the board, with the cache view as one of its tabs.
+The goal is one tool: the wheelhouse, with the cache view as one of its tabs.
 
-1. Package the repo as one Python project with both commands (`claude-board`, and
+1. Package the repo as one Python project with both commands (`claude-wheelhouse`, and
    `claude-dashboard` kept as an alias that opens the cache tab), installed with
    `uv tool install` instead of the Homebrew single-file copy. Point the Homebrew formula
    at the package, or retire it with a note in the README.
@@ -291,13 +291,13 @@ The goal is one tool: the board, with the cache view as one of its tabs.
 
 ## Verified end to end
 
-A real session launched through `claude_board run` (headless, in a pty) registered its
+A real session launched through `claude_wheelhouse run` (headless, in a pty) registered its
 Claude process, started the monitor, posted `T1` through the MCP server, received a
-board message through the monitor while idle, acted on it, and deleted its own data
+wheelhouse message through the monitor while idle, acted on it, and deleted its own data
 with `end_session`. A second headless run checked the registered pid directly: it was
 the forked pid, `/proc/<pid>/comm` was `claude` with the `--session-id` command line,
-and it was still the running process (with the board's MCP server and monitor as
-children) after the trust prompt and the brief. A launch through Windows Terminal reached `claude_board run` in the
+and it was still the running process (with the wheelhouse's MCP server and monitor as
+children) after the trust prompt and the brief. A launch through Windows Terminal reached `claude_wheelhouse run` in the
 new tab (confirmed by `launch.log`).
 
 ## Open questions
@@ -307,4 +307,4 @@ new tab (confirmed by `launch.log`).
 2. Notification size: the monitor prints answers up to 1,500 characters inline and
    points to `get_input(ref)` for longer ones. Is that the right cut-off?
 3. When to take the first step of "Path to a single tool": straight after the prototype
-   settles, or once the board has been in daily use for a while?
+   settles, or once the wheelhouse has been in daily use for a while?
