@@ -29,21 +29,15 @@ REQUEST_TEXT = {
 
 
 def poll_once(store: Store, sid: str, out=sys.stdout) -> int | None:
-    """Pass on new End or Park requests, then the person's messages: claim, print and flush,
-    then confirm. If printing fails (stdout closed as the session dies), release the claim
-    so the messages are delivered next time. Returns None once the session has gone."""
+    """Pass on the person's messages (claim, print and flush, then confirm), then new End or
+    Park requests. Messages go first so that a cancel of an earlier request is never heard
+    after the fresh request that replaced it. If printing fails (stdout closed as the session
+    dies), release the claim so the messages are delivered next time. Returns None once the
+    session has gone."""
     session = store.session(sid)
     if session is None:
         print(GONE_TEXT, file=out, flush=True)
         return None
-    for what, text in REQUEST_TEXT.items():
-        asked = session[f"{what}_requested_at"]
-        if asked and session[f"{what}_told_at"] != asked and store.tell_request(sid, what, asked):
-            try:
-                print(text, file=out, flush=True)
-            except BaseException:
-                store.untell_request(sid, what)
-                raise
     msgs = store.claim(sid)
     shown = 0
     try:
@@ -53,6 +47,14 @@ def poll_once(store: Store, sid: str, out=sys.stdout) -> int | None:
     finally:
         store.confirm(msgs[:shown])
         store.release(msgs[shown:])
+    for what, text in REQUEST_TEXT.items():
+        asked = session[f"{what}_requested_at"]
+        if asked and session[f"{what}_told_at"] != asked and store.tell_request(sid, what, asked):
+            try:
+                print(text, file=out, flush=True)
+            except BaseException:
+                store.untell_request(sid, what)
+                raise
     return shown
 
 

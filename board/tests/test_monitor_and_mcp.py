@@ -95,3 +95,15 @@ def test_reading_a_thread_marks_its_messages_delivered(store, sid):
     out = io.StringIO()
     assert monitor.poll_once(store, sid, out) == 1
     assert "unrelated" in out.getvalue() and "postgres" not in out.getvalue()
+
+
+def test_a_cancel_then_a_fresh_request_arrive_in_order(store, sid):
+    """R5 #2: within one poll, the cancel of the old request must come before the new one."""
+    store.request(sid, "end")
+    monitor.poll_once(store, sid, io.StringIO())
+    store.cancel_request(sid, "end")
+    store.request(sid, "end")
+    out = io.StringIO()
+    monitor.poll_once(store, sid, out)
+    text = out.getvalue()
+    assert text.index("cancelled the end request") < text.index("pressed End"), text
