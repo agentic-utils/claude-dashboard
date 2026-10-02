@@ -29,6 +29,18 @@ REQUEST_TEXT = {
 }
 
 
+def retry(fn, attempts: int = 5, pause: float = 0.2):
+    """Retry a write that hit "database is locked". Used for confirm: the messages have
+    been printed, so leaving them claimed would print them again once the claim goes stale."""
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(pause)
+
+
 def poll_once(store: Store, sid: str, out=sys.stdout) -> int | None:
     """Pass on the person's messages (claim, print and flush, then confirm), then new End or
     Park requests. Messages go first so that a cancel of an earlier request is never heard
@@ -46,8 +58,10 @@ def poll_once(store: Store, sid: str, out=sys.stdout) -> int | None:
             print(format_message(m), file=out, flush=True)
             shown += 1
     finally:
-        store.confirm(msgs[:shown])
-        store.release(msgs[shown:])
+        try:
+            retry(lambda: store.confirm(msgs[:shown]))
+        finally:
+            store.release(msgs[shown:])
     for what, text in REQUEST_TEXT.items():
         asked = session[f"{what}_requested_at"]
         if asked and session[f"{what}_told_at"] != asked and store.tell_request(sid, what, asked):

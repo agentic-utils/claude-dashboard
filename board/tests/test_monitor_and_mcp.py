@@ -124,3 +124,24 @@ def test_the_monitor_survives_a_locked_database(sid, monkeypatch):
     monkeypatch.setattr(monitor.time, "sleep", lambda s: None)
     monitor.main(sid)
     assert len(calls) == 3
+
+
+def test_a_failed_confirm_is_retried_not_left_for_the_claim_timeout(store, sid, monkeypatch):
+    """R6: if confirm hits "database is locked" after printing, retry it, so the message
+    isn't printed again when its claim goes stale 30 s later."""
+    import sqlite3
+    store.send(sid, "delete the branch")
+    real_confirm, fails = store.confirm, [1]
+
+    def confirm(msgs):
+        if fails:
+            fails.pop()
+            raise sqlite3.OperationalError("database is locked")
+        real_confirm(msgs)
+
+    monkeypatch.setattr(store, "confirm", confirm)
+    monkeypatch.setattr(monitor.time, "sleep", lambda s: None)
+    out = io.StringIO()
+    assert monitor.poll_once(store, sid, out) == 1
+    assert store.pending(sid) == []
+    assert out.getvalue().count("delete the branch") == 1
