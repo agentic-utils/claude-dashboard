@@ -11,7 +11,7 @@ it as panes, so one window shows everything that needs attention.
 
 1. **One hub, optional modules.** `claude-wheelhouse` is the one package
    everyone installs: sessions, inbox, store, the wheelhouse app. Review and
-   dash are separate packages that plug into it; install only the ones you
+   dashboard are separate packages that plug into it; install only the ones you
    want. Each module runs inside the wheelhouse and depends on it.
 2. **A thin host.** The wheelhouse app hosts panes and owns no module data.
    The hub's own data is sessions and their threads; everything a module
@@ -29,7 +29,7 @@ access; anything that spans Linux users (one instance per user, as today).
 |---|---|---|
 | `claude-wheelhouse` | The hub: sessions (launch, adopt, liveness, park, end), inbox of tasks and questions, store, MCP server, monitor, the `claude-wheelhouse` CLI, the wheelhouse app, theme (colour, shimmer, Cylon, Matrix cursor), the Pane and Service protocols, shared session views | `board/` (PR #56) plus theme pieces of `claude_dashboard.py` |
 | `claude-wheelhouse-review` | Open PRs and unopened branches, with merge/draft/close actions | The PR tab inside `claude_dashboard.py` |
-| `claude-wheelhouse-dash` | Cache-token dashboard | `claude_dashboard.py` live/history views |
+| `claude-wheelhouse-dashboard` | Cache-token dashboard | `claude_dashboard.py` live/history views |
 
 PyPI names checked on 2026-10-02: `claude-wheelhouse` is free.
 `claude-board`, `claude-review` and `claude-dashboard` are taken, which is why
@@ -49,8 +49,8 @@ claude-wheelhouse/
       src/claude_wheelhouse/
     review/                 claude-wheelhouse-review
       src/claude_wheelhouse_review/
-    dash/                   claude-wheelhouse-dash
-      src/claude_wheelhouse_dash/
+    dashboard/              claude-wheelhouse-dashboard
+      src/claude_wheelhouse_dashboard/
 ```
 
 Each package has its own `pyproject.toml`, tests and version. Module packages
@@ -64,7 +64,7 @@ PyPI:
 ```
 uv tool install "claude-wheelhouse @ git+https://github.com/agentic-utils/claude-wheelhouse#subdirectory=packages/wheelhouse" \
     --with "claude-wheelhouse-review @ git+...#subdirectory=packages/review" \
-    --with "claude-wheelhouse-dash @ git+...#subdirectory=packages/dash"
+    --with "claude-wheelhouse-dashboard @ git+...#subdirectory=packages/dashboard"
 ```
 
 That is long. The README gets a copy-paste block, and a `claude-wheelhouse
@@ -118,7 +118,8 @@ decides anything lives in the service.
 
 ### Surfaces
 
-A package declares its surfaces in a dict, keyed by surface name:
+A pane declares its surfaces in a dict, keyed by surface name (see
+"Module protocol"):
 
 ```python
 surfaces = {"tui": make_review_widget}     # later: "web": make_review_router
@@ -133,45 +134,130 @@ browser tab with no extra code. It is not a web surface (it streams the
 terminal UI), but it answers "I want this in a browser tab" until there is
 demand for a real one.
 
-## Pane contract
+## Module protocol
 
-The hub defines the protocol the wheelhouse app consumes, and its own views
-(inbox, sessions) use it too, so every pane gets the same isolation:
+Anyone can add a module, the review and dashboard modules included, by
+writing a package against one public protocol. The hub has no private hooks
+for its own modules: if review needs something, it goes into the protocol.
 
-```python
-class Pane(Protocol):
-    id: str                          # "inbox", "sessions", "review", "dash"
-    title: str
-    service: Service
-    surfaces: dict[str, Callable[[Service], object]]
-    def badge(self) -> Badge | None: ...   # count + severity, or None
-```
+### Discovery
 
-Modules register a factory under the entry-point group
-`claude_wheelhouse.panes`:
+A module is a Python package that declares one entry point in the group
+`claude_wheelhouse.modules`, pointing at its module object:
 
 ```toml
-[project.entry-points."claude_wheelhouse.panes"]
-review = "claude_wheelhouse_review:pane"
+[project.entry-points."claude_wheelhouse.modules"]
+review = "claude_wheelhouse_review:module"
 ```
 
-**Badges are the point of the app.** The tab bar reads
-`Inbox 3 . Review 1 . Dash !` so the user sees where attention is needed
-without visiting each tab. `badge()` is a cheap query on the service and is
-called on the change-feed tick, never on every frame.
+Installing the package (for example with `uv tool install ... --with`) is
+all it takes. The hub reads the entry points at startup; there is no config
+file to edit and nothing to register by hand. `claude-wheelhouse modules`
+lists what it found: id, package version, API version and status (loaded,
+incompatible, failed, with the reason).
 
-**Pane isolation.** The app constructs each pane inside a guard and wraps
-its widget in a container that catches exceptions from that subtree
-(Textual's default is to tear down the whole app). A failed pane shows an
-error card with the traceback summary and a retry key; the other panes keep
-running. A module that fails to import (a broken install) is listed as
-unavailable rather than crashing discovery.
+### The module object
+
+Only the metadata is required. Every other slot is optional, so a module can
+be a single pane, a single CLI subcommand, or both.
+
+```python
+class Module(Protocol):
+    id: str                 # "review"; also its tab, CLI word and DB name
+    title: str              # "Review"
+    version: str            # the package version
+    api: int                # the WHEELHOUSE_API it was written against
+
+    # optional slots
+    panes: list[Pane]                      # tabs in the wheelhouse app
+    cli: Callable[[Context, list[str]], int] | None   # claude-wheelhouse <id> ...
+    service: Service | None                # queries, commands, changes()
+    def start(self, ctx: Context) -> None: ...        # open DB, start refreshers
+    def stop(self) -> None: ...                       # flush and release
+
+class Pane(Protocol):
+    title: str
+    surfaces: dict[str, Callable[[Context], object]]  # {"tui": make_widget}
+    bindings: list[Binding]
+    def badge(self) -> Badge | None: ...              # count + severity, or None
+```
+
+Rules a module follows:
+
+- **Service first.** Queries return JSON-able dataclasses; commands raise
+  errors from the hub's hierarchy (`WheelhouseError` and subclasses); the
+  change feed says when to redraw (see "Service" above). Widgets hold no
+  logic.
+- **Its own data.** A module keeps its database at
+  `<state dir>/<id>.db` and never writes anyone else's. What it wants to
+  share, it publishes as read-only SQLite views named `wh_<id>_*` (see
+  "Data ownership").
+- **Badges are cheap.** `badge()` runs on the change-feed tick and must not
+  touch the network.
+- **No cross-imports.** A module imports `claude_wheelhouse` and nothing from
+  another module. Modules meet only through published views.
+
+The hub's own inbox and sessions views are panes built the same way, so they
+get the same isolation.
+
+**Badges are the point of the app.** The tab bar reads
+`Inbox 3 . Review 1 . Dashboard !` so the user sees where attention is
+needed without visiting each tab.
+
+### What the hub gives a module
+
+One `Context` object, passed to `start`, `cli` and every surface factory:
+
+- `state_dir`: where the module keeps its database and cache.
+- `sessions()`: read-only access to the hub's `wh_sessions` view.
+- `views(module_id)`: read-only access to another module's published views,
+  treating a missing database or view as "nothing known".
+- `changes()`: the hub's change feed, to redraw when sessions move.
+- `notify(text, severity)`: a toast in whichever surface is showing.
+- `config`: the module's own section of the user's config.
+
+Nothing else. If a module needs more, the protocol grows (with an API bump if
+it breaks anyone).
+
+### Compatibility and isolation
+
+The hub declares `WHEELHOUSE_API`, a single integer. A module whose `api`
+differs is not started: its tab shows an error card saying which version it
+needs and which the hub has. A module that fails to import, raises in
+`start`, or raises inside its widget subtree gets the same treatment: an error
+card with the reason, a summary of the traceback and a retry key. The other
+modules and the app keep running. Textual's default of tearing down the whole
+app on an uncaught exception is overridden by a container around each pane.
+
+### Contributor kit
+
+- **An example module** in the repo (`examples/hello/`): one pane with a
+  badge, one CLI subcommand, a tiny service and its own database. It is the
+  template a contributor copies.
+- **Conformance tests** in `claude_wheelhouse.testing`, which a module runs
+  in its own suite: entry point resolves, metadata present, `api` matches,
+  `start`/`stop` with a temporary state dir, every surface factory builds,
+  `badge()` returns quickly without network, published views match `wh_<id>_*`.
+- Review and dashboard are written against the same protocol and pass the
+  same tests, which keeps the protocol honest.
+
+### Open questions
+
+- **Q28 session contributions.** Should a module be able to add MCP tools,
+  skills or protocol text to the sessions the wheelhouse launches?
+  Recommendation: not in v1. The hub keeps sole ownership of what is
+  injected into a session; revisit when a real module needs it.
+- **Q29 versioning.** Recommendation: one integer API version, bumped on any
+  breaking change, matched exactly. No semver ranges.
+- **Q30 scaffolding.** Recommendation: the example module and the conformance
+  tests now; no `claude-wheelhouse new-module` scaffold command until a second
+  outside contributor appears.
 
 ## Data ownership
 
 Each package owns its own SQLite database under
 `~/.local/state/claude-wheelhouse/`: the hub's `wheelhouse.db`, and
-`<module>.db` for each module, with the durability rules already proven in the
+`<id>.db` for each module, with the durability rules already proven in the
 prototype (WAL, `synchronous=FULL`, one transaction per write). No package
 writes another package's database.
 
@@ -183,14 +269,15 @@ publishing convention:
 - The hub exposes what it knows about sessions (name, ticket, directory,
   state) as a SQLite view `wh_sessions` with `session_id` as its first column.
 - A module that knows something about sessions exposes it the same way, as
-  `wh_sessions_<module>`, so the hub's sessions view can show it.
+  a view named `wh_<id>_sessions`, so the hub's sessions view can show it.
+  Any other view a module publishes is also named `wh_<id>_*`.
 - A reader opens the other database read-only (`file:...?mode=ro` URI)
   through a hub helper and treats a missing file or view as "not installed
   yet" or "nothing known".
 
 So the review pane can show "opened by session *Rare caper*" by reading the
 hub's `wh_sessions` view, and the sessions view can show a session's open PRs
-from `wh_sessions_review`.
+from `wh_review_sessions`.
 
 ## The `claude-wheelhouse` CLI and the slash commands
 
@@ -214,12 +301,13 @@ One CLI, owned by the hub:
 ```
 claude-wheelhouse              the wheelhouse app
 claude-wheelhouse review       the review pane on its own
-claude-wheelhouse dash         the cache dashboard on its own
+claude-wheelhouse dashboard    the cache dashboard on its own
+claude-wheelhouse modules      list installed modules and their status
 claude-wheelhouse review ...   module subcommands pass through
 ```
 
-Modules register subcommands via a second entry-point group,
-`claude_wheelhouse.commands`. There are no other alias scripts.
+Modules add subcommands through the `cli` slot of the module protocol
+(below). There are no other alias scripts.
 
 ### Slash commands in sessions
 
@@ -322,13 +410,13 @@ The rewrite:
   update the cache optimistically, as `apply_pr_action_locally` does today.
 - Rate-limit headroom and offline handling carry over as they are.
 
-### Dash (rest of `claude_dashboard.py` to `packages/dash`)
+### Dashboard (rest of `claude_dashboard.py` to `packages/dashboard`)
 
 The dashboard is a 5,200-line, stdlib-only, raw-terminal (termios) program.
 It is not a Textual app, so it cannot simply be hosted as a pane. The order:
 
-1. Move the file into `packages/dash` unchanged, runnable as
-   `claude-wheelhouse dash`. In the wheelhouse app it appears as a card that
+1. Move the file into `packages/dashboard` unchanged, runnable as
+   `claude-wheelhouse dashboard`. In the wheelhouse app it appears as a card that
    opens it in its own terminal tab, rather than an embedded pane.
 2. Split its scan and usage logic into a service (it is already largely
    separate from rendering).
@@ -365,18 +453,21 @@ Each step is its own issue and PR, so every review covers one kind of change.
 1. **Finish PR #56 (the prototype).** Switch `/park` and `/end` to the
    single `/wheelhouse park|end` skill with the fixed name, then the
    round-5 review, then find the flaky test. Adoption by handoff and the
-   first part of the rename (the `claude-wheelhouse` package and command)
-   land early on PRs stacked on #56, so the prototype can be used day to day.
+   full rename (the `claude-wheelhouse` package and command, the
+   `claude_wheelhouse` module, the database under
+   `~/.local/state/claude-wheelhouse/`, `WHEELHOUSE_*` environment
+   variables, and the MCP server and plugin named `wheelhouse`) land early
+   on PRs stacked on #56, so the prototype can be used day to day.
 2. **Restructure into the workspace.** Move the prototype into
-   `packages/wheelhouse` and finish the rename (module, database path,
-   environment variables, MCP server and plugin names). Add the theme,
-   protocols and session views to the hub, move the dashboard file in
+   `packages/wheelhouse`. Add the theme, the module protocol, `Context`,
+   `claude_wheelhouse.testing`, the example module and the session views to
+   the hub, move the dashboard file in
    unchanged, add LICENSE and the README disclaimer. Move the session logic
    out of `tui.py` into its service. Retire the Homebrew tap.
 3. **Review module.** Lift the PR tab out of the dashboard into
    `packages/review` as a Textual module, with the GraphQL refresher.
-4. **The wheelhouse app.** Pane discovery, tab bar with badges, pane
-   isolation, the dash card.
-5. **Dash Textual port** (near-term follow-up).
+4. **The wheelhouse app.** Module discovery, `claude-wheelhouse modules`,
+   tab bar with badges, pane isolation, the dashboard card.
+5. **Dashboard Textual port** (near-term follow-up).
 
 Later: hot adoption, a web surface, PyPI.
