@@ -212,6 +212,33 @@ or with a slow MCP server never looks dead. The server only writes a
 heartbeat, on start and every 30 s. Tool calls run in worker threads, so the store
 serialises access to its one connection with a lock.
 
+## Adopting a session
+
+Adopt brings a session the board didn't launch onto the board, by handoff. Hot adoption
+(attaching to a session without restarting it) is deferred.
+
+- **Candidates.** Transcripts under `~/.claude/projects/*/*.jsonl` touched in the last
+  14 days and not already on the board, newest first, at most 40. Subagent transcripts
+  sit a level deeper and are never offered; headless runs (`entrypoint` other than
+  `cli`) are skipped. The title is the session's custom title, else its AI title, else
+  its first typed prompt. Only the first and last 256 KB of each file are read.
+- **Directory.** The cwd whose encoded form matches the transcript's folder (where
+  `--resume` finds it), not the latest cwd, since a session may have moved since.
+- **Still running?** Claude Code writes `~/.claude/sessions/<pid>.json` (pid,
+  `sessionId`, `procStart`) for each running session. Records of dead sessions linger,
+  so one counts only while `/proc/<pid>/stat` agrees on the start time. A running
+  session is never launched: the dialog says to type `/exit` in its tab, and Adopt checks
+  again when pressed. `claude_board run` also refuses inside the new tab if the session
+  is running elsewhere, which covers Restore as well.
+- **Launch.** The session is registered under its own Claude session id with
+  `adopted = 1`, then opened like a restore: `claude --resume <id>` with the board's
+  plugin, MCP server and protocol. A launch that fails removes the row again.
+- **The protocol needs `--system-prompt-snapshot off`.** Claude records the system
+  prompt at a conversation's first request and replays it on every resume, so an
+  adopted session never sees `--append-system-prompt`. Checked on 2.1.287: with the
+  default the resumed session didn't see an appended instruction, with `off` it did, and
+  a later default resume lost it again. So adopted sessions launch with `off` every time.
+
 ## TUI
 
 - **Inbox tab.** Sessions on the left (a status dot, the name, the open-question count,
@@ -221,8 +248,8 @@ serialises access to its one connection with a lock.
   answer box. Ctrl+S sends (Ctrl+Enter where the terminal reports it).
 - **Sessions tab.** Every session with status, name, ticket, directory, open-question
   and running counts. Restore on a dead row, parked or not (unparks only once the launch
-  goes through), Restore All (dead and not parked), Park / unpark, End, New session. Park
-  and End follow the lifecycle rules above.
+  goes through), Restore All (dead and not parked), Park / unpark, End, New session,
+  Adopt (`a`). Park and End follow the lifecycle rules above.
 - **Look.** Matrix green inside panels; colour and a shimmering title bar on the chrome.
 
 ## Relationship to the cache dashboard
@@ -256,6 +283,9 @@ The goal is one tool: the board, with the cache view as one of its tabs.
 | plugin skills are namespaced | true: `/<plugin>:<skill>` |
 | plugin monitors run for the whole session and their output reaches Claude as notifications | true (docs, components page) |
 | `-n, --name` | exists; sets the display name and terminal title |
+| `--resume <id>` keeps the session id and its transcript file | true (headless check) |
+| `--system-prompt-snapshot off` makes a resumed session see `--append-system-prompt` | true (headless check); the default does not |
+| `~/.claude/sessions/<pid>.json` records each running session with `sessionId` and `procStart` (= `/proc/<pid>/stat` field 22) | true |
 | `wt.exe new-tab --title`, `-w 0` | true (Microsoft docs) |
 | `wt.exe` callable directly from WSL | false: it is a 2-byte execution alias; `cmd.exe /c wt.exe` works |
 

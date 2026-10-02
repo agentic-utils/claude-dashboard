@@ -12,6 +12,10 @@ WSL and Windows Terminal. Prototype: see `../.plan/session-board.md` for the des
   hides a session until you restore it. End deletes its board data. On a running
   session, Park and End only ask the session to do it (press again to cancel or force);
   the board never deletes anything by itself.
+- **Adopt.** Brings a session the board didn't launch onto the board: pick it from the
+  recent sessions in `~/.claude/projects`. If it's still running, type `/exit` in its
+  tab first (the board never kills it), then press Adopt; it reopens in a new tab with
+  `claude --resume` and the board's flags.
 - **Durable.** State is in SQLite at `~/.local/state/claude-board/board.db`
   (override with `BOARD_DB`), committed to disk on every change.
 
@@ -27,7 +31,7 @@ uv sync
 uv run claude-board
 ```
 
-Keys: `i` inbox, `s` sessions, `n` new session, `Esc` all sessions, `Ctrl+S` send, `q` quit.
+Keys: `i` inbox, `s` sessions, `n` new session, `a` adopt, `Esc` all sessions, `Ctrl+S` send, `q` quit.
 
 ## Test
 
