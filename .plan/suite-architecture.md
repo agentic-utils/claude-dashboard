@@ -19,23 +19,31 @@ it as panes, so one window shows everything that needs attention.
 3. **Surface-agnostic content.** Every package serves its content through a
    service layer, so a browser surface can be added later without touching
    module logic. The browser surface itself is not in scope.
-4. **Wheelhouse reports, never directs.** Everything wheelhouse injects into a
-   session (`protocol.md`, the MCP tool descriptions, the `/wheelhouse` skill)
-   tells the model where and how to report, and nothing about how to work.
-   The user's own instructions (CLAUDE.md and the like) stay the only source
-   of working practice; wheelhouse never overrides them or adds to them. In
-   Doug's words: "Wheelhouse must NEVER override a user's instructions in
-   CLAUDE.md. It does not dictate that certain practices will be followed; it
-   ONLY indicates how to report practices of a certain type, should the
-   user's CLAUDE.md instruct it to behave in that way."
-   - Where wheelhouse defines a kind of report, such as autonomous decisions
-     (claude-wheelhouse issue #61), the injected text says explicitly that it
-     applies only when the user's instructions already have the model work
-     that way, and otherwise there is nothing to report.
-   - Naming a way of working in context nudges the model towards it, so any
-     such section is checked for that before it ships: A/B headless runs of
-     the same tasks with and without the section, comparing how the model
-     behaves, not just what it reports.
+4. **Wheelhouse instructs its channels and never overrides the user.**
+   Everything wheelhouse injects into a session (`protocol.md`, the MCP tool
+   descriptions, the `/wheelhouse` skill) is reviewable before use (see
+   "Reviewing what gets injected").
+   - **Its own channels are instructed plainly.** The protocol tells the
+     session to post its tasks, status updates and questions to the
+     wheelhouse and to read the answers. That is what the user opted into by
+     launching through the wheelhouse, and without it the tool does nothing
+     useful.
+   - **The user's instructions always win.** Nothing injected overrides or
+     adds to the user's own instructions (CLAUDE.md and the like) about how
+     to work.
+   - **Autonomous decisions are report-only** (claude-wheelhouse issue #61).
+     Deciding without asking is a working practice that only the user's
+     instructions can establish. As Doug put it: "Wheelhouse must NEVER
+     override a user's instructions in CLAUDE.md. It does not dictate that
+     certain practices will be followed; it ONLY indicates how to report
+     practices of a certain type, should the user's CLAUDE.md instruct it to
+     behave in that way." The injected text says explicitly that the section
+     applies only when the user's instructions already have the model decide
+     some things itself, and otherwise there is nothing to report.
+   - **Decisions are checked for priming before they ship.** Naming a way of
+     working in context nudges the model towards it, so the decisions
+     section is tested with A/B headless runs of the same tasks with and
+     without it, comparing how the model behaves, not just what it reports.
 
 Non-goals: a generic, schema-driven UI that renders on both surfaces; remote
 access; anything that spans Linux users (one instance per user, as today).
@@ -340,6 +348,24 @@ no clash detection or renaming. The plugin is namespaced as `wheelhouse`, so
 `/wheelhouse:wheelhouse` still reaches it if something else ever claims the
 bare name.
 
+### Reviewing what gets injected
+
+Nobody should have standing instructions put into their sessions without
+reading them first, so everything injected is easy to find and read:
+
+- **Plain files.** `protocol.md`, the wheelhouse skill and the MCP tool
+  descriptions ship as readable files in the package, not strings built at
+  run time.
+- **`claude-wheelhouse protocol`** prints exactly what a launched session
+  receives: the protocol, the skill, the MCP tool descriptions and the
+  launch flags.
+- **The README** has a "What wheelhouse puts into your sessions" section
+  linking each file.
+- **The New session and Adopt dialogs** offer a key to view it before
+  launching.
+
+The first two land on the prototype with the rename.
+
 ## Adopting a running session
 
 A session started outside the wheelhouse has no injected commands or
@@ -470,7 +496,9 @@ Each step is its own issue and PR, so every review covers one kind of change.
    `claude_wheelhouse` module, the database under
    `~/.local/state/claude-wheelhouse/`, `WHEELHOUSE_*` environment
    variables, and the MCP server and plugin named `wheelhouse`) land early
-   on PRs stacked on #56, so the prototype can be used day to day.
+   on PRs stacked on #56, so the prototype can be used day to day. The
+   rename also brings `claude-wheelhouse protocol` and the injected text as
+   plain files.
 2. **Restructure into the workspace.** Move the prototype into
    `packages/wheelhouse`. Add the theme, the module protocol, `Context`,
    `claude_wheelhouse.testing`, the example module and the session views to
