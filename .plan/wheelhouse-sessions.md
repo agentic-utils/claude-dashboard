@@ -101,8 +101,13 @@ writes the session row, then opens a Windows Terminal tab:
 
 ```
 cmd.exe /c wt.exe -w 0 new-tab --title <name> wsl.exe -d <distro> -u <user> --cd <dir> -- \
-    <python> -m claude_wheelhouse run <session-id>
+    <login shell> -lc "exec <python> -m claude_wheelhouse run <session-id>"
 ```
+
+wsl.exe runs its command with no shell, so the user's profile never runs and
+`~/.local/bin`, where claude is installed, is missing from the `PATH`. Going through the
+user's login shell (`$SHELL`, else their passwd entry, else bash) gives the tab the
+environment of an ordinary WSL tab, which hooks and MCP servers need too.
 
 `wt.exe` is a Windows execution alias that WSL can't execute directly (it resolves on
 the `PATH` but does nothing), so it goes through `cmd.exe /c` as Microsoft's docs say.

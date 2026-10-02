@@ -7,11 +7,16 @@ command separator and from Windows argument quoting.
 wt.exe is a Windows execution alias, which WSL can't run directly, so it goes
 through `cmd.exe /c` as Microsoft's docs prescribe. cmd re-parses the line, so
 its metacharacters are kept out of the title and refused in the directory.
+
+wsl.exe runs the command with no shell, so the user's profile never puts
+~/.local/bin (where claude lives) on the PATH. The tab runs it through the user's
+login shell, giving it the environment of an ordinary WSL tab.
 """
 
 import getpass
 import json
 import os
+import pwd
 import shlex
 import subprocess
 import sys
@@ -27,14 +32,18 @@ PROTOCOL = (Path(__file__).parent / "protocol.md").read_text()
 CMD_META = set('&|<>^%"')
 
 
-def wt_argv(session, *, python: str, distro: str, user: str) -> list[str]:
+def login_shell() -> str:
+    return os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell or "/bin/bash"
+
+
+def wt_argv(session, *, python: str, distro: str, user: str, shell: str) -> list[str]:
     if CMD_META & set(session["cwd"]):
         raise ValueError(f"can't launch in {session['cwd']}: it contains one of {''.join(sorted(CMD_META))}")
     title = "".join(c for c in session["name"] or Path(session["cwd"]).name if c not in CMD_META)
     return [
         "cmd.exe", "/c", "wt.exe", "-w", "0", "new-tab", "--title", title.replace(";", ","),
         "wsl.exe", "-d", distro, "-u", user, "--cd", session["cwd"].replace(";", r"\;"),
-        "--", python, "-m", "claude_wheelhouse", "run", session["id"],
+        "--", shell, "-lc", f"exec {shlex.join([python, '-m', 'claude_wheelhouse', 'run', session['id']])}",
     ]
 
 
@@ -107,7 +116,8 @@ def open_tab(store: Store, sid: str) -> None:
     if liveness.status(session) == "starting":   # a tab is opening but hasn't registered yet
         raise RuntimeError(f"session {session['name'] or sid} is still starting")
     argv = wt_argv(session, python=sys.executable,
-                   distro=os.environ.get("WSL_DISTRO_NAME", "Ubuntu"), user=getpass.getuser())
+                   distro=os.environ.get("WSL_DISTRO_NAME", "Ubuntu"), user=getpass.getuser(),
+                   shell=login_shell())
     store.mark_launched(sid)
     # cmd.exe or wt.exe failing would otherwise be invisible: keep their output
     with open(store.path.parent / "launch.log", "a") as log:

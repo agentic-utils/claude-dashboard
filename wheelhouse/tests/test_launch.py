@@ -16,10 +16,10 @@ def row(**over):
     ({"name": "fish & chips"}, "fish  chips", "/home/u/repo", "cmd metacharacters dropped from the title"),
 ])
 def test_wt_argv(over, title, cwd, desc):
-    argv = launch.wt_argv(row(**over), python="/py", distro="Ubuntu", user="u")
+    argv = launch.wt_argv(row(**over), python="/py", distro="Ubuntu", user="u", shell="/bin/zsh")
     assert argv[:8] == ["cmd.exe", "/c", "wt.exe", "-w", "0", "new-tab", "--title", title], desc
     assert argv[argv.index("--cd") + 1] == cwd, desc
-    assert argv[-5:] == ["/py", "-m", "claude_wheelhouse", "run", "abc-123"], desc
+    assert argv[-4:] == ["--", "/bin/zsh", "-lc", "exec /py -m claude_wheelhouse run abc-123"], desc
 
 
 @pytest.mark.parametrize("over, resume, has, lacks, last, desc", [
@@ -46,7 +46,7 @@ def test_claude_argv(over, resume, has, lacks, last, desc):
 
 def test_wt_argv_refuses_cmd_metacharacters_in_the_directory():
     with pytest.raises(ValueError, match="can't launch"):
-        launch.wt_argv(row(cwd="/home/u/a&b"), python="/py", distro="Ubuntu", user="u")
+        launch.wt_argv(row(cwd="/home/u/a&b"), python="/py", distro="Ubuntu", user="u", shell="/bin/bash")
 
 
 def test_transcript_exists(tmp_path):
@@ -151,3 +151,14 @@ def test_protocol_shows_everything_a_session_receives(db_file):
         assert part in text, desc
     assert {t.__name__ for t in mcp_server.TOOLS} == {
         "post_item", "update_item", "get_input", "list_items", "park_session", "end_session"}
+
+
+@pytest.mark.parametrize("env_shell, pw_shell, expected, desc", [
+    ("/bin/zsh", "/bin/sh", "/bin/zsh", "$SHELL wins"),
+    ("", "/usr/bin/fish", "/usr/bin/fish", "falls back to the passwd entry"),
+    ("", "", "/bin/bash", "falls back to bash"),
+])
+def test_login_shell(monkeypatch, env_shell, pw_shell, expected, desc):
+    monkeypatch.setenv("SHELL", env_shell)
+    monkeypatch.setattr(launch.pwd, "getpwuid", lambda uid: type("pw", (), {"pw_shell": pw_shell}))
+    assert launch.login_shell() == expected, desc
