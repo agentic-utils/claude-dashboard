@@ -53,6 +53,8 @@ also standalone: it only tracks sessions it launched, needs no global hooks, set
 hides the session from the inbox and keeps it off Restore All. It never hides whether
 the process is running: a parked session that is still running is live, and Restore
 and End treat it as live.
+If you park a session and keep working in its tab, its new questions stay out of the
+inbox too, by design: parking is your own signal to set it aside.
 
 - **Life and death come from the process, not the heartbeat.** Sleep and hibernate keep
   the process, so the session stays live and the heartbeat resumes on wake. A reboot or
@@ -146,9 +148,10 @@ A static plugin directory shipped in the package, loaded per session with `--plu
   reads `$ARGUMENTS` and replies with usage for anything else. A plugin skill whose
   frontmatter sets `name` answers to the bare name as well as the namespaced one ("The
   bare `/fancy` also invokes the skill unless another command already uses that name",
-  code.claude.com/docs/en/skills). Checked headless with `disable-model-invocation: true`
-  on the earlier `/park` skill: the bare name resolves. `/board:wheelhouse` remains as a
-  fallback if another command takes the bare name.
+  code.claude.com/docs/en/skills). Checked headless on `/wheelhouse` itself (claude
+  2.1.287, `disable-model-invocation: true`): the session lists the skill as
+  `board:wheelhouse`, and `/wheelhouse bogus` returns the usage line. `/board:wheelhouse`
+  remains as a fallback if another command takes the bare name.
 
 ## Data model
 
