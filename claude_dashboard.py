@@ -54,7 +54,8 @@ a message instead of a table if it isn't. Refreshed on --pr-refresh-seconds
 (default 300s) — each scan is several `gh` subprocess calls.
 
 Stdlib only (except the optional `gh` CLI for the PRS tab). --once prints a
-single frame; --interval overrides the period.
+single frame; --json live|history prints that view's data as JSON; --interval
+overrides the period.
 
 Flags can also be set in .claude-dashboard.rc, next to this script or in $HOME (one flag
 per line, '#' comments OK) - CLI flags given at the command line override it.
@@ -1139,6 +1140,19 @@ def summary_title(summary_tab):
     return styled, off, segs
 
 
+def summarize(buckets):
+    """Totals over `buckets`: the bucket keys plus total `input` and
+    `effective` tokens. Shared by the SUMMARY panel and --json."""
+    agg = empty_bucket()
+    for b in buckets:
+        for k in agg:
+            agg[k] += b[k]
+    agg["input"] = agg["read"] + agg["new"] + agg["miss"]
+    agg["effective"] = sum(eff_tokens(b["uncached"], b["c5m"], b["c1h"], b["read"],
+                                      b["output"]) for b in buckets)
+    return agg
+
+
 def summary_rows(buckets, inner, win_label, lean=False, compact_nums=False,
                  show_cost=False):
     """Summary figures over `buckets` (the active tab's window slice).
@@ -1149,20 +1163,14 @@ def summary_rows(buckets, inner, win_label, lean=False, compact_nums=False,
     to narrow the panel. `show_cost` adds a $ estimate (effective tokens ×
     PRICE_PER_MTOK) and a cache-hit% line — used by the history view."""
     bignum = fmt_compact if compact_nums else fmt
-    agg = empty_bucket()
-    for b in buckets:
-        for k in agg:
-            agg[k] += b[k]
-    total_input = agg["read"] + agg["new"] + agg["miss"]
+    agg = summarize(buckets)
+    total_input, eff = agg["input"], agg["effective"]
 
     def kv(label, value):
         return label + " " * max(inner - _visible_len(label) - _visible_len(value), 1) + value
 
     def meter(key, name, value):
         return kv(rgb(CO[key], CHIP) + " " + rgb(TEXT, name), rgb(TEXT, value))
-
-    eff = sum(eff_tokens(b["uncached"], b["c5m"], b["c1h"], b["read"], b["output"])
-              for b in buckets)
 
     rows = [
         kv(rgb(DIM, "input"), rgb(TEXT, bignum(total_input), bold=True)),
@@ -4042,11 +4050,97 @@ def self_upgrade():
 
 
 
+# ── --json: the LIVE / HISTORY data for other front ends ─────────────────────
+# Same collect() as the TUI, printed as one JSON object instead of a frame.
+# Nothing is rendered and the usage endpoint is not called, so a status-bar
+# widget can poll it without competing for the rate-limited allowance API.
+
+CTX_LEVELS = {OK_C: 0, WARN_C: 1, ORANGE_C: 2, HOT_C: 3}
+
+
+def ctx_level(size, window):
+    """ctx_grade() as a number: 0 green, 1 yellow, 2 amber, 3 red, 4 flashing."""
+    col, flashing = ctx_grade(size, window)
+    return 4 if flashing else CTX_LEVELS[col]
+
+
+def session_json(s, now):
+    proj = _clean(os.path.basename(s["cwd"])) if s["cwd"] else ""
+    errored_last = s["err"] is not None and (
+        s["last"] is None or s["err"]["ts"] >= s["last"])
+    cutoff = now - ACTIVE_WINDOW
+    subs = sorted((sub for sub in s["subs"].values() if sub["stop"] >= cutoff),
+                  key=lambda sub: sub["start"])
+    return {
+        "sid": s["sid"],
+        "label": s["name"] or proj or s["sid"][:8],
+        "name": s["name"], "project": proj,
+        "model": short_model(s["model"]),
+        "last": _iso(s["last"] or s["last_act"]),
+        "active": s["last_act"] >= cutoff,
+        "error": ({"status": s["err"]["status"], "text": s["err"]["text"]}
+                  if errored_last else None),
+        # [main, sub] pairs; "window" is the whole view span (12h live by default).
+        "fresh_1h": [s["main_1h"], s["sub_1h"]],
+        "fresh_window": [s["main_12"], s["sub_12"]],
+        "eff_1h": [round(s["eff_main_1h"]), round(s["eff_sub_1h"])],
+        "eff_window": [round(s["eff_main_12"]), round(s["eff_sub_12"])],
+        "ctx": s["ctx"],
+        "ctx_window": session_window(s),
+        "ctx_level": ctx_level(s["ctx"], session_window(s)),
+        "peak_sub": s["peak_sub"],
+        "peak_sub_level": ctx_level(s["peak_sub"], sub_window(s)),
+        "subagents": [{
+            "slug": sub["slug"], "model": short_model(sub["model"]),
+            "start": _iso(sub["start"]), "stop": _iso(sub["stop"]),
+            "peak": sub["peak"],
+            "peak_level": ctx_level(sub["peak"], window_for(sub["model"], sub["peak"])),
+            "eff": round(sub["eff"]),
+        } for sub in subs],
+        # Sparse: bucket index (as a string key) -> bucket plus its effective
+        # tokens, idle buckets omitted.
+        "buckets": {str(i): dict(b, eff=round(eff_tokens(b["uncached"], b["c5m"], b["c1h"],
+                                                         b["read"], b["output"])))
+                    for i, b in enumerate(s["buckets"]) if b["responses"]},
+    }
+
+
+def json_dump(view):
+    now = datetime.now(timezone.utc)
+    history = view == "history"
+    window, bucket, nb = ((HIST_WINDOW, HIST_BUCKET, HIST_NUM_BUCKETS) if history
+                          else (WINDOW, BUCKET, NUM_BUCKETS))
+    buckets, sessions = collect(now, window, bucket, nb,
+                                track_models=history, track_heatmap=history)
+    out = {
+        "view": view,
+        "now": _iso(now),
+        "start": _iso(now - window),
+        "bucket_seconds": bucket.total_seconds(),
+        "active_window_seconds": ACTIVE_WINDOW.total_seconds(),
+        "price_per_mtok": PRICE_PER_MTOK,
+        "buckets": buckets,
+        "summary": summarize(buckets),
+        "sessions": [session_json(s, now) for s in
+                     sorted(sessions.values(), key=lambda s: s["last_act"], reverse=True)],
+    }
+    if history:
+        out["heatmap"] = HIST_HEAT          # [weekday Mon..Sun][local hour] eff tokens
+    else:
+        n = max(1, round(ACTIVE_WINDOW / BUCKET))
+        out["summary_active"] = summarize(buckets[-n:])
+    json.dump(out, sys.stdout, separators=(",", ":"))
+    print()
+
+
 def main():
     ap = _ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
         fromfile_prefix_chars="@")
     ap.add_argument("--once", action="store_true", help="render one frame and exit")
+    ap.add_argument("--json", choices=("live", "history"), default=None, metavar="VIEW",
+                    help="print the live or history data as JSON and exit "
+                         "(no allowance fetch)")
     ap.add_argument("--interval", type=int, default=None, metavar="SECONDS",
                     help="seconds between transcript refreshes "
                          "(default: one bucket)")
@@ -4122,6 +4216,10 @@ def main():
 
     cols = term_cols()
     configure_dimensions(args, cols, ap.error)
+
+    if args.json:
+        json_dump(args.json)
+        return
 
     if args.once:
         now = datetime.now(timezone.utc)

@@ -108,6 +108,7 @@ Or skip Homebrew entirely: it is a single stdlib-only file you can run in place.
 claude-dashboard                       # if installed via brew
 ./claude_dashboard.py                  # live dashboard (alt-screen)
 ./claude_dashboard.py --once           # render a single frame and exit
+./claude_dashboard.py --json live      # live (or history) data as JSON, for widgets
 ./claude_dashboard.py --interval 60    # override the 5-min data scan
 ./claude_dashboard.py --history-hours 336   # 2-week history span (press H)
 ./claude_dashboard.py --pr-refresh-seconds 120   # faster PRS-tab refresh (press P)
